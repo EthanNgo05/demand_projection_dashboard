@@ -21,17 +21,15 @@ models/
 Double exponential smoothing (level + trend), with dampening so long-run slopes taper rather than run away.
 
 $$
-\begin{aligned}
-\text{level}_t
-&= \alpha y_t + (1-\alpha)\left(\text{level}_{t-1}+\phi\,\text{trend}_{t-1}\right) \\
-\text{trend}_t
-&= \beta(\text{level}_t-\text{level}_{t-1})
-+(1-\beta)\phi\,\text{trend}_{t-1} \\
-\text{projected\_pos}(h)
-&= \text{level}_T
-+(\phi+\phi^2+\cdots+\phi^h)\,\text{trend}_T,
-\qquad h=1,\ldots,15
-\end{aligned}
+\text{level}_t = \alpha y_t + (1-\alpha)\left(\text{level}_{t-1}+\phi\,\text{trend}_{t-1}\right)
+$$
+
+$$
+\text{trend}_t = \beta(\text{level}_t-\text{level}_{t-1}) +(1-\beta)\phi\,\text{trend}_{t-1}
+$$
+
+$$
+\text{projected\_pos}(h) = \text{level}_T +(\phi+\phi^2+\cdots+\phi^h)\,\text{trend}_T, \qquad h=1,\ldots,15
 $$
 
 | Parameter | Range | Role |
