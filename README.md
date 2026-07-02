@@ -29,7 +29,7 @@ $$
 $$
 
 $$
-\text{projected\_pos}(h) = \text{level}_T +(\phi+\phi^2+\cdots+\phi^h)\,\text{trend}_T, \qquad h=1,\ldots,15
+\text{projected position}(h) = \text{level}_T +(\phi+\phi^2+\cdots+\phi^h)\,\text{trend}_T, \qquad h=1,\ldots,15
 $$
 
 | Parameter | Range | Role |
