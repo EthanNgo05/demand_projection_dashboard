@@ -403,23 +403,13 @@ def summary_to_excel(summary_df, sheet_name="summary"):
     return buf.getvalue()
 
 
-@st.cache_data(show_spinner="Building per-customer forecast…")
-def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
-                        beta=None, phi=None, min_weeks=None, _progress_cb=None):
-    """Per-(SKU, Customer Grouping) summary — the rows behind ALL_CUSTOMERS.
-
-    The pipeline's ``ALL_CUSTOMERS_demand_projections`` file is just a
-    concatenation of every per-customer-group summary sheet. This reproduces it
-    live: for each Customer Grouping we run the identical per-group forecast the
-    pipeline files under its region (``fit_regression`` with that group's label,
-    no breakdown_df), then stack the summaries. Recomputing rather than reading
-    the saved workbook keeps this table on the same snapshot / prices / smoothing
-    as the rest of the page (the dashboard's single-source-of-truth design).
-    ``alpha`` / ``beta`` / ``phi`` and ``min_weeks``, when given, override the
-    pipeline's constants (and are part of the cache key, so the sliders recompute).
-
-    Returns a DataFrame in the pipeline's SUMMARY_COLUMNS order, or None if no
-    group had anything to forecast.
+@st.cache_data(show_spinner=False)
+def _forecast_one_group(df_group, today_ts, model_path, group_label,
+                        prices=None, alpha=None, beta=None, phi=None,
+                        min_weeks=None):
+    """Forecast a single customer group's SKUs. Cached; calls NO Streamlit
+    element, so it is safe to replay on a cache hit. ``group_label`` is a
+    normal (hashable) argument so distinct groups get distinct cache entries.
     """
     P = load_pipeline(model_path)
     kwargs = {}
@@ -429,20 +419,46 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
         kwargs.update(alpha=alpha, beta=beta, phi=phi)
     if min_weeks is not None and _supports_min_weeks(P):
         kwargs["min_weeks_for_trend"] = min_weeks
+    agg = P.aggregate_to_sku_week(df_group)
+    summary, _ = P.fit_regression(
+        agg, today_ts, grouping_label=group_label, **kwargs
+    )
+    return summary
 
+
+def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
+                        beta=None, phi=None, min_weeks=None, progress_cb=None):
+    """Per-(SKU, Customer Grouping) summary — the rows behind ALL_CUSTOMERS.
+
+    The pipeline's ``ALL_CUSTOMERS_demand_projections`` file is just a
+    concatenation of every per-customer-group summary sheet. This reproduces it
+    live: for each Customer Grouping we run the identical per-group forecast via
+    the cached ``_forecast_one_group`` helper, then stack the summaries.
+    Recomputing rather than reading the saved workbook keeps this table on the
+    same snapshot / prices / smoothing as the rest of the page.
+
+    This orchestrator is intentionally NOT cached: it may call ``progress_cb``
+    (which drives a progress bar), and Streamlit element calls are not allowed
+    inside a cached function. Each group's forecast is cached instead, so the
+    expensive work is still memoised. On plain reruns this function isn't called
+    at all — the result is held in session_state (see main()).
+
+    Returns a DataFrame in the pipeline's SUMMARY_COLUMNS order, or None if no
+    group had anything to forecast.
+    """
     frames = []
     groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
     n_groups = len(groups)
     for i, group in enumerate(groups):
         sub = df[df["Customer Grouping"] == group]
-        agg = P.aggregate_to_sku_week(sub)
-        summary, _ = P.fit_regression(
-            agg, today_ts, grouping_label=group, **kwargs
+        summary = _forecast_one_group(
+            sub, today_ts, model_path, group,
+            prices, alpha, beta, phi, min_weeks,
         )
         if summary is not None and not summary.empty:
             frames.append(summary)
-        if _progress_cb is not None:
-            _progress_cb(i + 1, n_groups, group)
+        if progress_cb is not None:
+            progress_cb(i + 1, n_groups, group)
 
     if not frames:
         return None
@@ -830,8 +846,12 @@ def main():
             # keyed widget takes ownership of its state and the pre-seed didn't
             # reliably reach it on first render.
             def _reset_smoothing():
+                # Delete the widget keys so the sliders re-read their ``value=``
+                # (the pipeline defaults) on the next run, and request a
+                # recompute so the displayed forecast reflects those defaults.
                 for k in ("sl_alpha", "sl_beta", "sl_phi", "sl_min_weeks"):
                     st.session_state.pop(k, None)
+                st.session_state["_do_recompute"] = True
 
             if smoothing_ok:
                 st.caption(
@@ -934,7 +954,7 @@ def main():
                     )
                 by_cust = compute_by_customer(
                     df, today_ts, pipeline_path(),
-                    prices, alpha, beta, phi, min_weeks, _progress_cb=_bump,
+                    prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
                 )
             prog.progress(1.0, text="Done")
         finally:
