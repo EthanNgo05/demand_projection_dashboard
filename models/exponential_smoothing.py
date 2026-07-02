@@ -339,17 +339,27 @@ def week_anchors(today):
     WeekDate is the Sunday that *starts* each 7-day week, so the week labelled
     W covers [W, W+6]. A week is only "completely over" once today is past its
     Saturday. To avoid feeding a partially-elapsed week's POS into the model,
-    the historical window ends at the last fully-completed week.
+    the historical (training) window ends at the last fully-completed week.
+
+    The forecast, however, STARTS at the current in-progress week rather than
+    skipping to the next full week. That week is only partly elapsed, so it is
+    deliberately kept OUT of the training history (its partial POS would drag
+    the smoothed level), but it still needs a projection -- otherwise it would
+    fall into a gap, plotted as neither an actual nor a forecast. Because Holt's
+    method projects h = 1..15 steps ahead of the last trained week, step h = 1 is
+    exactly this in-progress week, so first_forecast_week = current_week_start
+    also keeps the horizon date labels aligned with the projection steps.
 
     The window *start* depends on LOOKBACK_WEEKS: with the default ``None`` the
     lower bound is HISTORY_START (i.e. all available history); set LOOKBACK_WEEKS
     to an int to use only that many most-recent completed weeks instead.
 
     Example (run on Thu 2026-06-25): the week of 2026-06-21 is still in progress
-    (runs through Sat 2026-06-27), so the window ends at 2026-06-14. With
-    LOOKBACK_WEEKS=None it starts at HISTORY_START (all history); with
-    LOOKBACK_WEEKS=8 it would start at 2026-04-26. The forecast starts the next
-    full week (2026-06-28), skipping the in-progress week.
+    (runs through Sat 2026-06-27), so the training window ends at 2026-06-14.
+    With LOOKBACK_WEEKS=None it starts at HISTORY_START (all history); with
+    LOOKBACK_WEEKS=8 it would start at 2026-04-26. The forecast starts at the
+    in-progress week (2026-06-21): that week is projected but is NOT used to fit
+    the model, so its partial POS never distorts the level/trend.
 
     Returns (lookback_start, last_complete_week, first_forecast_week).
     """
@@ -361,7 +371,11 @@ def week_anchors(today):
     else:
         # N weeks inclusive -> step back N-1 from the last completed week.
         lookback_start = last_complete_week - pd.Timedelta(weeks=LOOKBACK_WEEKS - 1)
-    first_forecast_week = current_week_start + pd.Timedelta(weeks=1)
+    # Forecast starts at the current in-progress week (not the next full week),
+    # so that partly-elapsed week gets a projection instead of falling into a gap.
+    # It is still excluded from the training window above (which ends at
+    # last_complete_week), so its partial POS never drags the fit.
+    first_forecast_week = current_week_start
     return lookback_start, last_complete_week, first_forecast_week
 
 
@@ -685,7 +699,7 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
     if window.empty:
         return None, None
 
-    # Project 15 weeks forward starting from the first full week after today
+    # Project 15 weeks forward starting from the current in-progress week
     forecast_weeks = pd.date_range(start=first_forecast_week, periods=15, freq="W-SUN")
 
     # Promo week-starts (for re-adding expected lift onto future promo weeks).
@@ -832,8 +846,8 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
     print(f"  SKUs projected:    {len(summary_rows)}")
 
     # initial_projection_avg: average of the existing system Projection over the
-    # SAME 15 forecast weeks the updated average uses -- from the first week after
-    # today (first_forecast_week, e.g. 2026-06-28) through the 15th forecast week
+    # SAME 15 forecast weeks the updated average uses -- from the current
+    # in-progress week (first_forecast_week) through the 15th forecast week
     # (forecast_weeks[-1]). Capping the window here (rather than averaging the
     # original projection over its entire future span) makes the two averages
     # apples-to-apples, so "Projection Difference" / "Revenue Risk" agree in sign
