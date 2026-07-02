@@ -438,12 +438,14 @@ def aggregate_chart(agg, summary, weekly, anchors, view):
     fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
     fc_tot = fc.groupby("WeekDate")["projected_pos"].sum().reset_index()
 
-    # Original projection: restrict to the SAME 15 forecast weeks as the updated
-    # forecast (and the Initial Projection Average), so the grey line spans the
-    # forecast horizon rather than the original projection's full future extent.
+    # Original projection: plot straight from the spreadsheet's Projection column
+    # across the SAME span shown for actuals + forecast (history start through the
+    # forecast horizon), so the grey line runs the full width of the chart rather
+    # than only over the 15 forecast weeks. Weeks with no Projection are dropped
+    # (the line simply connects the weeks that have a value); no recomputation.
     horizon_end = pd.to_datetime(weekly["WeekDate"]).max()
     sys_proj = agg[
-        (agg["WeekDate"] >= ffw) & (agg["WeekDate"] <= horizon_end)
+        (agg["WeekDate"] >= lb) & (agg["WeekDate"] <= horizon_end)
     ].dropna(subset=["Projection"])
     sys_tot = sys_proj.groupby("WeekDate")["Projection"].sum().reset_index()
 
@@ -481,11 +483,13 @@ def sku_chart(sku, desc, source, agg, weekly, anchors):
 
     a = agg[agg["SKU"].astype(str) == str(sku)].sort_values("WeekDate")
     hist = a[(a["WeekDate"] >= lb) & (a["WeekDate"] <= lcw)].dropna(subset=[col])
-    # Original projection: same 15 forecast weeks as the updated forecast, so it
-    # doesn't run past the horizon (matches the Initial Projection Average).
+    # Original projection: straight from the spreadsheet's Projection column,
+    # across the SAME span shown for actuals + forecast (history start through the
+    # forecast horizon), so the grey line runs the full width of the chart. Weeks
+    # with no Projection are dropped; no recomputation.
     horizon_end = pd.to_datetime(weekly["WeekDate"]).max()
     sys_proj = a[
-        (a["WeekDate"] >= ffw) & (a["WeekDate"] <= horizon_end)
+        (a["WeekDate"] >= lb) & (a["WeekDate"] <= horizon_end)
     ].dropna(subset=["Projection"])
 
     fc = weekly[weekly["SKU"].astype(str) == str(sku)].copy()
