@@ -78,14 +78,23 @@ C_GRID = "rgba(148,163,184,0.18)"
 # Pipeline loading + data layer (pure cores + cached wrappers)                #
 # --------------------------------------------------------------------------- #
 @st.cache_resource(show_spinner=False)
-def load_pipeline(path):
-    """Import the forecasting pipeline module by file path."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Pipeline not found at {path}")
+def _load_pipeline_cached(path, mtime):
+    """Import the forecasting pipeline module by file path.
+
+    ``mtime`` is part of the cache key so that pushing an updated pipeline
+    file invalidates the cached module instead of serving a stale copy.
+    """
     spec = importlib.util.spec_from_file_location("demand_pipeline", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def load_pipeline(path):
+    """Load the pipeline module, re-importing whenever the file changes."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Pipeline not found at {path}")
+    return _load_pipeline_cached(path, os.path.getmtime(path))
 
 
 def _supports_prices(P):
@@ -140,7 +149,16 @@ def _raw_dir():
     P = load_pipeline(PIPELINE_PATH)
     folder = os.environ.get("DEMAND_RAW_DIR")
     if folder is None:
-        folder = P.RAW_INPUTS_FOLDER
+        folder = getattr(P, "RAW_INPUTS_FOLDER", None)
+        if folder is None:
+            # Older pipeline without the constant: derive it from INPUT_GLOB
+            # if present, otherwise use the standard default location.
+            input_glob = getattr(P, "INPUT_GLOB", None)
+            folder = (
+                os.path.dirname(input_glob)
+                if input_glob
+                else "raw_inputs/demand_projections"
+            )
         if not os.path.isabs(folder):
             folder = os.path.join(HERE, folder)
     return folder
