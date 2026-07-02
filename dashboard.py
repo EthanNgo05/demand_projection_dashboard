@@ -405,7 +405,7 @@ def summary_to_excel(summary_df, sheet_name="summary"):
 
 @st.cache_data(show_spinner="Building per-customer forecast…")
 def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
-                        beta=None, phi=None, min_weeks=None):
+                        beta=None, phi=None, min_weeks=None, _progress_cb=None):
     """Per-(SKU, Customer Grouping) summary — the rows behind ALL_CUSTOMERS.
 
     The pipeline's ``ALL_CUSTOMERS_demand_projections`` file is just a
@@ -431,7 +431,9 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
         kwargs["min_weeks_for_trend"] = min_weeks
 
     frames = []
-    for group in sorted(df["Customer Grouping"].dropna().unique().tolist()):
+    groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
+    n_groups = len(groups)
+    for i, group in enumerate(groups):
         sub = df[df["Customer Grouping"] == group]
         agg = P.aggregate_to_sku_week(sub)
         summary, _ = P.fit_regression(
@@ -439,6 +441,8 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
         )
         if summary is not None and not summary.empty:
             frames.append(summary)
+        if _progress_cb is not None:
+            _progress_cb(i + 1, n_groups, group)
 
     if not frames:
         return None
@@ -817,26 +821,17 @@ def main():
             p0 = float(getattr(P, "PHI", 0.85))
             mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
 
-            # Seed each slider's state once so it starts at the file default.
-            # Passing the value via session_state (rather than the slider's own
-            # ``value`` arg) is what lets the reset callback below overwrite it.
-            seeds = []
-            if smoothing_ok:
-                seeds += [("sl_alpha", a0), ("sl_beta", b0), ("sl_phi", p0)]
-            if min_weeks_ok:
-                seeds += [("sl_min_weeks", mw0)]
-            for k, v in seeds:
-                st.session_state.setdefault(k, v)
-
+            # Slider defaults come from the pipeline constants and are passed
+            # via each slider's ``value=`` argument below. Reset and model
+            # switching work by DELETING the widget keys so the sliders re-read
+            # ``value=`` on the next run. We never assign a number into
+            # session_state for a keyed slider: pre-seeding like that is what
+            # previously left the sliders pinned to their minimums, because a
+            # keyed widget takes ownership of its state and the pre-seed didn't
+            # reliably reach it on first render.
             def _reset_smoothing():
-                # Runs before the sliders are rebuilt on the next run, so it can
-                # safely set their state — the reliable way to move a widget.
-                if smoothing_ok:
-                    st.session_state["sl_alpha"] = a0
-                    st.session_state["sl_beta"] = b0
-                    st.session_state["sl_phi"] = p0
-                if min_weeks_ok:
-                    st.session_state["sl_min_weeks"] = mw0
+                for k in ("sl_alpha", "sl_beta", "sl_phi", "sl_min_weeks"):
+                    st.session_state.pop(k, None)
 
             if smoothing_ok:
                 st.caption(
@@ -845,18 +840,18 @@ def main():
                 )
                 alpha = st.slider(
                     "α — level smoothing", min_value=0.01, max_value=0.99,
-                    step=0.01, key="sl_alpha",
+                    value=a0, step=0.01, key="sl_alpha",
                     help="Higher tracks recent weeks faster; lower ≈ a longer moving "
                          "average (effective window ≈ 2/α − 1 weeks).",
                 )
                 beta = st.slider(
                     "β — trend smoothing", min_value=0.0, max_value=0.99,
-                    step=0.01, key="sl_beta",
+                    value=b0, step=0.01, key="sl_beta",
                     help="Higher re-estimates the slope from recent weeks; 0 freezes it.",
                 )
                 phi = st.slider(
                     "φ — trend damping", min_value=0.0, max_value=1.0,
-                    step=0.05, key="sl_phi",
+                    value=p0, step=0.05, key="sl_phi",
                     help="Lower flattens the forecast toward the current level; "
                          "1 = plain (undamped) Holt.",
                 )
@@ -865,8 +860,8 @@ def main():
 
             if min_weeks_ok:
                 min_weeks = st.slider(
-                    "min weeks for trend", min_value=2, max_value=12, step=1,
-                    key="sl_min_weeks",
+                    "min weeks for trend", min_value=2, max_value=12,
+                    value=mw0, step=1, key="sl_min_weeks",
                     help="SKUs with fewer completed weeks than this are forecast "
                          "flat at their mean instead of extrapolating a trend — "
                          "prevents runaway projections from 1–2 weeks of data. "
@@ -889,9 +884,67 @@ def main():
                 "overrides, so its own module-level constants are used."
             )
 
-    summary, weekly, agg = compute_view(
-        df, view, today_ts, pipeline_path(), prices, alpha, beta, phi, min_weeks
+        # Recompute is a manual action: moving a slider no longer rebuilds the
+        # whole forecast on every tick. The button sets a flag (via callback,
+        # so it's honoured on the very next run) that the compute gate reads.
+        def _request_recompute():
+            st.session_state["_do_recompute"] = True
+
+        st.button(
+            "🔄 Recompute forecast", type="primary", on_click=_request_recompute,
+            help="Apply the current parameters. Structural changes (view, "
+                 "model, snapshot, data) recompute automatically.",
+        )
+
+    # ----- Compute (manual, with a progress bar) ---------------------------
+    # The forecast is cached in session_state and only (re)built when:
+    #   * there is no result yet (first load), or
+    #   * a structural input changed (view / model / snapshot / data / prices), or
+    #   * the user pressed "Recompute".
+    # Slider changes alone leave the last result on screen and surface a
+    # "parameters changed — recompute to apply" notice.
+    price_marker = None if prices is None else int(len(prices))
+    structural_sig = (view, pipeline_path(), today_str, price_marker)
+    param_sig = (alpha, beta, phi, min_weeks)
+
+    do_recompute = st.session_state.pop("_do_recompute", False)
+    stored = st.session_state.get("fc_result")
+    need_compute = (
+        stored is None
+        or st.session_state.get("fc_structural") != structural_sig
+        or do_recompute
     )
+
+    if need_compute:
+        prog = st.progress(0.0, text="Preparing…")
+        try:
+            prog.progress(0.15, text="Building forecast for this view…")
+            summary, weekly, agg = compute_view(
+                df, view, today_ts, pipeline_path(),
+                prices, alpha, beta, phi, min_weeks,
+            )
+
+            by_cust = None
+            if view == ALL_CUSTOMERS_VIEW and summary is not None and not summary.empty:
+                def _bump(done, total, group):
+                    frac = 0.4 + 0.55 * (done / max(total, 1))
+                    prog.progress(
+                        min(frac, 0.98),
+                        text=f"Per-customer forecast… ({done}/{total})",
+                    )
+                by_cust = compute_by_customer(
+                    df, today_ts, pipeline_path(),
+                    prices, alpha, beta, phi, min_weeks, _progress_cb=_bump,
+                )
+            prog.progress(1.0, text="Done")
+        finally:
+            prog.empty()
+
+        st.session_state["fc_result"] = (summary, weekly, agg, by_cust)
+        st.session_state["fc_structural"] = structural_sig
+        st.session_state["fc_params"] = param_sig
+    else:
+        summary, weekly, agg, by_cust = stored
 
     if summary is None or summary.empty:
         st.error(
@@ -899,6 +952,15 @@ def main():
             "nothing to forecast."
         )
         st.stop()
+
+    # If the sliders were moved since the on-screen result was built, the view
+    # is stale until the user recomputes. Flag it rather than silently updating.
+    if st.session_state.get("fc_params") != param_sig:
+        st.info(
+            "⚠️ Parameters changed since this forecast was built — click "
+            "**🔄 Recompute forecast** in the sidebar to apply them.",
+            icon="⚠️",
+        )
 
     # ----- Header / windows -------------------------------------------------
     st.subheader(view)
@@ -1039,13 +1101,11 @@ def main():
 
     # ----- Summary table by SKU and Customer (ALL CUSTOMERS view only) ------
     # Mirrors the pipeline's ALL_CUSTOMERS_demand_projections file: every SKU
-    # broken out by customer group. Recomputed live (see compute_by_customer)
-    # so it stays on the same snapshot / prices as the SKU table above.
+    # broken out by customer group. Computed alongside the main forecast in the
+    # recompute block above (and cached in session_state) so it stays on the
+    # same snapshot / prices / parameters as the SKU table.
     if view == ALL_CUSTOMERS_VIEW:
         st.markdown("### Summary table by SKU and Customer")
-        by_cust = compute_by_customer(
-            df, today_ts, pipeline_path(), prices, alpha, beta, phi, min_weeks
-        )
         if by_cust is None or by_cust.empty:
             st.info("No per-customer forecasts to show for this snapshot.")
         else:
