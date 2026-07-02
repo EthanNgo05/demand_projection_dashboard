@@ -85,9 +85,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # sidebar toggle to the pipeline file implementing it. When a DEMAND_PIPELINE
 # env var is set, that file is offered as an extra option and is the default.
 MODEL_OPTIONS = {
-    "Exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "Simple Regression": os.path.join(HERE, "models/regression.py"),
+    "Holt's Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
-    "Simple regression": os.path.join(HERE, "models/regression.py"),
 }
 _ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")
 if _ENV_PIPELINE:
