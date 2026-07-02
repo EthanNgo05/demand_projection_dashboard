@@ -215,12 +215,16 @@ def week_anchors(today):
     WeekDate is the Sunday that *starts* each 7-day week, so the week labelled
     W covers [W, W+6]. A week is only "completely over" once today is past its
     Saturday. To avoid feeding a partially-elapsed week's POS into the average,
-    the historical window ends at the last fully-completed week.
+    the historical window ends at the last fully-completed week -- but the
+    in-progress week is still projected, so it gets a forecast value rather than
+    being left as a gap between the actuals and the forecast.
 
-    Example (run on Thu 2026-06-25): the week of 2026-06-21 is still in progress
-    (runs through Sat 2026-06-27), so the window ends at 2026-06-14 and spans
-    the 8 weeks 2026-04-26 .. 2026-06-14. The forecast starts the next full week
-    (2026-06-28), skipping the in-progress week.
+    Example (run on Thu 2026-07-02): the week of 2026-06-28 is still in progress
+    (runs through Sat 2026-07-04), so the historical window ends at the last
+    completed week, 2026-06-21, and spans the 8 weeks 2026-05-03 .. 2026-06-21.
+    The forecast starts at that same in-progress week (2026-06-28): its partial
+    POS is excluded from the historical average, but it still receives a
+    projection so there is no gap.
 
     Returns (lookback_start, last_complete_week, first_forecast_week).
     """
@@ -228,7 +232,10 @@ def week_anchors(today):
     current_week_start = today - pd.Timedelta(days=days_since_sunday)
     last_complete_week = current_week_start - pd.Timedelta(weeks=1)
     lookback_start = last_complete_week - pd.Timedelta(weeks=7)   # 8 weeks inclusive
-    first_forecast_week = current_week_start + pd.Timedelta(weeks=1)
+    # Forecast begins at the in-progress week itself: its partial actuals are
+    # kept out of the historical average (window ends at last_complete_week),
+    # but it is projected so there's no gap between actuals and the forecast.
+    first_forecast_week = current_week_start
     return lookback_start, last_complete_week, first_forecast_week
 
 
@@ -392,10 +399,13 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
     print(f"  SKUs projected:    {len(summary_rows)}")
 
     # initial_projection_avg: average of the existing system Projection from the
-    # first week after today (first_forecast_week, e.g. 2026-06-28) through the
-    # last week that actually has a projection. Weeks with a missing projection
-    # are excluded from the average (mean() skips NaN), so a SKU whose projection
-    # runs out at, say, 2026-11-22 is not penalised for a blank 2026-11-29.
+    # first forecast week (first_forecast_week -- the in-progress week, e.g.
+    # 2026-06-28) through the last week that actually has a projection. Anchoring
+    # this to the same first_forecast_week keeps it aligned with the updated
+    # forecast (both start at the in-progress week). Weeks with a missing
+    # projection are excluded from the average (mean() skips NaN), so a SKU whose
+    # projection runs out at, say, 2026-11-22 is not penalised for a blank
+    # 2026-11-29.
     avg_initial = (
         df[df["WeekDate"] >= first_forecast_week]
         .dropna(subset=["Projection"])
