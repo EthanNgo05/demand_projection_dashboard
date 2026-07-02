@@ -51,12 +51,38 @@ import streamlit as st
 # --------------------------------------------------------------------------- #
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# The pipeline filename starts with a digit and contains a hyphen, so it can't
-# be imported with a normal ``import`` statement -- we load it by path instead.
-PIPELINE_PATH = os.environ.get(
-    "DEMAND_PIPELINE", os.path.join(HERE, "models/exponential_smoothing.py")
-    # "DEMAND_PIPELINE", os.path.join(HERE, "models/xgboost.py")
-)
+# The forecasting models on offer. Each entry maps the label shown in the
+# sidebar toggle to the pipeline file implementing it. When a DEMAND_PIPELINE
+# env var is set, that file is offered as an extra option and is the default.
+MODEL_OPTIONS = {
+    "Exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "XGBoost": os.path.join(HERE, "models/xgboost.py"),
+}
+_ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")
+if _ENV_PIPELINE:
+    MODEL_OPTIONS = {"Custom (DEMAND_PIPELINE)": _ENV_PIPELINE, **MODEL_OPTIONS}
+
+# Only offer models whose file is actually present in this deployment.
+MODEL_OPTIONS = {k: v for k, v in MODEL_OPTIONS.items() if os.path.exists(v)}
+DEFAULT_MODEL = next(iter(MODEL_OPTIONS), None)
+
+
+def pipeline_path():
+    """Path of the currently selected pipeline (the sidebar model toggle).
+
+    Falls back to the first available model before the toggle has rendered
+    (or if session state holds a label that no longer exists).
+    """
+    choice = st.session_state.get("model_choice", DEFAULT_MODEL)
+    if choice not in MODEL_OPTIONS:
+        choice = DEFAULT_MODEL
+    if choice is None:
+        raise FileNotFoundError(
+            "No forecasting pipeline found — expected "
+            "models/exponential_smoothing.py or models/xgboost.py next to "
+            "dashboard.py (or set the DEMAND_PIPELINE env var)."
+        )
+    return MODEL_OPTIONS[choice]
 
 ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
 
@@ -146,7 +172,7 @@ def _raw_dir():
     relative to this file when it is a relative path. This means moving the raw
     folder in the pipeline is picked up here automatically.
     """
-    P = load_pipeline(PIPELINE_PATH)
+    P = load_pipeline(pipeline_path())
     folder = os.environ.get("DEMAND_RAW_DIR")
     if folder is None:
         folder = getattr(P, "RAW_INPUTS_FOLDER", None)
@@ -171,7 +197,7 @@ def raw_glob():
 
 def price_glob():
     """Build the list-price glob, mirroring the pipeline's LIST_PRICE_GLOB name."""
-    P = load_pipeline(PIPELINE_PATH)
+    P = load_pipeline(pipeline_path())
     pattern = os.path.basename(getattr(P, "LIST_PRICE_GLOB", "list_prices_*.xlsx"))
     return os.path.join("raw_inputs", pattern)
 
@@ -223,38 +249,42 @@ def _clean(raw_df, P):
 
 
 @st.cache_data(show_spinner="Loading raw data…")
-def load_raw_from_path(path, _mtime):
-    """Read + clean a raw file from disk. ``_mtime`` busts the cache on change."""
-    P = load_pipeline(PIPELINE_PATH)
+def load_raw_from_path(path, _mtime, model_path):
+    """Read + clean a raw file from disk. ``_mtime`` busts the cache on change.
+
+    ``model_path`` keys the cache on the selected model, since each pipeline
+    owns its own cleaning rules.
+    """
+    P = load_pipeline(model_path)
     raw = pd.read_excel(path, header=2)
     return _clean(raw, P)
 
 
 @st.cache_data(show_spinner="Loading raw data…")
-def load_raw_from_bytes(_data, name):
-    """Read + clean an uploaded raw file (cached on its bytes)."""
-    P = load_pipeline(PIPELINE_PATH)
+def load_raw_from_bytes(_data, name, model_path):
+    """Read + clean an uploaded raw file (cached on its bytes + model)."""
+    P = load_pipeline(model_path)
     raw = pd.read_excel(BytesIO(_data), header=2)
     return _clean(raw, P)
 
 
 @st.cache_data(show_spinner="Loading list prices…")
-def load_prices_from_path(path, _mtime):
+def load_prices_from_path(path, _mtime, model_path):
     """Load a SKU -> List Price (USD) Series from disk. ``_mtime`` busts cache."""
-    P = load_pipeline(PIPELINE_PATH)
+    P = load_pipeline(model_path)
     if not hasattr(P, "load_list_prices"):
         return None
     return P.load_list_prices(path)
 
 
 @st.cache_data(show_spinner="Loading list prices…")
-def load_prices_from_bytes(_data, name):
+def load_prices_from_bytes(_data, name, model_path):
     """Load list prices from an uploaded workbook (cached on its bytes).
 
     Writes to a temp file so the pipeline's own reader/cleaner is reused
     (keeping a single source of truth for how prices are parsed).
     """
-    P = load_pipeline(PIPELINE_PATH)
+    P = load_pipeline(model_path)
     if not hasattr(P, "load_list_prices"):
         return None
     import tempfile
@@ -270,7 +300,7 @@ def load_prices_from_bytes(_data, name):
 
 def list_views(df):
     """Group views organised by region, plus the combined ALL CUSTOMERS view."""
-    P = load_pipeline(PIPELINE_PATH)
+    P = load_pipeline(pipeline_path())
     groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
     by_region = {}
     for g in groups:
@@ -279,8 +309,8 @@ def list_views(df):
 
 
 @st.cache_data(show_spinner="Building forecast…")
-def compute_view(df, view, today_ts, prices=None, alpha=None, beta=None, phi=None,
-                 min_weeks=None):
+def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
+                 beta=None, phi=None, min_weeks=None):
     """Recompute summary + weekly + per-week aggregate for the selected view.
 
     Returns (summary_df, weekly_df, agg_frame) where agg_frame is the SKU-week
@@ -291,9 +321,10 @@ def compute_view(df, view, today_ts, prices=None, alpha=None, beta=None, phi=Non
     'List Price (USD)' and 'Revenue Risk (USD)'. ``alpha`` / ``beta`` / ``phi``,
     when given, override the pipeline's smoothing constants for this call, and
     ``min_weeks`` overrides MIN_WEEKS_FOR_TREND (all are part of the cache key, so
-    moving a slider recomputes the forecast).
+    moving a slider recomputes the forecast). ``model_path`` selects the
+    pipeline and keys the cache, so toggling the model recomputes too.
     """
-    P = load_pipeline(PIPELINE_PATH)
+    P = load_pipeline(model_path)
     kwargs = {}
     if prices is not None and _supports_prices(P):
         kwargs["list_prices"] = prices
@@ -343,8 +374,8 @@ def summary_to_excel(summary_df, sheet_name="summary"):
 
 
 @st.cache_data(show_spinner="Building per-customer forecast…")
-def compute_by_customer(df, today_ts, prices=None, alpha=None, beta=None, phi=None,
-                        min_weeks=None):
+def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
+                        beta=None, phi=None, min_weeks=None):
     """Per-(SKU, Customer Grouping) summary — the rows behind ALL_CUSTOMERS.
 
     The pipeline's ``ALL_CUSTOMERS_demand_projections`` file is just a
@@ -360,7 +391,7 @@ def compute_by_customer(df, today_ts, prices=None, alpha=None, beta=None, phi=No
     Returns a DataFrame in the pipeline's SUMMARY_COLUMNS order, or None if no
     group had anything to forecast.
     """
-    P = load_pipeline(PIPELINE_PATH)
+    P = load_pipeline(model_path)
     kwargs = {}
     if prices is not None and _supports_prices(P):
         kwargs["list_prices"] = prices
@@ -584,7 +615,33 @@ def main():
     st.set_page_config(
         page_title="Demand Projections", page_icon="📦", layout="wide"
     )
-    P = load_pipeline(PIPELINE_PATH)
+
+    # ----- Model toggle ------------------------------------------------------
+    # Rendered first so every downstream helper (raw-file discovery, cleaning,
+    # forecasting) sees the chosen pipeline on this same run.
+    with st.sidebar:
+        st.header("Model")
+        if not MODEL_OPTIONS:
+            st.error(
+                "No forecasting pipeline found — expected "
+                "models/exponential_smoothing.py or models/xgboost.py "
+                "next to dashboard.py (or set DEMAND_PIPELINE)."
+            )
+            st.stop()
+
+        def _on_model_change():
+            # Pipelines ship their own smoothing defaults, so drop the slider
+            # state and let it re-seed from the newly selected pipeline.
+            for k in ("sl_alpha", "sl_beta", "sl_phi", "sl_min_weeks"):
+                st.session_state.pop(k, None)
+
+        st.radio(
+            "Forecasting model", list(MODEL_OPTIONS.keys()),
+            key="model_choice", on_change=_on_model_change,
+            help="Switching recomputes everything with the selected pipeline.",
+        )
+
+    P = load_pipeline(pipeline_path())
     st.title("📦 Demand Projection Dashboard")
     # Header caption: the pipeline can supply its own (DASHBOARD_CAPTION, e.g.
     # the XGBoost pipeline); otherwise fall back to the smoothing-aware blurbs.
@@ -616,7 +673,7 @@ def main():
             labels = {f"{d}  ({os.path.basename(p)})": (d, p) for d, p in files}
             choice = st.selectbox("Snapshot (raw file)", list(labels.keys()))
             today_str, path = labels[choice]
-            df = load_raw_from_path(path, os.path.getmtime(path))
+            df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
         else:
             st.info(f"Upload the Demand Planning Details and Plytix files below.")
 
@@ -624,7 +681,7 @@ def main():
             up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
             if up is not None:
                 data = up.getvalue()
-                df = load_raw_from_bytes(data, up.name)
+                df = load_raw_from_bytes(data, up.name, pipeline_path())
                 today_str = _date_from_name(up.name)
 
         # ----- List prices (drive revenue risk) ---------------------------
@@ -638,11 +695,15 @@ def main():
                     "projection difference × list price.",
             )
             if up_price is not None:
-                prices = load_prices_from_bytes(up_price.getvalue(), up_price.name)
+                prices = load_prices_from_bytes(
+                    up_price.getvalue(), up_price.name, pipeline_path()
+                )
                 if prices is not None:
                     st.success(f"{len(prices):,} list prices (uploaded)")
             elif price_file is not None:
-                prices = load_prices_from_path(price_file, os.path.getmtime(price_file))
+                prices = load_prices_from_path(
+                    price_file, os.path.getmtime(price_file), pipeline_path()
+                )
                 if prices is not None:
                     st.success(
                         f"{len(prices):,} list prices "
@@ -762,7 +823,7 @@ def main():
             )
 
     summary, weekly, agg = compute_view(
-        df, view, today_ts, prices, alpha, beta, phi, min_weeks
+        df, view, today_ts, pipeline_path(), prices, alpha, beta, phi, min_weeks
     )
 
     if summary is None or summary.empty:
@@ -916,7 +977,7 @@ def main():
     if view == ALL_CUSTOMERS_VIEW:
         st.markdown("### Summary table by SKU and Customer")
         by_cust = compute_by_customer(
-            df, today_ts, prices, alpha, beta, phi, min_weeks
+            df, today_ts, pipeline_path(), prices, alpha, beta, phi, min_weeks
         )
         if by_cust is None or by_cust.empty:
             st.info("No per-customer forecasts to show for this snapshot.")
