@@ -38,6 +38,8 @@ import os
 import re
 import glob
 import inspect
+import logging
+import traceback
 import importlib.util
 from io import BytesIO
 
@@ -45,6 +47,34 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+# --------------------------------------------------------------------------- #
+# Logging                                                                     #
+# --------------------------------------------------------------------------- #
+# Developer-facing log. Written next to this file as ``logs.txt`` so issues can
+# be inspected after the fact (on Streamlit Cloud, also visible via Manage app
+# → logs). Configured once per process; Streamlit reruns import the module only
+# once, so the handler isn't attached repeatedly.
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs.txt")
+
+logger = logging.getLogger("demand_dashboard")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    try:
+        _fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        _fh.setFormatter(_fmt)
+        logger.addHandler(_fh)
+    except OSError:
+        # Read-only filesystem (some hosts): fall back to the console only so
+        # the app still runs; logs then live in the platform's own log stream.
+        pass
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    logger.addHandler(_sh)
+    logger.propagate = False
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
@@ -55,7 +85,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # sidebar toggle to the pipeline file implementing it. When a DEMAND_PIPELINE
 # env var is set, that file is offered as an extra option and is the default.
 MODEL_OPTIONS = {
-    "Holt's Double Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "Exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
 }
 _ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")
@@ -616,6 +646,21 @@ def main():
         page_title="Demand Projections", page_icon="📦", layout="wide"
     )
 
+    # Widen the sidebar a touch (Streamlit's default is ~244-260px). Adjust
+    # SIDEBAR_WIDTH_PX to taste; users can still drag the divider to resize.
+    SIDEBAR_WIDTH_PX = 340
+    st.markdown(
+        f"""
+        <style>
+        section[data-testid="stSidebar"] {{
+            width: {SIDEBAR_WIDTH_PX}px !important;
+            min-width: {SIDEBAR_WIDTH_PX}px !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # ----- Model toggle ------------------------------------------------------
     # Rendered first so every downstream helper (raw-file discovery, cleaning,
     # forecasting) sees the chosen pipeline on this same run.
@@ -714,11 +759,33 @@ def main():
         st.warning("Pick or upload a raw data file to get started.")
         st.stop()
 
+    # A snapshot date anchors the entire 8-week history / 15-week forecast
+    # window, so we don't silently fall back to "today" — a wrong anchor
+    # produces plausible-looking but wrong numbers. If the filename carried no
+    # date, ask the user to confirm one explicitly before computing anything.
     if not today_str:
-        today_str = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
-        st.sidebar.warning(
-            "No date found in the filename — anchoring to today instead."
+        st.warning(
+            "No snapshot date was found in the filename. The date sets the "
+            "8-week history and 15-week forecast windows, so please confirm "
+            "it before continuing."
         )
+        picked = st.date_input(
+            "Snapshot date (as-of date for this data)",
+            value=pd.Timestamp.today().normalize(),
+            help="Usually the date the raw file was exported. Everything is "
+                 "computed relative to this date.",
+            key="manual_snapshot_date",
+        )
+        confirmed = st.checkbox(
+            "Use this date", key="confirm_snapshot_date",
+            help="Tick to compute the forecast with the date above.",
+        )
+        if not confirmed:
+            st.info("Confirm a snapshot date above to continue.")
+            st.stop()
+        today_str = pd.Timestamp(picked).strftime("%Y-%m-%d")
+        logger.info("Snapshot date manually confirmed by user: %s", today_str)
+
     today_ts = pd.Timestamp(today_str)
     lb, lcw, ffw = P.week_anchors(today_ts)
 
@@ -1017,5 +1084,44 @@ def main():
             )
 
 
+def _run():
+    """Run the app, turning any uncaught exception into a friendly message.
+
+    Non-engineer users shouldn't see a raw traceback (and it can leak column
+    names / paths). We log the full traceback to logs.txt for developers and
+    show a calm, actionable message instead. ``st.stop()`` raises internally to
+    halt a run and must be allowed to propagate untouched.
+    """
+    try:
+        main()
+    except Exception:  # noqa: BLE001 -- deliberately broad: last line of defence
+        # RerunException / StopException are Streamlit control-flow signals, not
+        # errors; let Streamlit handle them normally.
+        try:
+            from streamlit.runtime.scriptrunner import StopException, RerunException
+            _control_flow = (StopException, RerunException)
+        except Exception:
+            _control_flow = ()
+        import sys
+        exc = sys.exc_info()[1]
+        if _control_flow and isinstance(exc, _control_flow):
+            raise
+
+        tb = traceback.format_exc()
+        logger.error("Unhandled exception in dashboard:\n%s", tb)
+        st.error(
+            "Something went wrong while building this view. The error has been "
+            "logged for the developers. A common cause is an unexpected file "
+            "format — check that the raw file is a standard "
+            "`all_demand_projections_*.xlsx` export (headers on row 3) and the "
+            "list-price file is a `list_prices_*.xlsx`. If it keeps happening, "
+            "share the details below with the team."
+        )
+        with st.expander("Technical details (for developers)"):
+            st.exception(exc)
+            st.caption(f"Full traceback is also recorded in {LOG_PATH}.")
+        st.stop()
+
+
 if __name__ == "__main__":
-    main()
+    _run()
