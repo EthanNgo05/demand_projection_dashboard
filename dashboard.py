@@ -981,7 +981,7 @@ def main():
     # is stale until the user recomputes. Flag it rather than silently updating.
     if st.session_state.get("fc_params") != param_sig:
         st.info(
-            "⚠️ Parameters changed since this forecast was built — click "
+            "Parameters changed since this forecast was built — click "
             "**🔄 Recompute forecast** in the sidebar to apply them.",
             icon="⚠️",
         )
