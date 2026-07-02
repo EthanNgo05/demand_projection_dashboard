@@ -3,3 +3,6 @@
 
 # outputs folder
 /outputs
+
+# pycache
+__pycache__

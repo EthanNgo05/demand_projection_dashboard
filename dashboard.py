@@ -1,0 +1,931 @@
+"""
+Demand Projection Dashboard
+===========================
+
+An interactive Streamlit + Plotly front-end for the 15-week demand forecasts
+produced by ``10-all_demand_projections.py``.
+
+Rather than reading the saved Excel files (which only contain the 15 forecast
+weeks), this dashboard reads the *same raw data file* the pipeline uses and
+recomputes the forecast live by importing the pipeline's own functions
+(``week_anchors``, ``aggregate_to_sku_week``, ``fit_regression``,
+``region_for_group``). That keeps a single source of truth for the forecasting
+logic and unlocks the 8 weeks of historical actuals so they can be charted
+flowing straight into the forecast.
+
+Each SKU is forecast from POS where it has any in the 8-week window, otherwise
+from the Orders signal (the pipeline's POS-then-Orders fallback). The dashboard
+mirrors that: the historical line for a SKU shows whichever signal drove its
+forecast, and the "Data Source" is surfaced throughout.
+
+Run it locally with two terminals:
+
+    Terminal 1: streamlit run dashboard.py --server.headless true
+    Terminal 2: ngrok http 8501
+
+    Use link like: https://reissue-ninetieth-deeply.ngrok-free.dev 
+
+Also hosted on Streamlit Community Cloud
+
+    https://sh-demand-projections.streamlit.app/ 
+
+By default it discovers the raw folder from the pipeline's own
+``RAW_DATA_FOLDER`` (currently ``raw_data/demand_projections``), resolved next
+to this file. Override paths with the DEMAND_PIPELINE / DEMAND_RAW_DIR env vars.
+"""
+
+import os
+import re
+import glob
+import inspect
+import importlib.util
+from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+# --------------------------------------------------------------------------- #
+# Configuration                                                               #
+# --------------------------------------------------------------------------- #
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The pipeline filename starts with a digit and contains a hyphen, so it can't
+# be imported with a normal ``import`` statement -- we load it by path instead.
+PIPELINE_PATH = os.environ.get(
+    # "DEMAND_PIPELINE", os.path.join(HERE, "20-regression_demand_projections.py")
+    "DEMAND_PIPELINE", os.path.join(HERE, "models/exponential_smoothing.py")
+)
+
+ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
+
+# Column names produced by the pipeline's fit_regression when list prices are
+# supplied (see DISPLAY_NAMES in the pipeline). Kept here so the dashboard can
+# format / sort on them.
+PRICE_COL = "List Price (USD)"
+RISK_COL = "Revenue Risk (USD)"
+
+# Chart palette -- actuals are the anchor (solid), the two projections are
+# de-emphasised dashed/dotted lines so the eye reads "history -> forecast".
+C_ACTUAL = "#2563eb"   # blue   - historical actual demand (POS or Orders)
+C_UPDATED = "#ea580c"  # orange - our recomputed 15-week forecast
+C_ORIGINAL = "#9ca3af"   # grey   - the existing projection
+C_GRID = "rgba(148,163,184,0.18)"
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline loading + data layer (pure cores + cached wrappers)                #
+# --------------------------------------------------------------------------- #
+@st.cache_resource(show_spinner=False)
+def load_pipeline(path):
+    """Import the forecasting pipeline module by file path."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Pipeline not found at {path}")
+    spec = importlib.util.spec_from_file_location("demand_pipeline", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _supports_prices(P):
+    """True if this pipeline's fit_regression accepts a list_prices argument.
+
+    Lets the dashboard stay compatible with an older pipeline that predates the
+    revenue-risk columns: if the argument isn't supported we simply skip it.
+    """
+    try:
+        return "list_prices" in inspect.signature(P.fit_regression).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _supports_smoothing(P):
+    """True if this pipeline's fit_regression accepts alpha/beta/phi arguments.
+
+    Lets the sidebar smoothing sliders stay compatible with an older pipeline
+    whose fit_regression predates the per-call ALPHA/BETA/PHI override: if the
+    arguments aren't supported we skip them and the pipeline's own module-level
+    constants apply instead.
+    """
+    try:
+        params = inspect.signature(P.fit_regression).parameters
+    except (TypeError, ValueError):
+        return False
+    return {"alpha", "beta", "phi"} <= set(params)
+
+
+def _supports_min_weeks(P):
+    """True if this pipeline's fit_regression accepts a min_weeks_for_trend arg.
+
+    Guards the sidebar's min-weeks slider so the dashboard still runs against a
+    pipeline that predates the short-history flat-forecast guard: if the argument
+    isn't supported we skip it and the pipeline's own MIN_WEEKS_FOR_TREND applies.
+    """
+    try:
+        params = inspect.signature(P.fit_regression).parameters
+    except (TypeError, ValueError):
+        return False
+    return "min_weeks_for_trend" in params
+
+
+def _raw_dir():
+    """Resolve the folder holding the raw + price files.
+
+    Honours DEMAND_RAW_DIR if set; otherwise uses the pipeline's own
+    RAW_DATA_FOLDER constant (e.g. ``raw_data/demand_projections``), resolved
+    relative to this file when it is a relative path. This means moving the raw
+    folder in the pipeline is picked up here automatically.
+    """
+    P = load_pipeline(PIPELINE_PATH)
+    folder = os.environ.get("DEMAND_RAW_DIR")
+    if folder is None:
+        folder = P.RAW_DATA_FOLDER
+        if not os.path.isabs(folder):
+            folder = os.path.join(HERE, folder)
+    return folder
+
+
+def raw_glob():
+    """Build the raw-file glob, tracking the pipeline's RAW_DATA_FOLDER."""
+    return os.path.join(_raw_dir(), "all_demand_projections_*.xlsx")
+
+
+def price_glob():
+    """Build the list-price glob, mirroring the pipeline's LIST_PRICE_GLOB name."""
+    P = load_pipeline(PIPELINE_PATH)
+    pattern = os.path.basename(getattr(P, "LIST_PRICE_GLOB", "list_prices_*.xlsx"))
+    return os.path.join("raw_data", pattern)
+
+
+def discover_price_file():
+    """Newest list-price file in the raw folder, or None if there isn't one."""
+    matches = glob.glob(price_glob())
+    return max(matches, key=os.path.getmtime) if matches else None
+
+
+def _date_from_name(name):
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def discover_raw_files():
+    """Return [(date_str, path)] newest first, mirroring resolve_input_file()."""
+    out = []
+    for path in glob.glob(raw_glob()):
+        d = _date_from_name(path)
+        if d:
+            out.append((d, path))
+    return sorted(out, reverse=True)
+
+
+def _clean(raw_df, P):
+    """Apply the exact preprocessing from the pipeline's __main__ block.
+
+    Mirrors the updated pipeline: 'Sum of Quantity' -> Orders, and POS / Orders /
+    Projection are all carried through. Falls back gracefully if an older file
+    lacks the Orders column (an all-NaN Orders column is added so the
+    POS-then-Orders logic still runs without a KeyError).
+    """
+    rename = {"'Demand'[DisplaySKU]": "SKU", "Custnmbr": "CUSTNMBR"}
+    if "Sum of Quantity" in raw_df.columns:
+        rename["Sum of Quantity"] = "Orders"
+    df = raw_df.rename(columns=rename)
+
+    if "Orders" not in df.columns:
+        df["Orders"] = np.nan  # legacy file without an Orders/Sum of Quantity col
+
+    df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
+    df = df[~df["CUSTNMBR"].isin(P.CUSTOMERS_TO_IGNORE)]
+    df["WeekDate"] = pd.to_datetime(df["WeekDate"])
+    df["Customer Grouping"] = (
+        df["CUSTNMBR"].map(P.COMBINED_GROUPING).fillna(df["CUSTNMBR"])
+    )
+    return df
+
+
+@st.cache_data(show_spinner="Loading raw data…")
+def load_raw_from_path(path, _mtime):
+    """Read + clean a raw file from disk. ``_mtime`` busts the cache on change."""
+    P = load_pipeline(PIPELINE_PATH)
+    raw = pd.read_excel(path, header=2)
+    return _clean(raw, P)
+
+
+@st.cache_data(show_spinner="Loading raw data…")
+def load_raw_from_bytes(_data, name):
+    """Read + clean an uploaded raw file (cached on its bytes)."""
+    P = load_pipeline(PIPELINE_PATH)
+    raw = pd.read_excel(BytesIO(_data), header=2)
+    return _clean(raw, P)
+
+
+@st.cache_data(show_spinner="Loading list prices…")
+def load_prices_from_path(path, _mtime):
+    """Load a SKU -> List Price (USD) Series from disk. ``_mtime`` busts cache."""
+    P = load_pipeline(PIPELINE_PATH)
+    if not hasattr(P, "load_list_prices"):
+        return None
+    return P.load_list_prices(path)
+
+
+@st.cache_data(show_spinner="Loading list prices…")
+def load_prices_from_bytes(_data, name):
+    """Load list prices from an uploaded workbook (cached on its bytes).
+
+    Writes to a temp file so the pipeline's own reader/cleaner is reused
+    (keeping a single source of truth for how prices are parsed).
+    """
+    P = load_pipeline(PIPELINE_PATH)
+    if not hasattr(P, "load_list_prices"):
+        return None
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+        tf.write(_data)
+        tmp = tf.name
+    try:
+        return P.load_list_prices(tmp)
+    finally:
+        os.remove(tmp)
+
+
+def list_views(df):
+    """Group views organised by region, plus the combined ALL CUSTOMERS view."""
+    P = load_pipeline(PIPELINE_PATH)
+    groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
+    by_region = {}
+    for g in groups:
+        by_region.setdefault(P.region_for_group(g), []).append(g)
+    return by_region
+
+
+@st.cache_data(show_spinner="Building forecast…")
+def compute_view(df, view, today_ts, prices=None, alpha=None, beta=None, phi=None,
+                 min_weeks=None):
+    """Recompute summary + weekly + per-week aggregate for the selected view.
+
+    Returns (summary_df, weekly_df, agg_frame) where agg_frame is the SKU-week
+    POS/Orders/Projection table (used to draw historical actuals and the original
+    projection). For ALL CUSTOMERS the breakdown is included so the summary
+    carries 'Top Volume Customer Groups'. When ``prices`` (a SKU -> price Series)
+    is supplied and the pipeline supports it, the summary also carries
+    'List Price (USD)' and 'Revenue Risk (USD)'. ``alpha`` / ``beta`` / ``phi``,
+    when given, override the pipeline's smoothing constants for this call, and
+    ``min_weeks`` overrides MIN_WEEKS_FOR_TREND (all are part of the cache key, so
+    moving a slider recomputes the forecast).
+    """
+    P = load_pipeline(PIPELINE_PATH)
+    kwargs = {}
+    if prices is not None and _supports_prices(P):
+        kwargs["list_prices"] = prices
+    if None not in (alpha, beta, phi) and _supports_smoothing(P):
+        kwargs.update(alpha=alpha, beta=beta, phi=phi)
+    if min_weeks is not None and _supports_min_weeks(P):
+        kwargs["min_weeks_for_trend"] = min_weeks
+    if view == ALL_CUSTOMERS_VIEW:
+        combined_label = getattr(
+            P, "ALL_CUSTOMERS_LABEL", getattr(P, "ALL_SKUS_LABEL", ALL_CUSTOMERS_VIEW)
+        )
+        agg = P.aggregate_to_sku_week(df)
+        summary, weekly = P.fit_regression(
+            agg, today_ts, grouping_label=combined_label,
+            breakdown_df=df, **kwargs,
+        )
+    else:
+        sub = df[df["Customer Grouping"] == view]
+        agg = P.aggregate_to_sku_week(sub)
+        summary, weekly = P.fit_regression(
+            agg, today_ts, grouping_label=view, **kwargs
+        )
+    return summary, weekly, agg
+
+
+def view_to_excel(summary_df, weekly_df):
+    """Build an in-memory .xlsx (same two-sheet layout as the pipeline output)."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        summary_df.to_excel(w, sheet_name="summary", index=False)
+        weekly_df.to_excel(w, sheet_name="weekly_forecast", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def summary_to_excel(summary_df, sheet_name="summary"):
+    """Build an in-memory single-sheet .xlsx of a summary table.
+
+    Used for the by-SKU-and-customer table, which mirrors the pipeline's
+    ALL_CUSTOMERS_demand_projections file (a single concatenated summary sheet).
+    """
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        summary_df.to_excel(w, sheet_name=sheet_name, index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner="Building per-customer forecast…")
+def compute_by_customer(df, today_ts, prices=None, alpha=None, beta=None, phi=None,
+                        min_weeks=None):
+    """Per-(SKU, Customer Grouping) summary — the rows behind ALL_CUSTOMERS.
+
+    The pipeline's ``ALL_CUSTOMERS_demand_projections`` file is just a
+    concatenation of every per-customer-group summary sheet. This reproduces it
+    live: for each Customer Grouping we run the identical per-group forecast the
+    pipeline files under its region (``fit_regression`` with that group's label,
+    no breakdown_df), then stack the summaries. Recomputing rather than reading
+    the saved workbook keeps this table on the same snapshot / prices / smoothing
+    as the rest of the page (the dashboard's single-source-of-truth design).
+    ``alpha`` / ``beta`` / ``phi`` and ``min_weeks``, when given, override the
+    pipeline's constants (and are part of the cache key, so the sliders recompute).
+
+    Returns a DataFrame in the pipeline's SUMMARY_COLUMNS order, or None if no
+    group had anything to forecast.
+    """
+    P = load_pipeline(PIPELINE_PATH)
+    kwargs = {}
+    if prices is not None and _supports_prices(P):
+        kwargs["list_prices"] = prices
+    if None not in (alpha, beta, phi) and _supports_smoothing(P):
+        kwargs.update(alpha=alpha, beta=beta, phi=phi)
+    if min_weeks is not None and _supports_min_weeks(P):
+        kwargs["min_weeks_for_trend"] = min_weeks
+
+    frames = []
+    for group in sorted(df["Customer Grouping"].dropna().unique().tolist()):
+        sub = df[df["Customer Grouping"] == group]
+        agg = P.aggregate_to_sku_week(sub)
+        summary, _ = P.fit_regression(
+            agg, today_ts, grouping_label=group, **kwargs
+        )
+        if summary is not None and not summary.empty:
+            frames.append(summary)
+
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+# --------------------------------------------------------------------------- #
+# Demand-signal helpers (POS-then-Orders, matching the pipeline)              #
+# --------------------------------------------------------------------------- #
+AVG_COL = "8 Week POS/Orders Average"  # renamed metric in the updated pipeline
+
+
+def source_map(summary):
+    """SKU -> 'POS' or 'Orders' (whichever the forecast used)."""
+    if "Data Source" not in summary.columns:
+        return {}
+    return dict(zip(summary["SKU"].astype(str), summary["Data Source"]))
+
+
+def historical_window(agg, summary, anchors):
+    """Per SKU-week actual demand in the 8-week window, using each SKU's source.
+
+    Adds a single 'demand' column = POS for POS-based SKUs, Orders for
+    Orders-based SKUs, so totals line up with the (mixed-source) forecast.
+    """
+    lb, lcw, _ = anchors
+    src = source_map(summary)
+    h = agg[(agg["WeekDate"] >= lb) & (agg["WeekDate"] <= lcw)].copy()
+    h["SKU"] = h["SKU"].astype(str)
+    use_orders = h["SKU"].map(src).eq("Orders")
+    orders = h["Orders"] if "Orders" in h.columns else np.nan
+    h["demand"] = np.where(use_orders, orders, h["POS"])
+    return h
+
+
+# --------------------------------------------------------------------------- #
+# Charts                                                                      #
+# --------------------------------------------------------------------------- #
+def _base_layout(fig, title, forecast_start, y_title="Units (POS / Orders)"):
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=16)),
+        margin=dict(l=10, r=10, t=80, b=10),
+        height=420,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=0.98, x=0),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    fig.update_xaxes(gridcolor=C_GRID, title=None)
+    fig.update_yaxes(gridcolor=C_GRID, rangemode="tozero", title=y_title)
+    if forecast_start is not None:
+        fig.add_vline(
+            x=forecast_start, line_width=1, line_dash="dot",
+            line_color="rgba(100,116,139,0.7)",
+        )
+        fig.add_annotation(
+            x=forecast_start, yref="paper", y=0.93, yanchor="bottom",
+            text="forecast →", showarrow=False, font=dict(size=11, color="#64748b"),
+            xshift=4,
+        )
+    return fig
+
+
+def aggregate_chart(agg, summary, weekly, anchors, view):
+    """Total actual demand (8 wks) flowing into total forecast (15 wks).
+
+    Historical demand uses each SKU's forecast source (POS or Orders) so the
+    actual total is comparable to the forecast total.
+    """
+    lb, lcw, ffw = anchors
+
+    hist = historical_window(agg, summary, anchors)
+    hist_tot = hist.groupby("WeekDate")["demand"].sum(min_count=1).reset_index()
+
+    fc = weekly.copy()
+    fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
+    fc_tot = fc.groupby("WeekDate")["projected_pos"].sum().reset_index()
+
+    # Original projection: restrict to the SAME 15 forecast weeks as the updated
+    # forecast (and the Initial Projection Average), so the grey line spans the
+    # forecast horizon rather than the original projection's full future extent.
+    horizon_end = pd.to_datetime(weekly["WeekDate"]).max()
+    sys_proj = agg[
+        (agg["WeekDate"] >= ffw) & (agg["WeekDate"] <= horizon_end)
+    ].dropna(subset=["Projection"])
+    sys_tot = sys_proj.groupby("WeekDate")["Projection"].sum().reset_index()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist_tot["WeekDate"], y=hist_tot["demand"], name="Actual demand",
+        mode="lines+markers", line=dict(color=C_ACTUAL, width=3),
+        marker=dict(size=6),
+    ))
+    if not hist_tot.empty and not fc_tot.empty:
+        fig.add_trace(go.Scatter(
+            x=[hist_tot["WeekDate"].iloc[-1], fc_tot["WeekDate"].iloc[0]],
+            y=[hist_tot["demand"].iloc[-1], fc_tot["projected_pos"].iloc[0]],
+            mode="lines", showlegend=False,
+            line=dict(color=C_UPDATED, width=2, dash="dot"), hoverinfo="skip",
+        ))
+    fig.add_trace(go.Scatter(
+        x=fc_tot["WeekDate"], y=fc_tot["projected_pos"], name="Updated forecast",
+        mode="lines+markers", line=dict(color=C_UPDATED, width=3, dash="dash"),
+        marker=dict(size=6),
+    ))
+    if not sys_tot.empty:
+        fig.add_trace(go.Scatter(
+            x=sys_tot["WeekDate"], y=sys_tot["Projection"], name="Original projection",
+            mode="lines+markers", line=dict(color=C_ORIGINAL, width=2, dash="dot"),
+            marker=dict(size=5),
+        ))
+    return _base_layout(fig, f"Total weekly demand — {view}", ffw)
+
+
+def sku_chart(sku, desc, source, agg, weekly, anchors):
+    """Per-SKU: actuals (8 wks, from its source) + updated forecast + original proj."""
+    lb, lcw, ffw = anchors
+    col = "Orders" if source == "Orders" else "POS"
+
+    a = agg[agg["SKU"].astype(str) == str(sku)].sort_values("WeekDate")
+    hist = a[(a["WeekDate"] >= lb) & (a["WeekDate"] <= lcw)].dropna(subset=[col])
+    # Original projection: same 15 forecast weeks as the updated forecast, so it
+    # doesn't run past the horizon (matches the Initial Projection Average).
+    horizon_end = pd.to_datetime(weekly["WeekDate"]).max()
+    sys_proj = a[
+        (a["WeekDate"] >= ffw) & (a["WeekDate"] <= horizon_end)
+    ].dropna(subset=["Projection"])
+
+    fc = weekly[weekly["SKU"].astype(str) == str(sku)].copy()
+    fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist["WeekDate"], y=hist[col], name=f"Actual {source}",
+        mode="lines+markers", line=dict(color=C_ACTUAL, width=3),
+        marker=dict(size=7),
+    ))
+    if not hist.empty and not fc.empty:
+        fig.add_trace(go.Scatter(
+            x=[hist["WeekDate"].iloc[-1], fc["WeekDate"].iloc[0]],
+            y=[hist[col].iloc[-1], fc["projected_pos"].iloc[0]],
+            mode="lines", showlegend=False,
+            line=dict(color=C_UPDATED, width=2, dash="dot"), hoverinfo="skip",
+        ))
+    fig.add_trace(go.Scatter(
+        x=fc["WeekDate"], y=fc["projected_pos"],
+        name=f"Updated forecast (from {source})",
+        mode="lines+markers", line=dict(color=C_UPDATED, width=3, dash="dash"),
+        marker=dict(size=7),
+    ))
+    if not sys_proj.empty:
+        fig.add_trace(go.Scatter(
+            x=sys_proj["WeekDate"], y=sys_proj["Projection"],
+            name="Original projection", mode="lines+markers",
+            line=dict(color=C_ORIGINAL, width=2, dash="dot"), marker=dict(size=5),
+        ))
+    title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
+    return _base_layout(fig, title, ffw, y_title=f"Units ({source})")
+
+
+# --------------------------------------------------------------------------- #
+# Summary table styling                                                       #
+# --------------------------------------------------------------------------- #
+def style_summary(summary_df):
+    """Format numbers and colour the up/down columns (up green / down red)."""
+    df = summary_df.copy()
+    int_cols = [c for c in [
+        "Weeks with data", "Initial Projection Average",
+        "Updated Projection Average", "Projection Difference",
+    ] if c in df.columns]
+    fmt = {c: "{:,.0f}" for c in int_cols}
+    if AVG_COL in df.columns:
+        fmt[AVG_COL] = "{:,.1f}"
+    if PRICE_COL in df.columns:
+        fmt[PRICE_COL] = "${:,.2f}"
+    if RISK_COL in df.columns:
+        fmt[RISK_COL] = "${:,.0f}"
+
+    def colour_diff(v):
+        if pd.isna(v):
+            return ""
+        if v > 0:
+            return "color:#15803d;font-weight:600"
+        if v < 0:
+            return "color:#b91c1c;font-weight:600"
+        return "color:#64748b"
+
+    sty = df.style.format(fmt, na_rep="—")
+    # Colour both the unit difference and the dollar revenue risk by direction.
+    diff_cols = [c for c in ["Projection Difference", RISK_COL] if c in df.columns]
+    if diff_cols:
+        sty = sty.map(colour_diff, subset=diff_cols)
+    return sty
+
+
+# --------------------------------------------------------------------------- #
+# App                                                                         #
+# --------------------------------------------------------------------------- #
+def main():
+    st.set_page_config(
+        page_title="Demand Projections", page_icon="📦", layout="wide"
+    )
+    P = load_pipeline(PIPELINE_PATH)
+    st.title("📦 Demand Projection Dashboard")
+    if _supports_smoothing(P):
+        st.caption(
+            "15-week Holt damped-trend forecast from the historical demand "
+            "window (POS where available, else Orders). Tune the smoothing "
+            "(α/β/φ) in the sidebar — changes recompute live."
+        )
+    else:
+        st.caption(
+            "15-week forecasts from the historical demand window "
+            f"(POS where available, else Orders; trend weight = {P.TREND_WEIGHT})."
+        )
+
+    # ----- Data source -----------------------------------------------------
+    with st.sidebar:
+        st.header("Data source")
+        files = discover_raw_files()
+        df = None
+        today_str = None
+
+        if files:
+            labels = {f"{d}  ({os.path.basename(p)})": (d, p) for d, p in files}
+            choice = st.selectbox("Snapshot (raw file)", list(labels.keys()))
+            today_str, path = labels[choice]
+            df = load_raw_from_path(path, os.path.getmtime(path))
+        else:
+            st.info(f"Upload the Demand Planning Details and Plytix files below.")
+
+        with st.expander("Upload the Demand Planning Details Projections from PowerBI", expanded=not files):
+            up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
+            if up is not None:
+                data = up.getvalue()
+                df = load_raw_from_bytes(data, up.name)
+                today_str = _date_from_name(up.name)
+
+        # ----- List prices (drive revenue risk) ---------------------------
+        st.header("Revenue risk")
+        prices = None
+        price_file = discover_price_file()
+        with st.expander("Upload Plytix file with list prices", expanded=not files):
+            up_price = st.file_uploader(
+                "list_prices_*.xlsx", type=["xlsx"], key="price_upload",
+                help="SKU + List Price USD. Used for revenue risk = "
+                    "projection difference × list price.",
+            )
+            if up_price is not None:
+                prices = load_prices_from_bytes(up_price.getvalue(), up_price.name)
+                if prices is not None:
+                    st.success(f"{len(prices):,} list prices (uploaded)")
+            elif price_file is not None:
+                prices = load_prices_from_path(price_file, os.path.getmtime(price_file))
+                if prices is not None:
+                    st.success(
+                        f"{len(prices):,} list prices "
+                        f"({os.path.basename(price_file)})"
+                    )
+
+    if df is None:
+        st.warning("Pick or upload a raw data file to get started.")
+        st.stop()
+
+    if not today_str:
+        today_str = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
+        st.sidebar.warning(
+            "No date found in the filename — anchoring to today instead."
+        )
+    today_ts = pd.Timestamp(today_str)
+    lb, lcw, ffw = P.week_anchors(today_ts)
+
+    # ----- View selector ---------------------------------------------------
+    with st.sidebar:
+        st.header("View")
+        by_region = list_views(df)
+        scope = st.radio(
+            "Scope", [ALL_CUSTOMERS_VIEW, "By customer group"], index=0
+        )
+        if scope == ALL_CUSTOMERS_VIEW:
+            view = ALL_CUSTOMERS_VIEW
+        else:
+            region = st.selectbox("Region", sorted(by_region.keys()))
+            view = st.selectbox("Customer group", by_region[region])
+
+    # ----- Model parameters (Holt damped-trend smoothing) ------------------
+    min_weeks = None
+    with st.sidebar:
+        st.header("Model parameters")
+        smoothing_ok = _supports_smoothing(P)
+        min_weeks_ok = _supports_min_weeks(P)
+
+        if smoothing_ok or min_weeks_ok:
+            # The pipeline's own constants are the "file defaults" the reset
+            # button snaps back to.
+            a0 = float(getattr(P, "ALPHA", 0.5))
+            b0 = float(getattr(P, "BETA", 0.3))
+            p0 = float(getattr(P, "PHI", 0.85))
+            mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
+
+            # Seed each slider's state once so it starts at the file default.
+            # Passing the value via session_state (rather than the slider's own
+            # ``value`` arg) is what lets the reset callback below overwrite it.
+            seeds = []
+            if smoothing_ok:
+                seeds += [("sl_alpha", a0), ("sl_beta", b0), ("sl_phi", p0)]
+            if min_weeks_ok:
+                seeds += [("sl_min_weeks", mw0)]
+            for k, v in seeds:
+                st.session_state.setdefault(k, v)
+
+            def _reset_smoothing():
+                # Runs before the sliders are rebuilt on the next run, so it can
+                # safely set their state — the reliable way to move a widget.
+                if smoothing_ok:
+                    st.session_state["sl_alpha"] = a0
+                    st.session_state["sl_beta"] = b0
+                    st.session_state["sl_phi"] = p0
+                if min_weeks_ok:
+                    st.session_state["sl_min_weeks"] = mw0
+
+            if smoothing_ok:
+                st.caption(
+                    "Lower α/β lean on more history and less on recent weeks; "
+                    "lower φ flattens the projection. Moving a slider recomputes."
+                )
+                alpha = st.slider(
+                    "α — level smoothing", min_value=0.01, max_value=0.99,
+                    step=0.01, key="sl_alpha",
+                    help="Higher tracks recent weeks faster; lower ≈ a longer moving "
+                         "average (effective window ≈ 2/α − 1 weeks).",
+                )
+                beta = st.slider(
+                    "β — trend smoothing", min_value=0.0, max_value=0.99,
+                    step=0.01, key="sl_beta",
+                    help="Higher re-estimates the slope from recent weeks; 0 freezes it.",
+                )
+                phi = st.slider(
+                    "φ — trend damping", min_value=0.0, max_value=1.0,
+                    step=0.05, key="sl_phi",
+                    help="Lower flattens the forecast toward the current level; "
+                         "1 = plain (undamped) Holt.",
+                )
+            else:
+                alpha = beta = phi = None
+
+            if min_weeks_ok:
+                min_weeks = st.slider(
+                    "min weeks for trend", min_value=2, max_value=12, step=1,
+                    key="sl_min_weeks",
+                    help="SKUs with fewer completed weeks than this are forecast "
+                         "flat at their mean instead of extrapolating a trend — "
+                         "prevents runaway projections from 1–2 weeks of data. "
+                         "2 disables the guard.",
+                )
+
+            bits = []
+            if smoothing_ok:
+                bits.append(f"α={a0:g}, β={b0:g}, φ={p0:g}")
+            if min_weeks_ok:
+                bits.append(f"min weeks={mw0}")
+            st.button(
+                "Reset to file defaults", on_click=_reset_smoothing,
+                help="Restore " + "; ".join(bits) + " from the pipeline file.",
+            )
+        else:
+            alpha = beta = phi = None
+            st.info(
+                "This pipeline's fit_regression doesn't accept α/β/φ or min-weeks "
+                "overrides, so its own module-level constants are used."
+            )
+
+    summary, weekly, agg = compute_view(
+        df, view, today_ts, prices, alpha, beta, phi, min_weeks
+    )
+
+    if summary is None or summary.empty:
+        st.error(
+            f"No POS or Orders in the 8-week window for **{view}** — "
+            "nothing to forecast."
+        )
+        st.stop()
+
+    # ----- Header / windows -------------------------------------------------
+    st.subheader(view)
+    model_bits = []
+    if alpha is not None:
+        model_bits.append(f"α = {alpha:.2f}, β = {beta:.2f}, φ = {phi:.2f}")
+    if min_weeks is not None:
+        model_bits.append(f"min weeks for trend = {min_weeks}")
+    if model_bits:
+        st.caption("Model in use — " + "; ".join(model_bits))
+    w1, w2 = st.columns(2)
+    w1.markdown(
+        f"**Historical window** &nbsp; {lb.date()} → {lcw.date()} "
+        f"<span style='color:#64748b'>(8 completed weeks)</span>",
+        unsafe_allow_html=True,
+    )
+    fc_weeks = pd.to_datetime(weekly["WeekDate"])
+    w2.markdown(
+        f"**Forecast window** &nbsp; {ffw.date()} → "
+        f"{fc_weeks.max().date()} "
+        f"<span style='color:#64748b'>({fc_weeks.nunique()} weeks)</span>",
+        unsafe_allow_html=True,
+    )
+
+    # ----- KPIs -------------------------------------------------------------
+    total_avg = summary[AVG_COL].sum()
+    total_updated = summary["Updated Projection Average"].sum()
+    total_initial = summary["Initial Projection Average"].sum()
+    diff = total_updated - total_initial
+    n_orders = int((summary.get("Data Source") == "Orders").sum()) \
+        if "Data Source" in summary.columns else 0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric(
+        "SKUs forecast", f"{len(summary):,}",
+        help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
+    )
+    k2.metric("Avg weekly demand (8 wk)", f"{total_avg:,.0f}")
+    k3.metric("Updated proj. (avg/wk)", f"{total_updated:,.0f}")
+    k4.metric(
+        "vs original projection", f"{diff:+,.0f}",
+        delta=f"{(diff / total_initial * 100):+.1f}%" if total_initial else None,
+    )
+    has_risk = RISK_COL in summary.columns and summary[RISK_COL].notna().any()
+    if has_risk:
+        net_risk = summary[RISK_COL].sum()
+        k5.metric(
+            "Revenue risk (net)", f"${net_risk:+,.0f}",
+            help="Σ (projection difference × list price) over priced SKUs. "
+                 "Negative = forecast fell below the original projection.",
+        )
+    else:
+        k5.metric(
+            "Revenue risk (net)", "—",
+            help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
+        )
+    if n_orders:
+        st.caption(
+            f"⚑ {n_orders} of {len(summary)} SKUs had no POS in the window and "
+            "were forecast from Orders (see the Data Source column)."
+        )
+    if PRICE_COL in summary.columns:
+        n_noprice = int(summary[PRICE_COL].isna().sum())
+        if n_noprice:
+            st.caption(
+                f"💲 {n_noprice} of {len(summary)} SKUs have no list price; "
+                "their revenue risk is left blank."
+            )
+
+    # ----- Aggregate chart --------------------------------------------------
+    st.plotly_chart(
+        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view),
+        width="stretch",
+    )
+
+    # ----- Per-SKU detail ---------------------------------------------------
+    st.markdown("### SKU detail")
+    skus = summary["SKU"].astype(str).tolist()
+    sku = st.selectbox("SKU", skus, help="Type to search")
+    row = summary.loc[summary["SKU"].astype(str) == sku].iloc[0]
+    desc = row["Description"] if isinstance(row["Description"], str) else ""
+    source = row["Data Source"] if "Data Source" in summary.columns else "POS"
+
+    cL, cR = st.columns([3, 1])
+    with cL:
+        st.plotly_chart(
+            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw)),
+            width="stretch",
+        )
+    with cR:
+        st.metric("Data source", source)
+        st.metric(f"8 wk {source} avg", f"{row[AVG_COL]:,.1f}")
+        st.metric("Updated proj.", f"{row['Updated Projection Average']:,.0f}")
+        sysv = row.get("Initial Projection Average")
+        st.metric("Original proj.", "—" if pd.isna(sysv) else f"{sysv:,.0f}")
+        st.metric(
+            "Difference",
+            f"{row['Projection Difference']:+,.0f}"
+            if pd.notna(row["Projection Difference"]) else "—",
+        )
+        if RISK_COL in summary.columns:
+            pv = row.get(PRICE_COL)
+            rv = row.get(RISK_COL)
+            st.metric("List price", "—" if pd.isna(pv) else f"${pv:,.2f}")
+            st.metric(
+                "Revenue risk",
+                "—" if pd.isna(rv) else f"${rv:+,.0f}",
+                help="Projection difference × list price.",
+            )
+        if "Top Volume Customer Groups" in summary.columns:
+            st.markdown("**Top volume groups**")
+            st.caption(row["Top Volume Customer Groups"])
+
+    # ----- Summary table ----------------------------------------------------
+    st.markdown("### Summary table by SKU")
+    summary_table = summary
+    if RISK_COL in summary.columns and summary[RISK_COL].notna().any():
+        # Largest revenue risk first, by magnitude (a big drop is as much a
+        # "risk" as a big gain); SKUs with no price (blank risk) sort to the end.
+        summary_table = (
+            summary.assign(_abs_risk=summary[RISK_COL].abs())
+            .sort_values("_abs_risk", ascending=False, na_position="last")
+            .drop(columns="_abs_risk")
+            .reset_index(drop=True)
+        )
+        st.caption("Ordered by largest revenue risk (by magnitude); blanks last.")
+    st.dataframe(
+        style_summary(summary_table), width="stretch", hide_index=True
+    )
+    st.download_button(
+        "⬇️ Download the summary table by SKU",
+        data=view_to_excel(summary_table, weekly),
+        file_name=f"{view.replace('/', '-').replace(' ', '_')}"
+                  f"_demand_projections_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_by_sku",
+    )
+
+    # ----- Summary table by SKU and Customer (ALL CUSTOMERS view only) ------
+    # Mirrors the pipeline's ALL_CUSTOMERS_demand_projections file: every SKU
+    # broken out by customer group. Recomputed live (see compute_by_customer)
+    # so it stays on the same snapshot / prices as the SKU table above.
+    if view == ALL_CUSTOMERS_VIEW:
+        st.markdown("### Summary table by SKU and Customer")
+        by_cust = compute_by_customer(
+            df, today_ts, prices, alpha, beta, phi, min_weeks
+        )
+        if by_cust is None or by_cust.empty:
+            st.info("No per-customer forecasts to show for this snapshot.")
+        else:
+            if RISK_COL in by_cust.columns and by_cust[RISK_COL].notna().any():
+                # Keep each SKU's customers together; within a SKU show the
+                # largest revenue risk (by magnitude) first, blanks last.
+                by_cust_table = (
+                    by_cust.assign(_abs_risk=by_cust[RISK_COL].abs())
+                    .sort_values(
+                        ["SKU", "_abs_risk"],
+                        ascending=[True, False],
+                        na_position="last",
+                    )
+                    .drop(columns="_abs_risk")
+                    .reset_index(drop=True)
+                )
+                st.caption(
+                    "Each SKU broken out by customer group; within a SKU, "
+                    "largest revenue risk first (by magnitude)."
+                )
+            else:
+                by_cust_table = (
+                    by_cust.sort_values(["SKU", "Customer Grouping"])
+                    .reset_index(drop=True)
+                )
+                st.caption("Each SKU broken out by customer group.")
+            st.dataframe(
+                style_summary(by_cust_table), width="stretch", hide_index=True
+            )
+            st.download_button(
+                "⬇️ Download the summary table by SKU and Customer",
+                data=summary_to_excel(by_cust_table),
+                file_name=f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_by_customer",
+            )
+
+
+if __name__ == "__main__":
+    main()
