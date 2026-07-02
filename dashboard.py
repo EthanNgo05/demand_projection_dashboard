@@ -695,10 +695,13 @@ def main():
             st.stop()
 
         def _on_model_change():
-            # Pipelines ship their own smoothing defaults, so drop the slider
-            # state and let it re-seed from the newly selected pipeline.
-            for k in ("sl_alpha", "sl_beta", "sl_phi", "sl_min_weeks"):
-                st.session_state.pop(k, None)
+            # Bump the parameter nonce so the sliders are rebuilt as fresh
+            # widgets keyed to the new nonce, re-reading the newly selected
+            # pipeline's value= defaults. (A structural change also recomputes
+            # automatically via the compute gate.)
+            st.session_state["param_nonce"] = (
+                st.session_state.get("param_nonce", 0) + 1
+            )
 
         st.radio(
             "Forecasting model", list(MODEL_OPTIONS.keys()),
@@ -837,21 +840,22 @@ def main():
             p0 = float(getattr(P, "PHI", 0.85))
             mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
 
-            # Slider defaults come from the pipeline constants and are passed
-            # via each slider's ``value=`` argument below. Reset and model
-            # switching work by DELETING the widget keys so the sliders re-read
-            # ``value=`` on the next run. We never assign a number into
-            # session_state for a keyed slider: pre-seeding like that is what
-            # previously left the sliders pinned to their minimums, because a
-            # keyed widget takes ownership of its state and the pre-seed didn't
-            # reliably reach it on first render.
+            # Slider defaults come from the pipeline constants, passed via each
+            # slider's value= argument. To reset reliably across Streamlit
+            # versions we use a "nonce": the slider keys embed an integer that
+            # we bump on reset (or model switch), which makes Streamlit build
+            # brand-new widgets that re-read value=. This is more robust than
+            # deleting a fixed key, which didn't reliably restore value=.
+            st.session_state.setdefault("param_nonce", 0)
+            nonce = st.session_state["param_nonce"]
+
             def _reset_smoothing():
-                # Delete the widget keys so the sliders re-read their ``value=``
-                # (the pipeline defaults) on the next run, and request a
-                # recompute so the displayed forecast reflects those defaults.
-                for k in ("sl_alpha", "sl_beta", "sl_phi", "sl_min_weeks"):
-                    st.session_state.pop(k, None)
-                st.session_state["_do_recompute"] = True
+                # Only move the sliders back to the file defaults. Do NOT
+                # recompute here — the forecast updates when the user clicks
+                # "Recompute forecast" (a stale notice is shown until then).
+                st.session_state["param_nonce"] = (
+                    st.session_state.get("param_nonce", 0) + 1
+                )
 
             if smoothing_ok:
                 st.caption(
@@ -860,18 +864,18 @@ def main():
                 )
                 alpha = st.slider(
                     "α — level smoothing", min_value=0.01, max_value=0.99,
-                    value=a0, step=0.01, key="sl_alpha",
+                    value=a0, step=0.01, key=f"sl_alpha_{nonce}",
                     help="Higher tracks recent weeks faster; lower ≈ a longer moving "
                          "average (effective window ≈ 2/α − 1 weeks).",
                 )
                 beta = st.slider(
                     "β — trend smoothing", min_value=0.0, max_value=0.99,
-                    value=b0, step=0.01, key="sl_beta",
+                    value=b0, step=0.01, key=f"sl_beta_{nonce}",
                     help="Higher re-estimates the slope from recent weeks; 0 freezes it.",
                 )
                 phi = st.slider(
                     "φ — trend damping", min_value=0.0, max_value=1.0,
-                    value=p0, step=0.05, key="sl_phi",
+                    value=p0, step=0.05, key=f"sl_phi_{nonce}",
                     help="Lower flattens the forecast toward the current level; "
                          "1 = plain (undamped) Holt.",
                 )
@@ -881,7 +885,7 @@ def main():
             if min_weeks_ok:
                 min_weeks = st.slider(
                     "min weeks for trend", min_value=2, max_value=12,
-                    value=mw0, step=1, key="sl_min_weeks",
+                    value=mw0, step=1, key=f"sl_min_weeks_{nonce}",
                     help="SKUs with fewer completed weeks than this are forecast "
                          "flat at their mean instead of extrapolating a trend — "
                          "prevents runaway projections from 1–2 weeks of data. "
@@ -977,7 +981,7 @@ def main():
     # is stale until the user recomputes. Flag it rather than silently updating.
     if st.session_state.get("fc_params") != param_sig:
         st.info(
-            "Parameters changed since this forecast was built — click "
+            "⚠️ Parameters changed since this forecast was built — click "
             "**🔄 Recompute forecast** in the sidebar to apply them.",
             icon="⚠️",
         )
