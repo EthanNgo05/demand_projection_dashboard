@@ -87,6 +87,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_OPTIONS = {
     "Exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
+    "Simple regression": os.path.join(HERE, "models/regression.py"),
 }
 _ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")
 if _ENV_PIPELINE:
@@ -109,8 +110,9 @@ def pipeline_path():
     if choice is None:
         raise FileNotFoundError(
             "No forecasting pipeline found — expected "
-            "models/exponential_smoothing.py or models/xgboost.py next to "
-            "dashboard.py (or set the DEMAND_PIPELINE env var)."
+            "models/exponential_smoothing.py, models/xgboost.py or "
+            "models/regression.py next to dashboard.py "
+            "(or set the DEMAND_PIPELINE env var)."
         )
     return MODEL_OPTIONS[choice]
 
@@ -689,8 +691,9 @@ def main():
         if not MODEL_OPTIONS:
             st.error(
                 "No forecasting pipeline found — expected "
-                "models/exponential_smoothing.py or models/xgboost.py "
-                "next to dashboard.py (or set DEMAND_PIPELINE)."
+                "models/exponential_smoothing.py, models/xgboost.py or "
+                "models/regression.py next to dashboard.py "
+                "(or set DEMAND_PIPELINE)."
             )
             st.stop()
 
