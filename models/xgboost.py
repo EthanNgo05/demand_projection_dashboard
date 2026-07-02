@@ -3,51 +3,54 @@ Updates projections for all SKUs based on combined demand projections for all co
 
 Uses *all* completed weeks of historical POS data to calculate a 15-week
 projection. The in-progress week is excluded so a partially-elapsed week's POS
-never drags the smoothed level (see week_anchors). The amount of history is
-controlled by LOOKBACK_WEEKS (None = all history; set an int to cap it).
+never drags the model (see week_anchors). The amount of history is controlled
+by LOOKBACK_WEEKS (None = all history; set an int to cap it).
 
-This is the exponential-smoothing counterpart of the linear-regression pipeline.
-Instead of fitting a straight line to the history and projecting the slope, it
-runs Holt's linear method with a damped trend (double exponential smoothing):
+This is the XGBoost (gradient-boosted trees) counterpart of the
+exponential-smoothing pipeline. Instead of smoothing a level and a trend, it
+learns a supervised mapping from each week's recent history to the next week's
+demand, pooled across every SKU in the group:
 
-    level_t    = ALPHA * y_t + (1 - ALPHA) * (level_{t-1} + PHI * trend_{t-1})
-    trend_t    = BETA  * (level_t - level_{t-1}) + (1 - BETA) * PHI * trend_{t-1}
-    projected_pos(week_h) = level_T + (PHI + PHI^2 + ... + PHI^h) * trend_T   (h = 1 .. 15)
+    features(SKU, week t) = [ lag_1 .. lag_N, rolling means, weeks since first
+                              sale, position in history, week-of-year sin/cos ]
+    target(SKU, week t)   = demand at week t   (scaled by the SKU's own mean,
+                                                so big and small SKUs share one
+                                                model without the big ones
+                                                dominating the loss)
 
-    - ALPHA : level smoothing  (0..1) -- how fast the level tracks recent demand
-    - BETA  : trend smoothing  (0..1) -- how fast the slope adapts (the ES analogue
-                                         of the old TREND_WEIGHT; exposed as
-                                         TREND_WEIGHT for dashboard compatibility)
-    - PHI   : trend damping    (0..1) -- < 1 flattens the trend the further out we
-                                         forecast, so a short-run slope is not
-                                         extrapolated indefinitely (PHI = 1 -> plain
-                                         Holt; PHI = 0 -> flat at the level)
-    - updated_projection_avg (per SKU) = mean of the 15 weekly projected_pos values
+One model is trained per group (per fit_xgboost call) on all of its SKUs'
+week-rows together, then each SKU is forecast 15 weeks ahead RECURSIVELY: the
+week-1 prediction is appended to the history to build week-2's features, and so
+on. Pooling matters because individual SKU series here are short (often 10-40
+weeks) -- far too little to train a tree ensemble per SKU -- while the pooled
+group easily has hundreds or thousands of training rows.
 
-Compared with the regression version this reacts more smoothly to noise, weights
-recent weeks more heavily than older ones, and -- thanks to the damping -- tapers
-an unsustainable trend rather than letting it run away over the 15-week horizon.
+Hyperparameters live in XGB_PARAMS / N_LAGS / ROLL_WINDOWS below. They are
+deliberately NOT exposed to the dashboard: fit_xgboost's signature carries no
+alpha/beta/phi, so the dashboard's smoothing sliders hide themselves (it
+inspects the signature), while ``min_weeks_for_trend`` IS accepted so the
+min-weeks slider keeps working.
 
-Before fitting, each SKU's series is cleansed of one-off promo spikes (e.g. Amazon
-Prime Day) and stockout dips: abnormal weeks are detected automatically (rolling
-median +/- OUTLIER_K MADs) and/or named explicitly (PROMO_WEEKS), then replaced
-with a local baseline so they don't inflate the smoothed level. Every cleaned week
-is written to a ``cleaned_outliers_<date>.txt`` record (see CLEANSE_OUTLIERS and
-``cleanse_series``).
+Short-history handling matches the exponential-smoothing pipeline: SKUs with
+fewer completed weeks than MIN_WEEKS_FOR_TREND are forecast FLAT at their mean
+(no model), which stops one-off orders (e.g. "Others - AU") from producing
+runaway projections. If a group is too small to train on at all (fewer than
+MIN_TRAIN_ROWS pooled samples), every SKU falls back to a flat-mean forecast.
+
+Before fitting, each SKU's series is cleansed of one-off promo spikes (e.g.
+Amazon Prime Day) and stockout dips exactly as in the smoothing pipeline:
+abnormal weeks are detected automatically (rolling median +/- OUTLIER_K MADs)
+and/or named explicitly (PROMO_WEEKS), then replaced with a local baseline.
+Every cleaned week is written to a ``cleaned_outliers_<date>.txt`` record.
 
 Promos also lift future demand, so any PROMO_WEEKS date that lands inside the
-15-week horizon has its projection scaled up by a promo uplift factor (fixed, or
-estimated per SKU from its own past promos). Cleansing removes the historical
-spike to get an honest baseline; the uplift re-adds the expected lift onto the
-upcoming promo weeks (baseline + uplift). Uplifted weeks are recorded to a
-``promo_uplift_<date>.txt`` file (see PROMO_UPLIFT).
+15-week horizon has its projection scaled up by a promo uplift factor (fixed,
+or estimated per SKU from its own past promos). Uplifted weeks are recorded to
+a ``promo_uplift_<date>.txt`` file (see PROMO_UPLIFT).
 
 Two kinds of output are produced:
     1) Per-group     : one file per Customer Grouping (see COMBINED_GROUPING),
-                       summing POS across the customers that make up the group
-                       (e.g. the three Amazon-DC channels become one AMAZON-DC
-                       forecast). Customers not in the mapping become their own
-                       single-member group.
+                       summing POS across the customers that make up the group.
     2) All-customers : a single file forecasting each SKU "as a whole", built by
                        summing POS (and the existing Projection) across every
                        customer for each SKU-week before fitting.
@@ -61,70 +64,71 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-# --- Exponential smoothing (Holt's damped-trend) parameters ---------------- #
-# All in [0, 1]. Defaults are deliberately conservative: a moderately responsive
-# level, a gently adapting trend, and damping so the trend tapers rather than
-# runs away over the 15-week horizon.
-ALPHA = 0.15   # level smoothing  -- higher = track recent demand faster
-BETA = 0.05    # trend smoothing  -- higher = let the slope change faster
-PHI = 0.6    # trend damping    -- < 1 flattens the trend further out (1 = plain Holt)
+# --- XGBoost model parameters ----------------------------------------------- #
+# One gradient-boosted-tree model is trained per group, pooled across its SKUs.
+# These are module-level constants on purpose: the dashboard does NOT expose
+# them (its smoothing sliders key off alpha/beta/phi in the fit signature,
+# which this pipeline deliberately omits). Tune them here.
+XGB_PARAMS = dict(
+    n_estimators=300,        # boosting rounds
+    learning_rate=0.05,      # shrinkage per round (lower = smoother, needs more rounds)
+    max_depth=4,             # tree depth -- shallow trees generalise better on small data
+    min_child_weight=5,      # min sum of instance weight per leaf (regularisation)
+    subsample=0.9,           # row subsampling per tree
+    colsample_bytree=0.9,    # feature subsampling per tree
+    reg_lambda=1.0,          # L2 regularisation
+    objective="reg:squarederror",
+    random_state=42,
+    n_jobs=-1,
+    verbosity=0,
+)
 
-# Backwards-compatibility alias. The dashboard reads ``TREND_WEIGHT`` for a
-# caption; in Holt's method BETA *is* the weight given to the trend, so it is the
-# natural analogue. Nothing in this file's math reads TREND_WEIGHT directly.
-TREND_WEIGHT = BETA
+N_LAGS = 6                   # lagged weeks fed as features (lag_1 .. lag_6)
+ROLL_WINDOWS = (4, 8)        # trailing rolling-mean windows added as features
+MIN_TRAIN_ROWS = 30          # pooled samples needed to train at all; below this
+                             # every SKU in the group is forecast flat at its mean
 
-# Minimum completed weeks of history required before a TREND is fitted. A slope
-# estimated from only a week or two is essentially noise, and Holt's method then
-# extrapolates it across the whole 15-week horizon -- so a single spike in a
-# 2-week series becomes a runaway ramp (e.g. "Others - AU"). Series shorter than
-# this are instead forecast FLAT at their mean (level only, no extrapolation),
-# which is far more sensible when there isn't enough history to see a trend.
+# Backwards-compatibility caption for the dashboard (it shows this string in the
+# header instead of the smoothing-specific blurb).
+DASHBOARD_CAPTION = (
+    "15-week XGBoost (gradient-boosted trees) forecast from the historical "
+    "demand window (POS where available, else Orders). One model per view, "
+    "pooled across its SKUs; hyperparameters are fixed in the pipeline file."
+)
+
+# Minimum completed weeks of history required before the model is used for a
+# SKU. A pattern learned from only a week or two is essentially noise -- so a
+# single spike in a 2-week series would otherwise become a runaway ramp (e.g.
+# "Others - AU"). Series shorter than this are instead forecast FLAT at their
+# mean, which is far more sensible when there isn't enough history.
 # Raise it to be more conservative (more series held flat); 2 disables the guard.
 MIN_WEEKS_FOR_TREND = 4
 
-# --- History window -------------------------------------------------------- #
+# --- History window --------------------------------------------------------- #
 # How many of the most-recent *completed* weeks to fit the model on.
 #   None -> use ALL available history (every completed week up to last week)
-#   int  -> use only the most recent N completed weeks (e.g. 8 for the old window)
-# Exponential smoothing weights recent weeks more heavily anyway, so feeding it
-# all history lets long-run level/trend inform the forecast without old weeks
-# dominating. The in-progress week is always excluded (see week_anchors).
+#   int  -> use only the most recent N completed weeks
+# Tree models benefit from more rows, so all history is the sensible default.
+# The in-progress week is always excluded (see week_anchors).
 LOOKBACK_WEEKS = None
 
 # Sentinel "beginning of time" used as the lower bound when LOOKBACK_WEEKS is
 # None, so a ``WeekDate >= HISTORY_START`` filter keeps every historical week.
 HISTORY_START = pd.Timestamp("2026-03-01")
 
-# --- Intermittent / lumpy demand ------------------------------------------- #
-# The historical series for a SKU only carries rows for weeks that actually had
-# POS (or Orders). Weeks with none are ABSENT, not zero. For sell-through / order
-# demand a missing completed week almost always means "nothing sold/ordered that
-# week" = 0, not "unknown", so dropping those weeks massively inflates a sparse
-# SKU: a customer that ordered 3160 once and nothing for the next two months is
-# otherwise fit as a one-point series and forecast at 3160 EVERY week (this is
-# what blows up "Others - AU", which is entirely one-off orders).
-#
-# With this on, each SKU's series is reindexed to every completed week from its
-# FIRST observation through the last completed week and the gaps filled with 0
-# before cleansing/fitting. Two effects:
-#   * the flat-mean fallback becomes a true weekly average (total / weeks-in-span)
-#     instead of the mean of only the non-zero weeks, and
-#   * "Weeks with data" / MIN_WEEKS_FOR_TREND now count the real elapsed span, so
-#     a single spike is correctly seen as 1 order across many weeks (held flat),
-#     not as a full multi-week history.
-# Leading weeks BEFORE a SKU's first-ever order are NOT zero-filled, so a newly
-# introduced SKU isn't penalised for weeks it didn't yet exist. Set False to
-# restore the old observed-weeks-only behaviour.
+# --- Intermittent / lumpy demand -------------------------------------------- #
+# Same rationale as the smoothing pipeline: a missing completed week almost
+# always means "nothing sold" = 0, so each SKU's series is reindexed to every
+# completed week from its FIRST observation through the last completed week and
+# the gaps filled with 0 before cleansing/fitting. Leading weeks BEFORE a SKU's
+# first-ever order are NOT zero-filled. Set False to restore observed-weeks-only.
 FILL_GAPS_WITH_ZERO = True
 
-# --- Outlier / promo cleansing --------------------------------------------- #
-# One-off spikes (e.g. Amazon Prime Day) and dips (e.g. stockouts) distort an
-# exponential-smoothing fit: with ALPHA=0.5 the level chases the most recent
-# weeks, so a single promotional week can inflate the whole 15-week forecast.
-# Before fitting, abnormal weeks are replaced with a local baseline (the median
-# of nearby normal weeks) so the model learns underlying demand, not the event.
-# Each cleaned week is recorded to a .txt audit file (see __main__).
+# --- Outlier / promo cleansing ---------------------------------------------- #
+# One-off spikes (e.g. Amazon Prime Day) and dips (e.g. stockouts) distort the
+# lag features the trees learn from, so abnormal weeks are replaced with a local
+# baseline (the median of nearby normal weeks) before fitting. Each cleaned week
+# is recorded to a .txt audit file (see __main__).
 #
 # Two sources of flags are unioned:
 #   1. Manual  -- PROMO_WEEKS below (always applied; you know these are promos).
@@ -137,8 +141,7 @@ OUTLIER_MIN_WEEKS = 5         # don't auto-detect on series shorter than this
 
 # Manual promo calendar: weeks you KNOW are abnormal. Any date inside the week
 # works -- it is snapped to that week's start (the Sunday WeekDate) before
-# matching, so you don't have to look up the exact Sunday. Always cleansed,
-# regardless of CLEANSE_OUTLIERS, and recorded with method "manual".
+# matching. Always cleansed, regardless of CLEANSE_OUTLIERS, recorded as "manual".
 PROMO_WEEKS = [
     # "2026-06-26",   # Amazon Prime Day week
     # # "2026-07-?"   # Friends and Family
@@ -150,7 +153,7 @@ PROMO_WEEKS = [
     # "2026-12-15"     # Christmas shopping
 ]
 
-# --- Future promo uplift --------------------------------------------------- #
+# --- Future promo uplift ----------------------------------------------------- #
 # Promos lift sales, so any PROMO_WEEKS date that lands inside the 15-week
 # forecast horizon has its projection scaled UP. (Historical copies of those
 # weeks are still cleansed for the baseline fit above -- this only re-adds the
@@ -159,8 +162,7 @@ PROMO_WEEKS = [
 # PROMO_UPLIFT controls the peak multiplier on a promo week:
 #   a number (e.g. 1.25) -> fixed: multiply promo-week projections by this factor
 #   "auto"               -> estimate the factor per SKU from its OWN historical
-#                           promo weeks (raw / cleansed baseline), falling back to
-#                           PROMO_UPLIFT_DEFAULT when that SKU has no promo history
+#                           promo weeks, falling back to PROMO_UPLIFT_DEFAULT
 PROMO_UPLIFT = 1.25            # "a bit higher"; set "auto" for a data-driven lift
 PROMO_UPLIFT_DEFAULT = 1.25    # fallback factor for "auto" when no SKU history
 PROMO_UPLIFT_MAX = 4.0         # clamp so a noisy estimate can't explode a week
@@ -276,6 +278,36 @@ SUMMARY_COLUMNS = [
 ]
 
 
+# --------------------------------------------------------------------------- #
+# Model backend: XGBoost, with an sklearn fallback so the dashboard still     #
+# runs on a host without the xgboost wheel (e.g. a fresh Streamlit Cloud env) #
+# --------------------------------------------------------------------------- #
+def _make_regressor():
+    """Return an unfitted boosted-tree regressor.
+
+    Prefers xgboost.XGBRegressor with XGB_PARAMS. If xgboost is not installed,
+    falls back to sklearn's HistGradientBoostingRegressor (also NaN-tolerant,
+    also gradient-boosted trees) so the pipeline keeps working; a note is
+    printed so the substitution is visible.
+    """
+    try:
+        from xgboost import XGBRegressor
+        return XGBRegressor(**XGB_PARAMS)
+    except ImportError:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        print(
+            "xgboost is not installed -- falling back to sklearn's "
+            "HistGradientBoostingRegressor (pip install xgboost to use XGBoost)."
+        )
+        return HistGradientBoostingRegressor(
+            max_iter=XGB_PARAMS.get("n_estimators", 300),
+            learning_rate=XGB_PARAMS.get("learning_rate", 0.05),
+            max_depth=XGB_PARAMS.get("max_depth", 4),
+            l2_regularization=XGB_PARAMS.get("reg_lambda", 1.0),
+            random_state=XGB_PARAMS.get("random_state", 42),
+        )
+
+
 def resolve_input_file():
     """Pick the most recent raw data file and anchor the forecast to its snapshot date.
 
@@ -342,24 +374,15 @@ def week_anchors(today):
     the historical (training) window ends at the last fully-completed week.
 
     The forecast, however, STARTS at the current in-progress week rather than
-    skipping to the next full week. That week is only partly elapsed, so it is
-    deliberately kept OUT of the training history (its partial POS would drag
-    the smoothed level), but it still needs a projection -- otherwise it would
-    fall into a gap, plotted as neither an actual nor a forecast. Because Holt's
-    method projects h = 1..15 steps ahead of the last trained week, step h = 1 is
-    exactly this in-progress week, so first_forecast_week = current_week_start
-    also keeps the horizon date labels aligned with the projection steps.
+    skipping to the next full week: that week is deliberately kept OUT of the
+    training history (its partial POS would distort the fit), but it still
+    needs a projection -- otherwise it would fall into a gap, plotted as
+    neither an actual nor a forecast. Step h = 1 of the 15-step horizon is
+    exactly this in-progress week.
 
     The window *start* depends on LOOKBACK_WEEKS: with the default ``None`` the
     lower bound is HISTORY_START (i.e. all available history); set LOOKBACK_WEEKS
     to an int to use only that many most-recent completed weeks instead.
-
-    Example (run on Thu 2026-06-25): the week of 2026-06-21 is still in progress
-    (runs through Sat 2026-06-27), so the training window ends at 2026-06-14.
-    With LOOKBACK_WEEKS=None it starts at HISTORY_START (all history); with
-    LOOKBACK_WEEKS=8 it would start at 2026-04-26. The forecast starts at the
-    in-progress week (2026-06-21): that week is projected but is NOT used to fit
-    the model, so its partial POS never distorts the level/trend.
 
     Returns (lookback_start, last_complete_week, first_forecast_week).
     """
@@ -371,10 +394,6 @@ def week_anchors(today):
     else:
         # N weeks inclusive -> step back N-1 from the last completed week.
         lookback_start = last_complete_week - pd.Timedelta(weeks=LOOKBACK_WEEKS - 1)
-    # Forecast starts at the current in-progress week (not the next full week),
-    # so that partly-elapsed week gets a projection instead of falling into a gap.
-    # It is still excluded from the training window above (which ends at
-    # last_complete_week), so its partial POS never drags the fit.
     first_forecast_week = current_week_start
     return lookback_start, last_complete_week, first_forecast_week
 
@@ -460,12 +479,12 @@ def _mad(a):
 
 def cleanse_series(week_dates, y, promo_week_starts=None, detect=None,
                    k=OUTLIER_K, window=OUTLIER_WINDOW, min_weeks=OUTLIER_MIN_WEEKS):
-    """Replace promo / outlier weeks with a local baseline before smoothing.
+    """Replace promo / outlier weeks with a local baseline before fitting.
 
-    Spikes (Prime Day) and dips (stockouts) corrupt an exponential-smoothing fit
-    because the level chases recent weeks. This returns a cleaned copy of ``y``
-    in which abnormal weeks are swapped for the median of nearby *normal* weeks,
-    so the model sees underlying demand rather than the event.
+    Spikes (Prime Day) and dips (stockouts) corrupt the lag features the trees
+    learn from. This returns a cleaned copy of ``y`` in which abnormal weeks are
+    swapped for the median of nearby *normal* weeks, so the model sees
+    underlying demand rather than the event.
 
     Weeks are flagged from two sources, unioned:
       * Manual -- WeekDate falls in ``promo_week_starts`` (defaults to the module
@@ -576,110 +595,149 @@ def promo_week_multipliers(forecast_weeks, factor, promo_set, halo=PROMO_HALO_WE
     return mult
 
 
-def holt_damped_forecast(y, horizon, alpha=ALPHA, beta=BETA, phi=PHI,
-                         min_weeks_for_trend=MIN_WEEKS_FOR_TREND):
-    """Holt's linear method with a damped trend (double exponential smoothing).
+# --------------------------------------------------------------------------- #
+# XGBoost feature engineering + forecasting                                   #
+# --------------------------------------------------------------------------- #
+def _feature_row(z_hist, t, n_total, week_date):
+    """Feature vector for one (SKU, week) sample.
 
-    Smooths the ordered demand sequence ``y`` into a level and a trend, then
-    projects ``horizon`` steps ahead, damping the trend by ``phi`` each step so a
-    short-run slope is not extrapolated indefinitely:
+    ``z_hist`` is the SKU's scale-normalised demand up to (but excluding) week
+    index ``t``; ``n_total`` its full training length; ``week_date`` the
+    calendar Sunday of the target week. Missing lags (early in a series) are
+    left as NaN -- both XGBoost and HistGradientBoosting handle NaN natively,
+    so short histories still produce usable rows without imputation.
 
-        level_t = alpha * y_t + (1 - alpha) * (level_{t-1} + phi * trend_{t-1})
-        trend_t = beta  * (level_t - level_{t-1}) + (1 - beta) * phi * trend_{t-1}
-        forecast_h = level_T + (phi + phi**2 + ... + phi**h) * trend_T
+    Features:
+      * lag_1 .. lag_N_LAGS      -- the previous weeks' demand
+      * roll_mean_w (ROLL_WINDOWS) -- trailing means over the last w weeks
+      * t_index                  -- weeks since the SKU's first observation
+      * t_frac                   -- position within the SKU's history (0..1)
+      * woy_sin / woy_cos        -- week-of-year seasonality encoding
+    """
+    feats = []
+    for lag in range(1, N_LAGS + 1):
+        feats.append(z_hist[t - lag] if t - lag >= 0 else np.nan)
+    for w in ROLL_WINDOWS:
+        lo = max(0, t - w)
+        feats.append(float(np.mean(z_hist[lo:t])) if t > lo else np.nan)
+    feats.append(float(t))
+    feats.append(float(t) / max(n_total - 1, 1))
+    woy = pd.Timestamp(week_date).isocalendar().week
+    feats.append(np.sin(2 * np.pi * woy / 52.0))
+    feats.append(np.cos(2 * np.pi * woy / 52.0))
+    return feats
 
-    ``y`` is the chronological sequence of observed demand. Gaps in the weekly
-    history are treated as consecutive observations (the original regression
-    pipeline only used real week offsets for its slope; here the smoothing runs
-    over the points it has).
 
-    Short series are handled specially, because a trend estimated from only a
-    couple of weeks is noise that would be extrapolated over the whole horizon:
+def build_training_set(series_by_sku, min_weeks_for_trend=MIN_WEEKS_FOR_TREND):
+    """Pool supervised (features, target) rows across every SKU in the group.
+
+    ``series_by_sku`` maps sku -> (week_dates, cleaned_y). Each SKU's demand is
+    divided by its own mean (its "scale") so big and small SKUs train one model
+    together without the big ones dominating the squared-error loss; forecasts
+    are multiplied back by the scale afterwards. SKUs shorter than
+    ``min_weeks_for_trend`` contribute no training rows (they are forecast flat
+    at their mean instead -- see ``xgboost_forecast``).
+
+    Returns (X, y, scales) where ``scales`` maps sku -> its mean level.
+    """
+    X, y = [], []
+    scales = {}
+    for sku, (week_dates, cy) in series_by_sku.items():
+        cy = np.asarray(cy, dtype="float64")
+        n = len(cy)
+        scale = float(np.mean(cy))
+        scales[sku] = scale
+        if n < min_weeks_for_trend or scale <= 0:
+            continue
+        z = cy / scale
+        wd = pd.to_datetime(pd.Series(week_dates)).to_numpy()
+        for t in range(1, n):          # first week has no lag -> start at t=1
+            X.append(_feature_row(z, t, n, wd[t]))
+            y.append(z[t])
+    if not X:
+        return np.empty((0, 0)), np.empty(0), scales
+    return np.asarray(X, dtype="float64"), np.asarray(y, dtype="float64"), scales
+
+
+def xgboost_forecast(model, z_hist, n_total, forecast_weeks, scale,
+                     mean_val, min_weeks_for_trend=MIN_WEEKS_FOR_TREND):
+    """Recursive 15-step forecast for one SKU using the pooled group model.
+
+    Each step builds a feature row from the trailing (normalised) history,
+    predicts the next week, clamps it at zero, and appends the prediction to
+    the history so the following step can use it as a lag -- standard recursive
+    multi-step forecasting.
+
+    Short series are handled exactly like the smoothing pipeline:
       * 0 weeks  -> flat at zero.
       * 1 week   -> flat at that value.
-      * < ``min_weeks_for_trend`` weeks -> flat at the mean of ``y`` (level only,
-        no trend). This is what stops tiny-sample groups (e.g. "Others - AU")
-        from producing runaway ramps.
-    With at least ``min_weeks_for_trend`` weeks the full damped-trend model runs.
-
-    Returns a list of ``horizon`` forecast values. Values are NOT clamped or
-    rounded here -- the caller does that (so it can floor at zero consistently).
+      * < ``min_weeks_for_trend`` weeks -> flat at the mean (no model), which
+        stops tiny-sample groups (e.g. "Others - AU") from producing runaway
+        forecasts.
+    A ``model`` of None (group too small to train) also falls back to the flat
+    mean. Returns a list of ``len(forecast_weeks)`` values (not rounded; the
+    caller floors at zero and rounds for consistency with the other pipelines).
     """
-    y = np.asarray(y, dtype="float64")
-    n = len(y)
+    horizon = len(forecast_weeks)
+    n = len(z_hist)
     if n == 0:
         return [0.0] * horizon
     if n == 1:
-        return [float(y[0])] * horizon
+        return [float(z_hist[0]) * scale] * horizon
+    if model is None or n < min_weeks_for_trend or scale <= 0:
+        return [float(mean_val)] * horizon
 
-    # Too few weeks to trust a trend: forecast FLAT at the mean rather than
-    # extrapolating a slope fit to a handful of noisy points.
-    if n < min_weeks_for_trend:
-        return [float(np.mean(y))] * horizon
-
-    # Initialise the level at the first observation and the trend at the first
-    # observed step. With only ~8 points this is more stable than estimating a
-    # separate warm-up regression.
-    level = y[0]
-    trend = y[1] - y[0]
-    for t in range(1, n):
-        prev_level = level
-        level = alpha * y[t] + (1.0 - alpha) * (prev_level + phi * trend)
-        trend = beta * (level - prev_level) + (1.0 - beta) * phi * trend
-
-    # Damped-trend projection: each step adds one more phi power to the running
-    # sum (phi + phi^2 + ... + phi^h), so the trend contribution saturates.
-    forecasts = []
-    phi_pow = 1.0
-    damp_sum = 0.0
-    for _ in range(horizon):
-        phi_pow *= phi
-        damp_sum += phi_pow
-        forecasts.append(level + damp_sum * trend)
-    return forecasts
+    z = list(np.asarray(z_hist, dtype="float64"))
+    out = []
+    for h in range(horizon):
+        t = len(z)
+        row = np.asarray(
+            [_feature_row(np.asarray(z), t, n_total + h + 1, forecast_weeks[h])],
+            dtype="float64",
+        )
+        pred = float(model.predict(row)[0])
+        pred = max(pred, 0.0)          # demand can't be negative
+        z.append(pred)
+        out.append(pred * scale)
+    return out
 
 
-def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
-                              list_prices=None, cleansing_log=None, uplift_log=None,
-                              alpha=ALPHA, beta=BETA, phi=PHI,
-                              min_weeks_for_trend=MIN_WEEKS_FOR_TREND):
-    """Build a 15-week forecast from the historical demand window.
+def fit_xgboost(df, today, grouping_label, breakdown_df=None,
+                list_prices=None, cleansing_log=None, uplift_log=None,
+                min_weeks_for_trend=MIN_WEEKS_FOR_TREND):
+    """Build a 15-week forecast from the historical demand window with XGBoost.
 
     The fitting window is all completed weeks by default (LOOKBACK_WEEKS=None),
     or the most recent N completed weeks if LOOKBACK_WEEKS is set; the in-progress
     week is always excluded (see ``week_anchors``).
 
-    Before smoothing, each SKU's series is run through ``cleanse_series`` so promo
+    Before fitting, each SKU's series is run through ``cleanse_series`` so promo
     spikes (e.g. Prime Day) and stockout dips are replaced by a local baseline and
     don't distort the fit. The count per SKU is reported in "Outlier Weeks Cleaned".
 
+    ONE boosted-tree model is trained per call, pooled across every SKU in
+    ``df`` (see ``build_training_set``), then each SKU is forecast recursively
+    15 weeks ahead (see ``xgboost_forecast``). Hyperparameters come from the
+    module-level XGB_PARAMS -- deliberately NOT function arguments, so the
+    dashboard's smoothing sliders hide themselves (it inspects this signature
+    for alpha/beta/phi and finds none).
+
     ``df`` must be at SKU-week granularity (see ``aggregate_to_sku_week``).
     For each SKU the forecast is built from POS where available; if a SKU has no
-    POS in the window, it falls back to the Orders signal using the identical
-    Holt damped-trend exponential smoothing (see ``holt_damped_forecast``). The
-    "Data Source" column records which one was used. SKUs with neither POS nor
-    Orders are skipped.
-    ``grouping_label`` is written into the "Customer Grouping" column (the group
-    name for a per-group file, or ALL_SKUS_LABEL for the combined file).
-    If ``breakdown_df`` (rows that still carry "Customer Grouping") is provided, a
-    "Top Volume Customer Groups" column is appended.
-    If ``list_prices`` (a SKU -> List Price USD Series, see ``load_list_prices``)
-    is provided, two columns are added: "List Price (USD)" and "Revenue Risk
-    (USD)" = projection_difference * list price. A negative value means the
-    updated forecast fell below the original (revenue at risk on the downside);
-    a positive value is upside. SKUs without a known price are left blank.
-    If ``cleansing_log`` (a list) is supplied, one dict per cleaned week is
-    appended to it for the audit record; the dashboard omits it (no file is
-    written during interactive use), so the return signature is unchanged.
-    Future PROMO_WEEKS falling inside the 15-week horizon have their projection
-    scaled up by the promo uplift factor (see PROMO_UPLIFT); if ``uplift_log`` (a
-    list) is supplied, one dict per uplifted week is appended to it.
-    ``alpha`` / ``beta`` / ``phi`` override the module-level smoothing constants
-    for this call (the dashboard passes its live slider values here); when
-    omitted they default to ALPHA / BETA / PHI, so the batch __main__ run is
-    unchanged. ``min_weeks_for_trend`` likewise overrides MIN_WEEKS_FOR_TREND:
-    SKUs with fewer completed weeks than this are forecast flat at their mean
-    instead of extrapolating a trend from too little history.
+    POS in the window, it falls back to the Orders signal. The "Data Source"
+    column records which one was used. SKUs with neither are skipped.
+    ``grouping_label`` is written into the "Customer Grouping" column.
+    If ``breakdown_df`` (rows that still carry "Customer Grouping") is provided,
+    a "Top Volume Customer Groups" column is appended.
+    If ``list_prices`` (a SKU -> List Price USD Series) is provided, "List Price
+    (USD)" and "Revenue Risk (USD)" = projection_difference * list price are
+    added. SKUs without a known price are left blank.
+    If ``cleansing_log`` / ``uplift_log`` (lists) are supplied, audit rows are
+    appended to them; the dashboard omits them, so the return signature is
+    unchanged.
+    ``min_weeks_for_trend`` overrides MIN_WEEKS_FOR_TREND for this call (the
+    dashboard passes its live slider value here): SKUs with fewer completed
+    weeks than this are forecast flat at their mean instead of using the model.
     Returns (summary_df, weekly_df), or (None, None) if no SKU has POS or Orders
     in the historical window (nothing to forecast from).
     """
@@ -705,8 +763,12 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
     # Promo week-starts (for re-adding expected lift onto future promo weeks).
     promo_set = {_week_start(d) for d in PROMO_WEEKS} if PROMO_WEEKS else set()
 
-    summary_rows = []
-    weekly_rows = []
+    # ------------------------------------------------------------------ #
+    # Pass 1: per SKU -- pick the signal, densify, cleanse. Collect the  #
+    # cleaned series so ONE pooled model can be trained across all SKUs. #
+    # ------------------------------------------------------------------ #
+    prepared = {}          # sku -> dict of everything pass 2 needs
+    series_by_sku = {}     # sku -> (week_dates, cleaned_y) for the training pool
 
     for (sku, desc), grp in window.groupby(["SKU", "Description"]):
         # Prefer POS; fall back to Orders only when the SKU has no POS at all.
@@ -747,14 +809,61 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
         # fitting, so the model learns underlying demand, not the event.
         y, flags, method = cleanse_series(week_dates.to_numpy(), y_raw)
 
+        prepared[sku] = dict(
+            desc=desc, source=source, week_dates=week_dates,
+            y_raw=y_raw, y=y, flags=flags, method=method, n=n,
+        )
+        series_by_sku[sku] = (week_dates.to_numpy(), y)
+
+    if not prepared:
+        return None, None
+
+    # ------------------------------------------------------------------ #
+    # Train ONE pooled model for the whole group. If there's too little  #
+    # to train on (or the fit fails), every SKU falls back to flat-mean. #
+    # ------------------------------------------------------------------ #
+    X, y_train, scales = build_training_set(
+        series_by_sku, min_weeks_for_trend=min_weeks_for_trend
+    )
+    model = None
+    if len(y_train) >= MIN_TRAIN_ROWS:
+        try:
+            model = _make_regressor()
+            model.fit(X, y_train)
+        except Exception:
+            print(traceback.format_exc())
+            print(
+                f"[{grouping_label}] model fit failed on {len(y_train)} samples; "
+                "falling back to flat-mean forecasts."
+            )
+            model = None
+    else:
+        print(
+            f"[{grouping_label}] only {len(y_train)} pooled training rows "
+            f"(< {MIN_TRAIN_ROWS}); forecasting every SKU flat at its mean."
+        )
+
+    # ------------------------------------------------------------------ #
+    # Pass 2: forecast each SKU with the pooled model (or its fallback), #
+    # apply promo uplift, and assemble the summary / weekly rows.        #
+    # ------------------------------------------------------------------ #
+    summary_rows = []
+    weekly_rows = []
+
+    for sku, p in prepared.items():
+        y, y_raw, flags, method = p["y"], p["y_raw"], p["flags"], p["method"]
+        week_dates, n = p["week_dates"], p["n"]
+        desc, source = p["desc"], p["source"]
+
         # Descriptive average over the (cleaned) fitting window. NOTE: the output
         # column is still named "8 Week POS/Orders Average" for dashboard
         # compatibility, but with LOOKBACK_WEEKS=None it now averages all history.
         mean_val = y.mean()
 
-        # Holt's damped-trend exponential smoothing over the cleaned weeks.
-        raw_forecast = holt_damped_forecast(
-            y, 15, alpha=alpha, beta=beta, phi=phi,
+        scale = scales.get(sku, float(mean_val))
+        z_hist = (y / scale) if scale > 0 else y
+        raw_forecast = xgboost_forecast(
+            model, z_hist, n, forecast_weeks, scale, mean_val,
             min_weeks_for_trend=min_weeks_for_trend,
         )
 
@@ -770,7 +879,7 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
         mult = promo_week_multipliers(forecast_weeks, factor, promo_set)
 
         # Floor at zero (demand can't be negative) and round to 1 decimal,
-        # matching the regression pipeline's output convention.
+        # matching the other pipelines' output convention.
         projected_15 = [max(round(v * m, 1), 0) for v, m in zip(raw_forecast, mult)]
         n_uplifted = int((mult > 1.0).sum())
 
@@ -843,7 +952,9 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
     )
     print(f"  Historical window: {actual_start.date()} -> {last_complete_week.date()} ({span_label})")
     print(f"  Forecast window:   {forecast_weeks[0].date()} -> {forecast_weeks[-1].date()}")
-    print(f"  SKUs projected:    {len(summary_rows)}")
+    print(f"  SKUs projected:    {len(summary_rows)} "
+          f"({'pooled XGBoost model' if model is not None else 'flat-mean fallback'}, "
+          f"{len(y_train)} training rows)")
 
     # initial_projection_avg: average of the existing system Projection over the
     # SAME 15 forecast weeks the updated average uses -- from the current
@@ -877,7 +988,6 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
         .sort_values("SKU")
         .reset_index(drop=True)
     )
-
 
     summary_df['projection_difference'] = summary_df['updated_projection_avg'] - summary_df['initial_projection_avg']
 
@@ -916,10 +1026,11 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
 
 
 # Backwards-compatibility alias. dashboard.py loads this module by path and calls
-# ``P.fit_regression`` (and inspects its signature for ``list_prices``). Pointing
-# the old name at the exponential-smoothing implementation lets the dashboard run
-# unchanged against this pipeline -- only DEMAND_PIPELINE / PIPELINE_PATH changes.
-fit_regression = fit_exponential_smoothing
+# ``P.fit_regression`` (and inspects its signature). Because fit_xgboost accepts
+# ``min_weeks_for_trend`` but NOT alpha/beta/phi, the dashboard automatically
+# keeps the min-weeks slider and hides the smoothing sliders -- only
+# DEMAND_PIPELINE / PIPELINE_PATH needs to change.
+fit_regression = fit_xgboost
 
 
 def _autosize_to_headers(worksheet, df, padding=2):
@@ -946,7 +1057,7 @@ def write_forecast(summary_df, weekly_df, out_path):
 
 if __name__ == "__main__":
     INPUT_FILE, today_str, TODAY = resolve_input_file()
-    OUTPUT_FOLDER = f"outputs/demand_projections/exponential_smoothing/{today_str}"
+    OUTPUT_FOLDER = f"outputs/demand_projections/xgboost/{today_str}"
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     print(f"Snapshot date (anchor): {today_str}\n")
 
@@ -1004,7 +1115,7 @@ if __name__ == "__main__":
             if not has_pos and not has_orders:
                 no_data.append(group)           # nothing to forecast at all
 
-            summary_df, weekly_df = fit_exponential_smoothing(
+            summary_df, weekly_df = fit_xgboost(
                 group_df, TODAY, grouping_label=group, list_prices=LIST_PRICES,
                 cleansing_log=cleansing_log, uplift_log=uplift_log,
             )
@@ -1032,7 +1143,7 @@ if __name__ == "__main__":
     combined_path = f"{OUTPUT_FOLDER}/ALL_SKUS_demand_projections_{today_str}.xlsx"
     try:
         combined_df = aggregate_to_sku_week(df)
-        combined_summary, combined_weekly = fit_exponential_smoothing(
+        combined_summary, combined_weekly = fit_xgboost(
             combined_df, TODAY, grouping_label=ALL_SKUS_LABEL,
             breakdown_df=df, list_prices=LIST_PRICES,
             cleansing_log=cleansing_log, uplift_log=uplift_log,
@@ -1044,7 +1155,7 @@ if __name__ == "__main__":
             print(f"[ALL_SKUS] ok -> {combined_path}")
     except Exception:
         print(traceback.format_exc())
-    
+
     valid_subfolders = ["AU (ACT)", "EU (SH-CTS)", "Other", "US (LBC+NJ)"]
     customer_dfs = []
     for folder in valid_subfolders:

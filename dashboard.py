@@ -30,7 +30,7 @@ Also hosted on Streamlit Community Cloud
     https://sh-demand-projections.streamlit.app/ 
 
 By default it discovers the raw folder from the pipeline's own
-``RAW_DATA_FOLDER`` (currently ``raw_data/demand_projections``), resolved next
+``RAW_INPUTS_FOLDER`` (currently ``raw_inputs/demand_projections``), resolved next
 to this file. Override paths with the DEMAND_PIPELINE / DEMAND_RAW_DIR env vars.
 """
 
@@ -54,8 +54,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # The pipeline filename starts with a digit and contains a hyphen, so it can't
 # be imported with a normal ``import`` statement -- we load it by path instead.
 PIPELINE_PATH = os.environ.get(
-    # "DEMAND_PIPELINE", os.path.join(HERE, "20-regression_demand_projections.py")
     "DEMAND_PIPELINE", os.path.join(HERE, "models/exponential_smoothing.py")
+    # "DEMAND_PIPELINE", os.path.join(HERE, "models/xgboost.py")
 )
 
 ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
@@ -133,21 +133,21 @@ def _raw_dir():
     """Resolve the folder holding the raw + price files.
 
     Honours DEMAND_RAW_DIR if set; otherwise uses the pipeline's own
-    RAW_DATA_FOLDER constant (e.g. ``raw_data/demand_projections``), resolved
+    RAW_INPUTS_FOLDER constant (e.g. ``raw_inputs/demand_projections``), resolved
     relative to this file when it is a relative path. This means moving the raw
     folder in the pipeline is picked up here automatically.
     """
     P = load_pipeline(PIPELINE_PATH)
     folder = os.environ.get("DEMAND_RAW_DIR")
     if folder is None:
-        folder = P.RAW_DATA_FOLDER
+        folder = P.RAW_INPUTS_FOLDER
         if not os.path.isabs(folder):
             folder = os.path.join(HERE, folder)
     return folder
 
 
 def raw_glob():
-    """Build the raw-file glob, tracking the pipeline's RAW_DATA_FOLDER."""
+    """Build the raw-file glob, tracking the pipeline's RAW_INPUTS_FOLDER."""
     return os.path.join(_raw_dir(), "all_demand_projections_*.xlsx")
 
 
@@ -155,7 +155,7 @@ def price_glob():
     """Build the list-price glob, mirroring the pipeline's LIST_PRICE_GLOB name."""
     P = load_pipeline(PIPELINE_PATH)
     pattern = os.path.basename(getattr(P, "LIST_PRICE_GLOB", "list_prices_*.xlsx"))
-    return os.path.join("raw_data", pattern)
+    return os.path.join("raw_inputs", pattern)
 
 
 def discover_price_file():
@@ -568,16 +568,23 @@ def main():
     )
     P = load_pipeline(PIPELINE_PATH)
     st.title("📦 Demand Projection Dashboard")
-    if _supports_smoothing(P):
+    # Header caption: the pipeline can supply its own (DASHBOARD_CAPTION, e.g.
+    # the XGBoost pipeline); otherwise fall back to the smoothing-aware blurbs.
+    caption = getattr(P, "DASHBOARD_CAPTION", None)
+    if caption:
+        st.caption(caption)
+    elif _supports_smoothing(P):
         st.caption(
             "15-week Holt damped-trend forecast from the historical demand "
             "window (POS where available, else Orders). Tune the smoothing "
             "(α/β/φ) in the sidebar — changes recompute live."
         )
     else:
+        tw = getattr(P, "TREND_WEIGHT", None)
         st.caption(
             "15-week forecasts from the historical demand window "
-            f"(POS where available, else Orders; trend weight = {P.TREND_WEIGHT})."
+            "(POS where available, else Orders"
+            + (f"; trend weight = {tw})." if tw is not None else ").")
         )
 
     # ----- Data source -----------------------------------------------------
