@@ -82,7 +82,7 @@ US_GROUPING = {
     'NORSTR': 'NORSTR',
     'NORCOM-DS': 'NORSTR',
     'NORCOM': 'NORSTR',
-    'Others - US': 'Others - US',
+    'Others - US': 'Others - US'
 }
 
 EU_GROUPING = {
@@ -95,7 +95,7 @@ EU_GROUPING = {
     'LERMER-FR': 'LERMER-FR',
     'SANIKAL-KG': 'SANIKAL-KG',
     'Others - EU': 'Others - EU',
-    'Others - IT': 'Others - EU',
+    'Others - IT': 'Others - EU'
 }
 
 AU_GROUPING = {
@@ -103,7 +103,24 @@ AU_GROUPING = {
     'Others - AU': 'Others - AU'
 }
 
-COMBINED_GROUPING = {**US_GROUPING, **EU_GROUPING, **AU_GROUPING}
+CA_GROUPING = {
+    'AMAZON-DCCA': 'AMAZON-DCCA',
+    'CANTIR': 'CANTIR',
+    'COSTCO-CAN': 'COSTCO-CAN',
+    'HOMEDEP-CA.COM': 'HOMEDEP-CA.COM',
+    'HOMEDEPOT-CA': 'HOMEDEPOT-CA',
+    'Others - CA': 'Others - CA',
+    'RONA-HQ': 'RONA-HQ',
+    'Web Sales - CA': 'Web Sales - CA',
+    'WINMER': 'WINMER'
+}
+
+JP_GROUPING = {
+    'Web Sales - JP': 'Web Sales - JP',
+    'Others - JP': 'Others - JP'
+}
+
+COMBINED_GROUPING = {**US_GROUPING, **EU_GROUPING, **AU_GROUPING, **CA_GROUPING, **JP_GROUPING}
 
 # Group labels belonging to each region (the *values* of the maps above), used to
 # file each group's output under US / EU / NON-US-EU. A group that came from
@@ -111,7 +128,8 @@ COMBINED_GROUPING = {**US_GROUPING, **EU_GROUPING, **AU_GROUPING}
 US_GROUPS = set(US_GROUPING.values())
 EU_GROUPS = set(EU_GROUPING.values())
 AU_GROUPS = set(AU_GROUPING.values())
-
+CA_GROUPS = set(CA_GROUPING.values())
+JP_GROUPS = set(CA_GROUPING.values())
 
 def region_for_group(group):
     if group in US_GROUPS:
@@ -120,6 +138,10 @@ def region_for_group(group):
         return "EU (SH-CTS)"
     elif group in AU_GROUPS:
         return "AU (ACT)"
+    elif group in CA_GROUPS:
+        return "CA (YYZ5)",
+    elif group in JP_GROUPS:
+        return "JP (NETDEPOT)"
     return "Other"
 
 # Label used for the all-customers (combined) output.

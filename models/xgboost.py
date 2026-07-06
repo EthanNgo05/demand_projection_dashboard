@@ -269,6 +269,10 @@ def region_for_group(group):
         return "EU (SH-CTS)"
     elif group in AU_GROUPS:
         return "AU (ACT)"
+    elif group in CA_GROUPS:
+        return "CA (YYZ5)",
+    elif group in JP_GROUPS:
+        return "JP (NETDEPOT)"
     return "Other"
 
 # Label used for the all-customers (combined) output.
