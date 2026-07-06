@@ -116,6 +116,15 @@ LOOKBACK_WEEKS = None
 # None, so a ``WeekDate >= HISTORY_START`` filter keeps every historical week.
 HISTORY_START = pd.Timestamp("2026-03-01")
 
+# Display label for the descriptive-average column. Reflects LOOKBACK_WEEKS so
+# the header never claims "8 Week" when it's actually averaging all history
+# (or some other window) -- see DISPLAY_NAMES / SUMMARY_COLUMNS below.
+AVG_COL_LABEL = (
+    "All-History POS/Orders Average"
+    if LOOKBACK_WEEKS is None
+    else f"{LOOKBACK_WEEKS} Week POS/Orders Average"
+)
+
 # --- Intermittent / lumpy demand -------------------------------------------- #
 # Same rationale as the smoothing pipeline: a missing completed week almost
 # always means "nothing sold" = 0, so each SKU's series is reindexed to every
@@ -252,7 +261,7 @@ DISPLAY_NAMES = {
     "weeks_with_data": "Weeks with data",
     "outlier_weeks_cleaned": "Outlier Weeks Cleaned",
     "promo_weeks_uplifted": "Promo Weeks Uplifted",
-    "8_week_pos_avg": "8 Week POS/Orders Average",
+    "8_week_pos_avg": AVG_COL_LABEL,
     "initial_projection_avg": "Initial Projection Average",
     "updated_projection_avg": "Updated Projection Average",
     "projection_difference": "Projection Difference",
@@ -269,7 +278,7 @@ SUMMARY_COLUMNS = [
     "Weeks with data",
     "Outlier Weeks Cleaned",
     "Promo Weeks Uplifted",
-    "8 Week POS/Orders Average",
+    AVG_COL_LABEL,
     "Initial Projection Average",
     "Updated Projection Average",
     "Projection Difference",
@@ -855,9 +864,10 @@ def fit_xgboost(df, today, grouping_label, breakdown_df=None,
         week_dates, n = p["week_dates"], p["n"]
         desc, source = p["desc"], p["source"]
 
-        # Descriptive average over the (cleaned) fitting window. NOTE: the output
-        # column is still named "8 Week POS/Orders Average" for dashboard
-        # compatibility, but with LOOKBACK_WEEKS=None it now averages all history.
+        # Descriptive average over the (cleaned) fitting window. The column's
+        # display label (AVG_COL_LABEL) already reflects LOOKBACK_WEEKS, so it
+        # reads "All-History..." rather than a hardcoded "8 Week..." when the
+        # window isn't actually 8 weeks.
         mean_val = y.mean()
 
         scale = scales.get(sku, float(mean_val))

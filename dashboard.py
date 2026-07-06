@@ -503,7 +503,24 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
 # --------------------------------------------------------------------------- #
 # Demand-signal helpers (POS-then-Orders, matching the pipeline)              #
 # --------------------------------------------------------------------------- #
-AVG_COL = "8 Week POS/Orders Average"  # renamed metric in the updated pipeline
+def resolve_avg_col(df):
+    """Name of the descriptive-average column, whatever window it covers.
+
+    The label varies by pipeline: regression always fits exactly 8 weeks
+    ("8 Week POS/Orders Average"), while exponential-smoothing and XGBoost
+    default to LOOKBACK_WEEKS=None ("All-History POS/Orders Average") or an
+    explicit N-week window if LOOKBACK_WEEKS is set. Matching by suffix keeps
+    the dashboard correct regardless of which pipeline produced the summary.
+    """
+    matches = [c for c in df.columns if c.endswith("POS/Orders Average")]
+    return matches[0] if matches else "8 Week POS/Orders Average"
+
+
+def avg_window_phrase(avg_col):
+    """Human-readable window description derived from the average column's
+    own label, e.g. "8 Week" or "All-History" -- so KPI captions never say
+    "8 wk" when the underlying average actually covers a different window."""
+    return avg_col.replace(" POS/Orders Average", "")
 
 
 def source_map(summary):
@@ -558,7 +575,7 @@ def _base_layout(fig, title, forecast_start, y_title="Units (POS / Orders)"):
 
 
 def aggregate_chart(agg, summary, weekly, anchors, view):
-    """Total actual demand (8 wks) flowing into total forecast (15 wks).
+    """Total actual demand (historical window) flowing into total forecast (15 wks).
 
     Historical demand uses each SKU's forecast source (POS or Orders) so the
     actual total is comparable to the forecast total.
@@ -611,7 +628,7 @@ def aggregate_chart(agg, summary, weekly, anchors, view):
 
 
 def sku_chart(sku, desc, source, agg, weekly, anchors):
-    """Per-SKU: actuals (8 wks, from its source) + updated forecast + original proj."""
+    """Per-SKU: actuals (historical window, from its source) + updated forecast + original proj."""
     lb, lcw, ffw = anchors
     col = "Orders" if source == "Orders" else "POS"
 
@@ -669,8 +686,9 @@ def style_summary(summary_df):
         "Updated Projection Average", "Projection Difference",
     ] if c in df.columns]
     fmt = {c: "{:,.0f}" for c in int_cols}
-    if AVG_COL in df.columns:
-        fmt[AVG_COL] = "{:,.1f}"
+    avg_col = resolve_avg_col(df)
+    if avg_col in df.columns:
+        fmt[avg_col] = "{:,.1f}"
     if PRICE_COL in df.columns:
         fmt[PRICE_COL] = "${:,.2f}"
     if RISK_COL in df.columns:
@@ -1153,7 +1171,8 @@ def main():
     )
 
     # ----- KPIs -------------------------------------------------------------
-    total_avg = summary[AVG_COL].sum()
+    avg_col = resolve_avg_col(summary)
+    total_avg = summary[avg_col].sum()
     total_updated = summary["Updated Projection Average"].sum()
     total_initial = summary["Initial Projection Average"].sum()
     diff = total_updated - total_initial
@@ -1165,7 +1184,7 @@ def main():
         "SKUs forecast", f"{len(summary):,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
     )
-    k2.metric("Avg weekly demand (8 wk)", f"{total_avg:,.0f}")
+    k2.metric(f"Avg weekly demand ({avg_window_phrase(avg_col)})", f"{total_avg:,.0f}")
     k3.metric("Updated proj. (avg/wk)", f"{total_updated:,.0f}")
     k4.metric(
         "vs original projection", f"{diff:+,.0f}",
@@ -1219,7 +1238,8 @@ def main():
         )
     with cR:
         st.metric("Data source", source)
-        st.metric(f"8 wk {source} avg", f"{row[AVG_COL]:,.1f}")
+        avg_col = resolve_avg_col(summary)
+        st.metric(f"{avg_window_phrase(avg_col)} {source} avg", f"{row[avg_col]:,.1f}")
         st.metric("Updated proj.", f"{row['Updated Projection Average']:,.0f}")
         sysv = row.get("Initial Projection Average")
         st.metric("Original proj.", "—" if pd.isna(sysv) else f"{sysv:,.0f}")
