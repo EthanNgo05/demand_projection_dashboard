@@ -1113,11 +1113,14 @@ def main():
     if model_bits:
         st.caption("Model in use — " + "; ".join(model_bits))
     w1, w2 = st.columns(2)
-    w1.markdown(
-        f"**Historical window** &nbsp; {lb.date()} → {lcw.date()} "
-        f"<span style='color:#64748b'>(8 completed weeks)</span>",
-        unsafe_allow_html=True,
-    )
+    # The fixed-window regression pipeline always fits exactly the last 8
+    # completed weeks, so we can state that. The other pipelines expose a
+    # LOOKBACK_WEEKS mechanism (all-history by default), so the window isn't a
+    # fixed 8 weeks — leave the count off rather than mislabel it.
+    hist_span = f"**Historical window** &nbsp; {lb.date()} → {lcw.date()}"
+    if not hasattr(P, "LOOKBACK_WEEKS"):
+        hist_span += " <span style='color:#64748b'>(8 completed weeks)</span>"
+    w1.markdown(hist_span, unsafe_allow_html=True)
     fc_weeks = pd.to_datetime(weekly["WeekDate"])
     w2.markdown(
         f"**Forecast window** &nbsp; {ffw.date()} → "
