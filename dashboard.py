@@ -879,17 +879,58 @@ def main():
             p0 = float(getattr(P, "PHI", 0.85))
             mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
 
-            # If the user ran Autofit, its winning parameters become the slider
-            # defaults (the nonce was bumped when they were stored, so the
-            # sliders rebuild and re-read value=). Results are keyed to the
-            # model/view they were fitted on; anything else falls back to the
-            # file defaults. The sliders stay fully adjustable afterwards.
+            # If Autofit has run (automatically on first sight, or via the
+            # button), its winning parameters become the slider defaults (the
+            # nonce was bumped when they were stored, so the sliders rebuild and
+            # re-read value=). Results are keyed to the model/view/snapshot they
+            # were fitted on; anything else falls back to the file defaults. The
+            # sliders stay fully adjustable afterwards.
             autofit = st.session_state.get("autofit_params")
             autofit_active = bool(
                 autofit
                 and autofit.get("model") == pipeline_path()
                 and autofit.get("view") == view
+                and autofit.get("today") == today_str
             )
+
+            # ----- Auto-run Autofit on first sight --------------------------
+            # So that selecting a smoothing model (or a new view / snapshot)
+            # opens the sliders already on the backtested α/β/φ rather than the
+            # file defaults. It runs once per (model, view, snapshot): the
+            # "autofit_tried" marker below records that we've attempted it, so a
+            # failed backtest isn't retried on every rerun and a good fit isn't
+            # re-run on every slider move. The user can re-fit any time with the
+            # Autofit button, or fine-tune the sliders by hand.
+            autofit_key = (pipeline_path(), view, today_str)
+            autofit_tried = st.session_state.get("autofit_tried") == autofit_key
+            if (
+                smoothing_ok
+                and _supports_autofit(P)
+                and not autofit_active
+                and not autofit_tried
+            ):
+                st.session_state["autofit_tried"] = autofit_key
+                with st.spinner("Autofitting α/β/φ for this view…"):
+                    best = run_autofit(df, view, today_ts, pipeline_path(), mw0)
+                if best is not None:
+                    logger.info(
+                        "Auto-Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
+                        "(MAE %.2f vs %.2f with file defaults)",
+                        view, best["alpha"], best["beta"], best["phi"],
+                        best["mae"], best["baseline_mae"],
+                    )
+                    st.session_state["autofit_params"] = {
+                        **best, "model": pipeline_path(),
+                        "view": view, "today": today_str,
+                    }
+                    # Rebuild the sliders on the fitted values and recompute the
+                    # forecast with them — exactly like the manual button does.
+                    st.session_state["param_nonce"] = (
+                        st.session_state.get("param_nonce", 0) + 1
+                    )
+                    st.session_state["_do_recompute"] = True
+                    st.rerun()
+
             if smoothing_ok and autofit_active:
                 a0, b0, p0 = autofit["alpha"], autofit["beta"], autofit["phi"]
 
@@ -901,17 +942,6 @@ def main():
             # deleting a fixed key, which didn't reliably restore value=.
             st.session_state.setdefault("param_nonce", 0)
             nonce = st.session_state["param_nonce"]
-
-            def _reset_smoothing():
-                # Only move the sliders back to the file defaults. Do NOT
-                # recompute here — the forecast updates when the user clicks
-                # "Recompute forecast" (a stale notice is shown until then).
-                st.session_state["param_nonce"] = (
-                    st.session_state.get("param_nonce", 0) + 1
-                )
-                # Discard any autofitted parameters so value= falls back to
-                # the pipeline file's constants.
-                st.session_state.pop("autofit_params", None)
 
             if smoothing_ok:
                 st.caption(
@@ -958,8 +988,7 @@ def main():
                          "compared to what actually happened (repeated from "
                          "several rolling origins). The combination with the "
                          "lowest total forecast error wins and is applied to the "
-                         "sliders. You can still fine-tune afterwards; "
-                         "'Reset to file defaults' undoes it.",
+                         "sliders. You can still fine-tune the sliders afterwards.",
                 ):
                     with st.spinner("Backtesting the parameter grid…"):
                         best = run_autofit(
@@ -982,8 +1011,14 @@ def main():
                             best["n_series"], best["n_points"],
                         )
                         st.session_state["autofit_params"] = {
-                            **best, "model": pipeline_path(), "view": view,
+                            **best, "model": pipeline_path(),
+                            "view": view, "today": today_str,
                         }
+                        # Mark this (model, view, snapshot) as fitted so the
+                        # auto-run-on-first-sight logic doesn't re-fire over it.
+                        st.session_state["autofit_tried"] = (
+                            pipeline_path(), view, today_str
+                        )
                         # Rebuild the sliders with the fitted values as their
                         # defaults and recompute the forecast with them.
                         st.session_state["param_nonce"] = nonce + 1
@@ -1006,18 +1041,6 @@ def main():
                         f"{autofit['holdout_weeks']} held-out weeks."
                     )
 
-            bits = []
-            if smoothing_ok:
-                fa0 = float(getattr(P, "ALPHA", 0.5))
-                fb0 = float(getattr(P, "BETA", 0.3))
-                fp0 = float(getattr(P, "PHI", 0.85))
-                bits.append(f"α={fa0:g}, β={fb0:g}, φ={fp0:g}")
-            if min_weeks_ok:
-                bits.append(f"min weeks={mw0}")
-            st.button(
-                "Reset to file defaults", on_click=_reset_smoothing,
-                help="Restore " + "; ".join(bits) + " from the pipeline file.",
-            )
         else:
             alpha = beta = phi = None
             st.info(
