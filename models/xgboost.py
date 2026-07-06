@@ -260,7 +260,7 @@ US_GROUPS = set(US_GROUPING.values())
 EU_GROUPS = set(EU_GROUPING.values())
 AU_GROUPS = set(AU_GROUPING.values())
 CA_GROUPS = set(CA_GROUPING.values())
-JP_GROUPS = set(CA_GROUPING.values())
+JP_GROUPS = set(JP_GROUPING.values())
 
 def region_for_group(group):
     if group in US_GROUPS:
@@ -270,7 +270,7 @@ def region_for_group(group):
     elif group in AU_GROUPS:
         return "AU (ACT)"
     elif group in CA_GROUPS:
-        return "CA (YYZ5)",
+        return "CA (YYZ5)"
     elif group in JP_GROUPS:
         return "JP (NETDEPOT)"
     return "Other"

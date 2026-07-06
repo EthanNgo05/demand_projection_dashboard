@@ -129,7 +129,7 @@ US_GROUPS = set(US_GROUPING.values())
 EU_GROUPS = set(EU_GROUPING.values())
 AU_GROUPS = set(AU_GROUPING.values())
 CA_GROUPS = set(CA_GROUPING.values())
-JP_GROUPS = set(CA_GROUPING.values())
+JP_GROUPS = set(JP_GROUPING.values())
 
 def region_for_group(group):
     if group in US_GROUPS:
@@ -139,7 +139,7 @@ def region_for_group(group):
     elif group in AU_GROUPS:
         return "AU (ACT)"
     elif group in CA_GROUPS:
-        return "CA (YYZ5)",
+        return "CA (YYZ5)"
     elif group in JP_GROUPS:
         return "JP (NETDEPOT)"
     return "Other"
@@ -615,16 +615,4 @@ if __name__ == "__main__":
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    # Groups with no POS in the window (their forecast, if any, used Orders).
-    if no_pos:
-        no_pos_path = os.path.join(OUTPUT_FOLDER, f"no_pos_{today_str}.txt")
-        with open(no_pos_path, "w") as f:
-            f.write("\n".join(no_pos))
-        print(f"No-POS customers saved to: {no_pos_path}")
-
-    # Groups with neither POS nor Orders (no forecast produced).
-    if no_data:
-        no_data_path = os.path.join(OUTPUT_FOLDER, f"no_pos_or_orders_{today_str}.txt")
-        with open(no_data_path, "w") as f:
-            f.write("\n".join(no_data))
-        print(f"No-POS-or-Orders customers saved to: {no_data_path}")
+  
