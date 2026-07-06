@@ -1184,7 +1184,7 @@ def main():
         "SKUs forecast", f"{len(summary):,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
     )
-    k2.metric(f"Avg weekly demand ({avg_window_phrase(avg_col)})", f"{total_avg:,.0f}")
+    k2.metric(f"Avg weekly demand", f"{total_avg:,.0f}")
     k3.metric("Updated proj. (avg/wk)", f"{total_updated:,.0f}")
     k4.metric(
         "vs original projection", f"{diff:+,.0f}",
