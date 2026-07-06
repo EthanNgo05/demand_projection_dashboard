@@ -167,6 +167,35 @@ PROMO_UPLIFT_MAX = 4.0         # clamp so a noisy estimate can't explode a week
 PROMO_HALO_WEEKS = 0           # also lift this many weeks either side (0 = off),
                                # tapering linearly to the edge of the halo
 
+# --- Autofit (grid-search backtest of ALPHA / BETA / PHI) ------------------- #
+# ``autofit_smoothing`` searches a grid of (alpha, beta, phi) combinations and
+# scores each one by BACKTESTING: the last AUTOFIT_HOLDOUT_WEEKS completed weeks
+# of every SKU's (cleansed) history are hidden from the model, forecast with the
+# candidate parameters, and compared against what actually happened. This is
+# repeated from AUTOFIT_FOLDS rolling origins (each fold slides the cut-off back
+# a few more weeks) so the winner isn't tuned to a single lucky window. The
+# combination with the lowest total absolute error across every SKU, fold and
+# holdout week wins.
+#
+# Notes on the scoring choices:
+#   * Errors are summed in UNITS (not percentages), so high-volume SKUs weigh
+#     more -- the fit minimises total units of forecast error, which is what
+#     drives inventory dollars.
+#   * Both training and holdout weeks use the CLEANSED series (promo spikes /
+#     stockout dips replaced by baseline), so the search optimises for
+#     underlying demand rather than chasing one-off events.
+#   * Forecasts are floored at zero before scoring, matching the pipeline's
+#     output convention.
+#   * Ties break toward the earliest grid entry, i.e. the LOWEST alpha/beta/phi
+#     (grids below are ascending), so "equally good" defaults stay conservative.
+AUTOFIT_HOLDOUT_WEEKS = 6      # weeks hidden at the end of history for scoring
+AUTOFIT_FOLDS = 3              # rolling origins (1 = single holdout)
+AUTOFIT_FOLD_STEP = 3          # weeks the cut-off slides back per extra fold
+AUTOFIT_MIN_TRAIN_WEEKS = 8    # min completed weeks a fold must train on to count
+AUTOFIT_ALPHA_GRID = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.70, 0.90]
+AUTOFIT_BETA_GRID = [0.00, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50]
+AUTOFIT_PHI_GRID = [0.20, 0.40, 0.60, 0.80, 0.90, 0.95, 1.00]
+
 RAW_INPUTS_FOLDER = "raw_inputs/demand_projections"
 INPUT_GLOB = os.path.join(RAW_INPUTS_FOLDER, "all_demand_projections_*.xlsx")
 
@@ -637,6 +666,189 @@ def holt_damped_forecast(y, horizon, alpha=ALPHA, beta=BETA, phi=PHI,
         damp_sum += phi_pow
         forecasts.append(level + damp_sum * trend)
     return forecasts
+
+
+def _series_for_fit(grp, last_complete_week):
+    """Per-SKU demand series exactly as ``fit_exponential_smoothing`` builds it.
+
+    Mirrors the fit's preprocessing so the autofit backtest scores the SAME
+    series the real forecast is fit on: POS-then-Orders source selection,
+    optional zero-densification of the active span (FILL_GAPS_WITH_ZERO), and
+    promo/outlier cleansing. Returns (source, week_dates, y_cleaned) or
+    (None, None, None) when the SKU has neither POS nor Orders.
+    """
+    pos_grp = grp[grp["POS"].notna()]
+    if not pos_grp.empty:
+        source, src_grp = "POS", pos_grp
+    else:
+        orders_grp = grp[grp["Orders"].notna()]
+        if orders_grp.empty:
+            return None, None, None
+        source, src_grp = "Orders", orders_grp
+
+    src_grp = src_grp.sort_values("WeekDate").reset_index(drop=True)
+
+    if FILL_GAPS_WITH_ZERO and not src_grp.empty:
+        full_weeks = pd.date_range(
+            start=src_grp["WeekDate"].min(), end=last_complete_week, freq="W-SUN"
+        )
+        src_grp = (
+            src_grp.set_index("WeekDate")
+            .reindex(full_weeks)
+            .rename_axis("WeekDate")
+            .reset_index()
+        )
+        src_grp[source] = src_grp[source].fillna(0.0)
+
+    y_raw = src_grp[source].to_numpy(dtype="float64")
+    y, _, _ = cleanse_series(src_grp["WeekDate"].to_numpy(), y_raw)
+    return source, src_grp["WeekDate"], y
+
+
+def _holt_grid_forecast(y, horizon, alphas, betas, phis):
+    """Run Holt's damped-trend recursion for MANY (alpha, beta, phi) combos at once.
+
+    ``alphas`` / ``betas`` / ``phis`` are parallel 1-D arrays (one entry per
+    combo). The smoothing recursion is identical to ``holt_damped_forecast``
+    but the level/trend state is a vector over combos, so a whole parameter
+    grid is evaluated in one pass over the series instead of one pass per
+    combo. Requires len(y) >= 2. Returns an array of shape (horizon, n_combos).
+    """
+    m = alphas.shape[0]
+    level = np.full(m, y[0], dtype="float64")
+    trend = np.full(m, y[1] - y[0], dtype="float64")
+    for t in range(1, len(y)):
+        prev_level = level
+        level = alphas * y[t] + (1.0 - alphas) * (prev_level + phis * trend)
+        trend = betas * (level - prev_level) + (1.0 - betas) * phis * trend
+
+    fc = np.empty((horizon, m), dtype="float64")
+    phi_pow = np.ones(m, dtype="float64")
+    damp_sum = np.zeros(m, dtype="float64")
+    for h in range(horizon):
+        phi_pow = phi_pow * phis
+        damp_sum = damp_sum + phi_pow
+        fc[h] = level + damp_sum * trend
+    return fc
+
+
+def autofit_smoothing(df, today, alpha_grid=None, beta_grid=None, phi_grid=None,
+                      holdout_weeks=AUTOFIT_HOLDOUT_WEEKS, folds=AUTOFIT_FOLDS,
+                      fold_step=AUTOFIT_FOLD_STEP,
+                      min_train_weeks=AUTOFIT_MIN_TRAIN_WEEKS,
+                      min_weeks_for_trend=MIN_WEEKS_FOR_TREND):
+    """Grid-search the (alpha, beta, phi) that best predicts held-out history.
+
+    ``df`` must be at SKU-week granularity (see ``aggregate_to_sku_week``) --
+    the same frame ``fit_exponential_smoothing`` receives. For every SKU with
+    enough history the last ``holdout_weeks`` completed weeks are hidden, the
+    model is fit on the remainder with each parameter combination, and the
+    hidden weeks are forecast and scored (absolute error, in units, on the
+    cleansed series, forecasts floored at zero). ``folds`` rolling origins
+    slide the cut-off back ``fold_step`` weeks at a time so the winner
+    generalises across recent windows rather than fitting one lucky one.
+
+    A fold only counts when its training slice still has at least
+    ``max(min_train_weeks, min_weeks_for_trend)`` weeks -- below
+    ``min_weeks_for_trend`` the model forecasts flat at the mean regardless of
+    parameters, so such folds carry no signal and are skipped for speed.
+
+    The module defaults (ALPHA, BETA, PHI) are always scored too, so the
+    result reports how much the winner improves on the file defaults.
+
+    Returns a dict::
+
+        {"alpha", "beta", "phi",          # best combination found
+         "mae",                            # its backtest MAE (units/week)
+         "baseline_mae",                   # MAE of the file defaults
+         "baseline_params": (a, b, p),     # the file defaults scored
+         "n_series", "n_points",           # how much data backed the score
+         "holdout_weeks", "folds"}
+
+    or None when no SKU has enough completed history to backtest.
+    """
+    alpha_grid = AUTOFIT_ALPHA_GRID if alpha_grid is None else list(alpha_grid)
+    beta_grid = AUTOFIT_BETA_GRID if beta_grid is None else list(beta_grid)
+    phi_grid = AUTOFIT_PHI_GRID if phi_grid is None else list(phi_grid)
+
+    # Flatten the grid into parallel combo arrays; ascending order means a tie
+    # resolves to the most conservative (lowest) parameters via argmin.
+    combos = [
+        (a, b, p)
+        for a in sorted(alpha_grid)
+        for b in sorted(beta_grid)
+        for p in sorted(phi_grid)
+    ]
+    baseline = (float(ALPHA), float(BETA), float(PHI))
+    if baseline not in combos:
+        combos.append(baseline)          # always score the file defaults too
+    baseline_idx = combos.index(baseline)
+
+    A = np.array([c[0] for c in combos], dtype="float64")
+    B = np.array([c[1] for c in combos], dtype="float64")
+    PH = np.array([c[2] for c in combos], dtype="float64")
+
+    lookback_start, last_complete_week, _ = week_anchors(today)
+    window = df[
+        (df["WeekDate"] >= lookback_start)
+        & (df["WeekDate"] <= last_complete_week)
+        & (df["POS"].notna() | df["Orders"].notna())
+        & ~df["SKU"].astype(str).str.endswith("*")
+    ].sort_values(["SKU", "WeekDate"])
+    if window.empty:
+        return None
+
+    min_train = max(int(min_train_weeks), int(min_weeks_for_trend), 2)
+    total_err = np.zeros(A.shape[0], dtype="float64")
+    n_points = 0
+    n_series = 0
+
+    for (_sku, _desc), grp in window.groupby(["SKU", "Description"]):
+        source, _weeks, y = _series_for_fit(grp, last_complete_week)
+        if source is None:
+            continue
+        n = len(y)
+        if n < min_train + 1:
+            continue                     # nothing to hold out after training
+
+        scored = False
+        for k in range(max(int(folds), 1)):
+            cut = n - int(holdout_weeks) - k * int(fold_step)
+            if cut < min_train:
+                # Not enough training weeks left; with < holdout remaining
+                # weeks a shorter final fold is still allowed below.
+                cut = min_train if (k == 0 and n - min_train >= 1) else None
+                if cut is None:
+                    break
+            h = min(int(holdout_weeks), n - cut)
+            if h < 1:
+                break
+            fc = np.maximum(_holt_grid_forecast(y[:cut], h, A, B, PH), 0.0)
+            actual = y[cut:cut + h]
+            total_err += np.abs(fc - actual[:, None]).sum(axis=0)
+            n_points += h
+            scored = True
+            if cut == min_train:
+                break                    # can't slide the origin back further
+        if scored:
+            n_series += 1
+
+    if n_points == 0:
+        return None
+
+    best = int(np.argmin(total_err))
+    return {
+        "alpha": float(A[best]),
+        "beta": float(B[best]),
+        "phi": float(PH[best]),
+        "mae": float(total_err[best] / n_points),
+        "baseline_mae": float(total_err[baseline_idx] / n_points),
+        "baseline_params": baseline,
+        "n_series": int(n_series),
+        "n_points": int(n_points),
+        "holdout_weeks": int(holdout_weeks),
+        "folds": int(folds),
+    }
 
 
 def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,

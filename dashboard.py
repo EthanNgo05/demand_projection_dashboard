@@ -196,6 +196,15 @@ def _supports_min_weeks(P):
     return "min_weeks_for_trend" in params
 
 
+def _supports_autofit(P):
+    """True if this pipeline can grid-search its own smoothing parameters.
+
+    The Holt pipeline exposes ``autofit_smoothing`` (a backtest over an
+    alpha/beta/phi grid). Pipelines without it simply don't get the button.
+    """
+    return callable(getattr(P, "autofit_smoothing", None))
+
+
 def _raw_dir():
     """Resolve the folder holding the raw + price files.
 
@@ -403,6 +412,30 @@ def summary_to_excel(summary_df, sheet_name="summary"):
         summary_df.to_excel(w, sheet_name=sheet_name, index=False)
     buf.seek(0)
     return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def run_autofit(df, view, today_ts, model_path, min_weeks=None):
+    """Grid-search the best alpha/beta/phi for the selected view (cached).
+
+    Builds the same SKU-week aggregate ``compute_view`` fits on, then delegates
+    to the pipeline's ``autofit_smoothing`` backtest. Cached on
+    (data, view, snapshot, model, min_weeks) so clicking Autofit twice — or
+    returning to a view already fitted this session — is instant.
+    """
+    P = load_pipeline(model_path)
+    if not _supports_autofit(P):
+        return None
+    if view == ALL_CUSTOMERS_VIEW:
+        agg = P.aggregate_to_sku_week(df)
+    else:
+        agg = P.aggregate_to_sku_week(df[df["Customer Grouping"] == view])
+    kwargs = {}
+    if min_weeks is not None and "min_weeks_for_trend" in inspect.signature(
+        P.autofit_smoothing
+    ).parameters:
+        kwargs["min_weeks_for_trend"] = min_weeks
+    return P.autofit_smoothing(agg, today_ts, **kwargs)
 
 
 @st.cache_data(show_spinner=False)
@@ -705,6 +738,9 @@ def main():
             st.session_state["param_nonce"] = (
                 st.session_state.get("param_nonce", 0) + 1
             )
+            # Autofitted parameters belong to the previous model; drop them so
+            # the new pipeline starts from its own file defaults.
+            st.session_state.pop("autofit_params", None)
 
         st.radio(
             "Forecasting model", list(MODEL_OPTIONS.keys()),
@@ -843,6 +879,20 @@ def main():
             p0 = float(getattr(P, "PHI", 0.85))
             mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
 
+            # If the user ran Autofit, its winning parameters become the slider
+            # defaults (the nonce was bumped when they were stored, so the
+            # sliders rebuild and re-read value=). Results are keyed to the
+            # model/view they were fitted on; anything else falls back to the
+            # file defaults. The sliders stay fully adjustable afterwards.
+            autofit = st.session_state.get("autofit_params")
+            autofit_active = bool(
+                autofit
+                and autofit.get("model") == pipeline_path()
+                and autofit.get("view") == view
+            )
+            if smoothing_ok and autofit_active:
+                a0, b0, p0 = autofit["alpha"], autofit["beta"], autofit["phi"]
+
             # Slider defaults come from the pipeline constants, passed via each
             # slider's value= argument. To reset reliably across Streamlit
             # versions we use a "nonce": the slider keys embed an integer that
@@ -859,6 +909,9 @@ def main():
                 st.session_state["param_nonce"] = (
                     st.session_state.get("param_nonce", 0) + 1
                 )
+                # Discard any autofitted parameters so value= falls back to
+                # the pipeline file's constants.
+                st.session_state.pop("autofit_params", None)
 
             if smoothing_ok:
                 st.caption(
@@ -895,9 +948,70 @@ def main():
                          "2 disables the guard.",
                 )
 
+            # ----- Autofit: backtest a grid of α/β/φ and keep the winner ----
+            if smoothing_ok and _supports_autofit(P):
+                if st.button(
+                    "✨ Autofit α/β/φ",
+                    help="Grid-searches the smoothing parameters by backtesting: "
+                         "the last few completed weeks of each SKU's history are "
+                         "hidden, forecast with each parameter combination, and "
+                         "compared to what actually happened (repeated from "
+                         "several rolling origins). The combination with the "
+                         "lowest total forecast error wins and is applied to the "
+                         "sliders. You can still fine-tune afterwards; "
+                         "'Reset to file defaults' undoes it.",
+                ):
+                    with st.spinner("Backtesting the parameter grid…"):
+                        best = run_autofit(
+                            df, view, today_ts, pipeline_path(), min_weeks
+                        )
+                    if best is None:
+                        st.warning(
+                            "Not enough completed weeks of history in this view "
+                            "to backtest — autofit needs SKUs with at least "
+                            f"~{getattr(P, 'AUTOFIT_MIN_TRAIN_WEEKS', 8) + 1} "
+                            "completed weeks."
+                        )
+                    else:
+                        logger.info(
+                            "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
+                            "(MAE %.2f vs %.2f with file defaults; "
+                            "%d SKUs, %d holdout points)",
+                            view, best["alpha"], best["beta"], best["phi"],
+                            best["mae"], best["baseline_mae"],
+                            best["n_series"], best["n_points"],
+                        )
+                        st.session_state["autofit_params"] = {
+                            **best, "model": pipeline_path(), "view": view,
+                        }
+                        # Rebuild the sliders with the fitted values as their
+                        # defaults and recompute the forecast with them.
+                        st.session_state["param_nonce"] = nonce + 1
+                        st.session_state["_do_recompute"] = True
+                        st.rerun()
+
+                if autofit_active:
+                    improve = autofit["baseline_mae"] - autofit["mae"]
+                    pct = (
+                        f" ({improve / autofit['baseline_mae'] * 100:.0f}% better)"
+                        if autofit["baseline_mae"] > 0 and improve > 0 else ""
+                    )
+                    st.success(
+                        f"Autofit applied: α={autofit['alpha']:g}, "
+                        f"β={autofit['beta']:g}, φ={autofit['phi']:g} — "
+                        f"backtest error {autofit['mae']:.1f} u/wk vs "
+                        f"{autofit['baseline_mae']:.1f} with file defaults"
+                        f"{pct}. Scored on {autofit['n_series']} SKUs, "
+                        f"{autofit['folds']} rolling folds of "
+                        f"{autofit['holdout_weeks']} held-out weeks."
+                    )
+
             bits = []
             if smoothing_ok:
-                bits.append(f"α={a0:g}, β={b0:g}, φ={p0:g}")
+                fa0 = float(getattr(P, "ALPHA", 0.5))
+                fb0 = float(getattr(P, "BETA", 0.3))
+                fp0 = float(getattr(P, "PHI", 0.85))
+                bits.append(f"α={fa0:g}, β={fb0:g}, φ={fp0:g}")
             if min_weeks_ok:
                 bits.append(f"min weeks={mw0}")
             st.button(
