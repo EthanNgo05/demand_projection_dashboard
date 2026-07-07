@@ -344,88 +344,155 @@ def read_plytix_from_bytes(_data, name):
     return pd.read_excel(BytesIO(_data))
 
 
-def compute_active_products(plytix_df):
-    """Exploded (SKU, Active-in-region) frame for active products, plus the raw
-    SKU -> 'Active in' lookup. Ported verbatim from inactive_projections.ipynb.
+INACTIVE_COLS = [
+    "SKU", "Location", "Region", "Active in", "Customer Grouping",
+    "CUSTNMBR", "First_WeekDate", "Last_WeekDate", "Source",
+]
 
-    Returns (active_products_df, sku_active_in) or (None, None) if the Plytix
-    export lacks the columns the check needs (an older list-price file).
+
+def _active_in_list(sku_active_in, sku):
+    """The list of regions a SKU is 'Active in' (e.g. ['US', 'CA', 'EU'])."""
+    return [x.strip() for x in str(sku_active_in.get(sku, "")).split(",")]
+
+
+def compute_active_products(plytix_df):
+    """From the Plytix export, the set of active-product SKUs and a
+    SKU -> 'Active in' string lookup.
+
+    "Active product" mirrors inactive_projections.ipynb: SKU Status == Active,
+    SKU Type == Product, and SKUs starting LS/AS excluded. Trailing '*' markers
+    are stripped so SKUs line up with the demand + warehouse files.
+
+    Returns (active_sku_set, sku_active_in) or (None, None) if the Plytix export
+    lacks the columns the check needs (an older list-price file).
     """
     required = {"SKU", "SKU Status", "SKU Type", "Active in"}
     if plytix_df is None or not required.issubset(plytix_df.columns):
         return None, None
-    p = plytix_df.sort_values("SKU")
-    ap = p[(p["SKU Status"] == "Active") & (p["SKU Type"] == "Product")].copy()
-    ap = ap[~ap["SKU"].astype(str).str.startswith(("LS", "AS"))]
-    ap["Active in"] = (
-        ap["Active in"].astype(str).str.split(",")
-        .apply(lambda lst: [x.strip() for x in lst])
-    )
-    ap = ap.explode("Active in").reset_index(drop=True)
-    ap = ap[ap["Active in"].isin(WAREHOUSE_REGIONS)].reset_index(drop=True)
-    sku_active_in = p[["SKU", "Active in"]].drop_duplicates()
-    return ap, sku_active_in
+    p = plytix_df.copy()
+    p["SKU"] = p["SKU"].astype(str).str.rstrip("*")
+    act = p[(p["SKU Status"] == "Active") & (p["SKU Type"] == "Product")]
+    act = act[~act["SKU"].str.startswith(("LS", "AS"))]
+    active_sku_set = set(act["SKU"])
+    # Full (un-exploded) Active-in string per SKU, e.g. "US,CA,UK,SG,EU,AU".
+    sku_active_in = dict(zip(p["SKU"], p["Active in"].astype(str)))
+    return active_sku_set, sku_active_in
 
 
-def compute_inactive_projections(active_products_df, sku_active_in,
-                                 warehouse_map, today_ts):
-    """Active products with FUTURE projections in regions they're not active in.
+def _region_code(P, grouping):
+    """Two-letter region code for a customer grouping (US/CA/EU/JP/AU), or None.
 
-    Ported from inactive_projections.ipynb. For each region's warehouse file we
-    take the projection rows whose SKU is not in that region's active-SKU set,
-    drop rows whose location is actually one of the SKU's 'Active in' regions,
-    keep only weeks after ``today_ts`` (the snapshot date), and aggregate to the
-    first/last projected week per (SKU, Location, Active in, CUSTNMBR).
-
-    Returns a DataFrame with columns [SKU, Location, Active in, CUSTNMBR,
-    First_WeekDate, Last_WeekDate] (empty if nothing is flagged or inputs are
-    missing).
+    The pipeline's region_for_group returns labels like "JP (NETDEPOT)" or
+    "US (LBC+NJ)"; the leading two letters are the region code we match against
+    Plytix 'Active in'. Anything else (e.g. "Other") returns None.
     """
-    cols = ["SKU", "Location", "Active in", "CUSTNMBR",
-            "First_WeekDate", "Last_WeekDate"]
-    if active_products_df is None or not warehouse_map:
-        return pd.DataFrame(columns=cols)
+    try:
+        label = P.region_for_group(grouping)
+    except Exception:
+        return None
+    code = str(label)[:2].upper()
+    return code if code in WAREHOUSE_REGIONS else None
 
-    results = []
-    for region, proj_df in warehouse_map.items():
-        active_skus = set(
-            active_products_df.loc[
-                active_products_df["Active in"] == region, "SKU"
+
+def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
+                                 today_ts, anchors=None, warehouse_map=None):
+    """Active products showing up in a region they are not 'Active in'.
+
+    This is the fix for cases like ST1082 (active in US/CA/UK/SG/EU/AU but not
+    JP), which still appeared in the JP (NETDEPOT) summary: the dashboard builds
+    a forward forecast for any SKU with demand history in a region, so simply
+    checking the raw warehouse "future projection" column misses it. Instead we
+    look at the *demand file itself* — the same data the dashboard forecasts —
+    map each customer to its region via the pipeline's region_for_group, and
+    flag any active product whose region is not in its Plytix 'Active in' list.
+
+    The per-region warehouse files (if supplied) are cross-checked the same way
+    (their own future projections), so nothing they surface is missed either.
+
+    Returns a table (columns = INACTIVE_COLS) of the flagged
+    SKU x customer x region combinations, empty if none or inputs are missing.
+    """
+    if not active_sku_set or not sku_active_in:
+        return pd.DataFrame(columns=INACTIVE_COLS)
+
+    frames = []
+
+    # ----- Primary: the demand file, by customer-group region ---------------
+    if df is not None and not df.empty:
+        m = df.copy()
+        m["SKU"] = m["SKU"].astype(str).str.rstrip("*")
+        m = m[m["SKU"].isin(active_sku_set)]
+        if not m.empty:
+            m["Region"] = m["Customer Grouping"].map(
+                lambda g: P.region_for_group(g)
+            )
+            m["Location"] = m["Customer Grouping"].map(
+                lambda g: _region_code(P, g)
+            )
+            m = m[m["Location"].notna()]
+            keep = [
+                loc not in _active_in_list(sku_active_in, sku)
+                for sku, loc in zip(m["SKU"], m["Location"])
             ]
-        )
-        inactive_rows = proj_df[~proj_df["SKU"].isin(active_skus)].copy()
-        inactive_rows["Location"] = region
-        results.append(inactive_rows)
+            m = m[keep]
+            m["WeekDate"] = pd.to_datetime(m["WeekDate"])
+            # Only flag pairs the dashboard would actually forecast — i.e. that
+            # carry a POS/Orders demand signal in the historical window (that is
+            # exactly what puts a SKU in a region's summary). Without anchors we
+            # fall back to any presence.
+            if anchors is not None and not m.empty:
+                lb, lcw, _ = anchors
+                sig = (
+                    (m["WeekDate"] >= lb) & (m["WeekDate"] <= lcw)
+                    & (m["POS"].notna() | m.get("Orders", pd.Series(index=m.index)).notna())
+                )
+                live = m.loc[sig, ["SKU", "CUSTNMBR", "Location"]].drop_duplicates()
+                m = m.merge(live, on=["SKU", "CUSTNMBR", "Location"], how="inner")
+            if not m.empty:
+                g = m.groupby(
+                    ["SKU", "Location", "Region", "Customer Grouping", "CUSTNMBR"],
+                    as_index=False,
+                ).agg(
+                    First_WeekDate=("WeekDate", "min"),
+                    Last_WeekDate=("WeekDate", "max"),
+                )
+                g["Active in"] = g["SKU"].map(lambda s: sku_active_in.get(s))
+                g["Source"] = "Demand file"
+                frames.append(g)
 
-    inv = pd.concat(results, ignore_index=True)
-    inv = inv[["SKU", "Location", "CUSTNMBR", "WeekDate"]].drop_duplicates()
-    inv = inv.merge(sku_active_in, on="SKU", how="left")
-    inv = inv[["SKU", "Location", "Active in", "CUSTNMBR", "WeekDate"]]
-
-    # Drop rows where the projection's location is one the SKU is active in.
-    inv = inv[
-        inv.apply(
-            lambda row: row["Location"] not in [
-                x.strip() for x in str(row["Active in"]).split(",")
-            ],
-            axis=1,
-        )
-    ]
-
-    # Future projections only, relative to the snapshot date.
-    inv["WeekDate"] = pd.to_datetime(inv["WeekDate"])
-    inv = inv[inv["WeekDate"] > today_ts]
-    if inv.empty:
-        return pd.DataFrame(columns=cols)
-
-    inv = (
-        inv.groupby(["SKU", "Location", "Active in", "CUSTNMBR"], as_index=False)
-        .agg(
+    # ----- Cross-check: the per-region warehouse files (future projections) --
+    for region, proj in (warehouse_map or {}).items():
+        if region not in WAREHOUSE_REGIONS:
+            continue
+        p = proj.copy()
+        p["SKU"] = p["SKU"].astype(str).str.rstrip("*")
+        p = p[p["SKU"].isin(active_sku_set)]
+        p = p[[region not in _active_in_list(sku_active_in, s) for s in p["SKU"]]]
+        if p.empty:
+            continue
+        p["WeekDate"] = pd.to_datetime(p["WeekDate"])
+        p = p[p["WeekDate"] > today_ts]
+        if p.empty:
+            continue
+        g = p.groupby(["SKU", "CUSTNMBR"], as_index=False).agg(
             First_WeekDate=("WeekDate", "min"),
             Last_WeekDate=("WeekDate", "max"),
         )
-    )
-    return inv.sort_values("SKU").reset_index(drop=True)
+        g["Location"] = region
+        g["Region"] = region
+        g["Customer Grouping"] = g["CUSTNMBR"]
+        g["Active in"] = g["SKU"].map(lambda s: sku_active_in.get(s))
+        g["Source"] = "Warehouse file"
+        frames.append(g)
+
+    if not frames:
+        return pd.DataFrame(columns=INACTIVE_COLS)
+
+    out = pd.concat(frames, ignore_index=True)[INACTIVE_COLS]
+    # If a SKU x customer x region shows up from both sources, keep the demand
+    # file row (appended first) — it's the one the dashboard actually forecasts.
+    out = out.drop_duplicates(subset=["SKU", "Location", "CUSTNMBR"], keep="first")
+    return out.sort_values(["SKU", "Location", "CUSTNMBR"]).reset_index(drop=True)
 
 
 def _clean(raw_df, P):
@@ -1091,19 +1158,23 @@ def main():
     lb, lcw, ffw = P.week_anchors(today_ts)
 
     # ----- Active-in check: flag + drop out-of-region projections ----------
-    # Ported from inactive_projections.ipynb. Any active product with a future
-    # projection (relative to the snapshot date) in a warehouse region it is not
-    # 'Active in' is flagged. Those exact SKU × customer rows are dropped from
-    # the raw data BEFORE forecasting, so they don't distort the projections, and
-    # the flagged set is surfaced in its own table further down.
-    active_products_df, sku_active_in = compute_active_products(plytix_df)
+    # An active product should only be forecast in a region it is 'Active in'
+    # (per the Plytix export). We look at the demand file itself — mapping each
+    # customer to its region via the pipeline's region_for_group — and flag any
+    # active product whose region is not in its 'Active in' list (e.g. ST1082,
+    # active in US/CA/UK/SG/EU/AU, appearing under JP (NETDEPOT)). The uploaded
+    # warehouse files are cross-checked too. Those SKU × customer rows are then
+    # dropped from the data BEFORE forecasting and surfaced in their own table.
+    active_sku_set, sku_active_in = compute_active_products(plytix_df)
+    check_ran = active_sku_set is not None
     inactive_df = compute_inactive_projections(
-        active_products_df, sku_active_in, warehouse_map, today_ts
+        df, active_sku_set, sku_active_in, P, today_ts,
+        anchors=(lb, lcw, ffw), warehouse_map=warehouse_map,
     )
     n_excluded_rows = 0
     if not inactive_df.empty:
         exclude_keys = {
-            f"{str(s).rstrip('*')}||{str(c)}"
+            f"{str(s)}||{str(c)}"
             for s, c in zip(inactive_df["SKU"], inactive_df["CUSTNMBR"])
         }
         key = df["SKU"].astype(str).str.rstrip("*") + "||" + df["CUSTNMBR"].astype(str)
@@ -1112,8 +1183,8 @@ def main():
         if n_excluded_rows:
             df = df[~drop_mask].reset_index(drop=True)
             logger.info(
-                "Active-in check: dropped %d raw rows across %d SKU×customer "
-                "pair(s) with future projections in non-active regions.",
+                "Active-in check: dropped %d raw rows across %d SKU×customer×"
+                "region combos not in the SKU's 'Active in' list.",
                 n_excluded_rows, len(inactive_df),
             )
 
@@ -1581,43 +1652,39 @@ def main():
             )
 
     # ----- Excluded: active products projected in non-active regions --------
-    # The rows behind these SKU × customer pairs were dropped from every table
-    # above (their projections sit in a warehouse region the SKU isn't active
-    # in). Surface them so the exclusion is visible and auditable.
-    if not warehouse_map:
-        st.markdown(
-            "### Active products with future projections in non-active locations"
-        )
+    # The rows behind these SKU × customer × region combos were dropped from
+    # every table above (the SKU isn't 'Active in' that region). Surface them so
+    # the exclusion is visible and auditable.
+    HEADER = "### Active products with future projections in locations they are not active in"
+    if not check_ran:
+        st.markdown(HEADER)
         st.info(
-            "Upload the per-region warehouse projection files in the sidebar "
-            "(and a Plytix export with an 'Active in' column) to run this check."
+            "Upload a Plytix export with an 'Active in' column (sidebar) to run "
+            "the active-in check."
         )
     elif inactive_df.empty:
-        st.markdown(
-            "### Active products with future projections in non-active locations"
-        )
+        st.markdown(HEADER)
         st.success(
-            "None found — every active product's future projections sit in a "
-            "region it is active in."
+            "None found — every active product is only forecast in regions it "
+            "is active in."
         )
     else:
-        st.markdown(
-            "### Active products with future projections in locations they are "
-            "not active in"
-        )
+        st.markdown(HEADER)
+        n_skus = inactive_df["SKU"].nunique()
         st.caption(
-            f"Excluded from the forecast above: {n_excluded_rows:,} raw row(s) "
-            f"across {len(inactive_df):,} SKU × customer pair(s). Each SKU here "
-            "is an active product being projected in a warehouse region that is "
-            "not in its Plytix 'Active in' list, for weeks after "
-            f"{today_ts.date()}."
+            f"Excluded from the forecast above: {n_excluded_rows:,} demand row(s) "
+            f"across {len(inactive_df):,} SKU × customer × region combo(s) "
+            f"({n_skus:,} distinct SKUs). Each is an active product being "
+            "forecast in a region (US/CA/EU/JP/AU) that is not in its Plytix "
+            "'Active in' list. Region comes from each customer's group; 'Source' "
+            "shows whether it was found in the demand file or a warehouse file."
         )
         show = inactive_df.copy()
         show["First_WeekDate"] = pd.to_datetime(show["First_WeekDate"]).dt.date
         show["Last_WeekDate"] = pd.to_datetime(show["Last_WeekDate"]).dt.date
         st.dataframe(show, width="stretch", hide_index=True)
         st.download_button(
-            "⬇️ Download the inactive-projections table",
+            "⬇️ Download the excluded (inactive-region) projections table",
             data=summary_to_excel(inactive_df, sheet_name="inactive_projections"),
             file_name=f"inactive_projections_{today_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
