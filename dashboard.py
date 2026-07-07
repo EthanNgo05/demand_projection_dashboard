@@ -1038,6 +1038,7 @@ def main():
         anchors=(lb, lcw, ffw),
     )
     n_excluded_rows = 0
+    excluded_counts_by_key = pd.Series(dtype="int64")
     if not inactive_df.empty:
         exclude_keys = {
             f"{str(s)}||{str(c)}"
@@ -1046,6 +1047,9 @@ def main():
         key = df["SKU"].astype(str).str.rstrip("*") + "||" + df["CUSTNMBR"].astype(str)
         drop_mask = key.isin(exclude_keys)
         n_excluded_rows = int(drop_mask.sum())
+        # Per SKU||CUSTNMBR demand-row counts, so the excluded table can report
+        # accurate row totals when scoped to a single region's view below.
+        excluded_counts_by_key = key[drop_mask].value_counts()
         if n_excluded_rows:
             df = df[~drop_mask].reset_index(drop=True)
             logger.info(
@@ -1063,6 +1067,7 @@ def main():
         )
         if scope == ALL_CUSTOMERS_VIEW:
             view = ALL_CUSTOMERS_VIEW
+            region = None
         else:
             region = st.selectbox("Region", sorted(by_region.keys()))
             view = st.selectbox("Customer group", by_region[region])
@@ -1522,29 +1527,56 @@ def main():
     # every table above (the SKU isn't 'Active in' that region). Surface them so
     # the exclusion is visible and auditable.
     HEADER = "### Active products with projections in locations they are not active in"
+    st.markdown(HEADER)
     if not check_ran:
-        st.markdown(HEADER)
         st.info(
             "Upload a Plytix export with an 'Active in' column (sidebar) to run "
             "the active-in check."
         )
-    elif inactive_df.empty:
-        st.markdown(HEADER)
-        st.success(
-            "None found — every active product is only forecast in regions it "
-            "is active in."
-        )
     else:
-        st.markdown(HEADER)
-        n_skus = inactive_df["SKU"].nunique()
+        # In a "By customer group" view, mirror the summary table above: only
+        # show rows whose region matches the selected region (e.g. a US view
+        # shouldn't list "JP (NETDEPOT)" rows). ALL CUSTOMERS shows every region.
+        region_scoped = view != ALL_CUSTOMERS_VIEW and region is not None
+        table_df = inactive_df
+        if region_scoped:
+            table_df = inactive_df[inactive_df["Region"] == region]
+
+        if table_df.empty:
+            if region_scoped:
+                st.success(
+                    f"None found for {region} — every active product here is "
+                    "only forecast in regions it is active in."
+                )
+            else:
+                st.success(
+                    "None found — every active product is only forecast in "
+                    "regions it is active in."
+                )
+            return
+        n_skus = table_df["SKU"].nunique()
+        if region_scoped:
+            scoped_keys = (
+                table_df["SKU"].astype(str) + "||" + table_df["CUSTNMBR"].astype(str)
+            )
+            n_rows_shown = int(
+                excluded_counts_by_key[
+                    excluded_counts_by_key.index.isin(set(scoped_keys))
+                ].sum()
+            )
+            scope_note = f" for {region}"
+        else:
+            n_rows_shown = n_excluded_rows
+            scope_note = ""
         st.caption(
-            f"Excluded from the forecast above: {n_excluded_rows:,} demand row(s) "
-            f"across {len(inactive_df):,} SKU × customer × region combo(s) "
+            f"Excluded from the forecast above{scope_note}: {n_rows_shown:,} demand "
+            f"row(s) across {len(table_df):,} SKU × customer × region combo(s) "
             f"({n_skus:,} distinct SKUs). Each is an active product being "
             "forecast in a region (US/CA/EU/JP/AU) that is not in its Plytix "
             "'Active in' list. Region comes from each customer's group."
         )
 
+        inactive_df = table_df.copy()
         inactive_df["First_WeekDate"] = pd.to_datetime(inactive_df["First_WeekDate"]).dt.date
         inactive_df["Last_WeekDate"] = pd.to_datetime(inactive_df["Last_WeekDate"]).dt.date
         inactive_df = inactive_df[['SKU', 'Region', 'Active in', 'Customer Grouping', 'First_WeekDate', 'Last_WeekDate']]
