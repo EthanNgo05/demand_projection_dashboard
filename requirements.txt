@@ -5,3 +5,7 @@ plotly
 openpyxl
 scikit-learn
 xgboost
+langgraph
+langchain-core
+langchain-anthropic
+python-dotenv
