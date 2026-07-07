@@ -990,7 +990,7 @@ def main():
                     )
 
     if df is None:
-        st.warning("Pick or upload a raw data file to get started.")
+        st.warning("Upload the Demand Planning Details Projections file to get started.")
         st.stop()
 
     # A snapshot date anchors the entire 8-week history / 15-week forecast
