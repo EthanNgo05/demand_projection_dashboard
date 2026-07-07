@@ -268,7 +268,7 @@ def region_for_group(group):
     elif group in EU_GROUPS:
         return "EU (SH-CTS)"
     elif group in AU_GROUPS:
-        return "AU (ACT)"
+        return "AU (ACR)"
     elif group in CA_GROUPS:
         return "CA (YYZ5)"
     elif group in JP_GROUPS:
@@ -1188,7 +1188,7 @@ if __name__ == "__main__":
     except Exception:
         print(traceback.format_exc())
 
-    valid_subfolders = ["AU (ACT)", "EU (SH-CTS)", "Other", "US (LBC+NJ)"]
+    valid_subfolders = ["AU (ACR)", "EU (SH-CTS)", "Other", "US (LBC+NJ)"]
     customer_dfs = []
     for folder in valid_subfolders:
         for xlsx_file in (Path(OUTPUT_FOLDER) / folder).rglob("*.xlsx"):

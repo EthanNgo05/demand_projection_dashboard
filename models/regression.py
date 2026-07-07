@@ -137,7 +137,7 @@ def region_for_group(group):
     elif group in EU_GROUPS:
         return "EU (SH-CTS)"
     elif group in AU_GROUPS:
-        return "AU (ACT)"
+        return "AU (ACR)"
     elif group in CA_GROUPS:
         return "CA (YYZ5)"
     elif group in JP_GROUPS:
