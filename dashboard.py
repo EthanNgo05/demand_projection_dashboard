@@ -1569,9 +1569,8 @@ def main():
             n_rows_shown = n_excluded_rows
             scope_note = ""
         st.caption(
-            f"Excluded from the forecast above{scope_note}: {n_rows_shown:,} demand "
-            f"row(s) across {len(table_df):,} SKU × customer × region combo(s) "
-            f"({n_skus:,} distinct SKUs). Each is an active product being "
+            f"Excluded from the forecast above{scope_note}:"
+            f"{n_skus:,} distinct SKUs. Each is an active product being "
             "forecast in a region (US/CA/EU/JP/AU) that is not in its Plytix "
             "'Active in' list. Region comes from each customer's group."
         )
