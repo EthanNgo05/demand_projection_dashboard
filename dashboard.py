@@ -291,8 +291,20 @@ def read_plytix_from_bytes(_data, name):
 
 INACTIVE_COLS = [
     "SKU", "Location", "Region", "Active in", "Customer Grouping",
-    "CUSTNMBR", "First_WeekDate", "Last_WeekDate", "Source",
+    "CUSTNMBR", "First_WeekDate", "Last_WeekDate", "Original_Projection", "Source",
 ]
+
+
+def _this_week_start():
+    """Sunday-anchored start of the current week as a Timestamp.
+
+    WeekDates fall on Sunday-anchored 7-day boundaries, so "this week" is the
+    most recent Sunday on or before today (e.g. today 7/7 -> 7/5). Shared by the
+    excluded-table future-projection column and its "future only" toggle so both
+    use the exact same boundary.
+    """
+    today = pd.Timestamp.today().normalize()
+    return today - pd.Timedelta(days=(today.weekday() + 1) % 7)
 
 
 def _active_in_list(sku_active_in, sku):
@@ -390,12 +402,20 @@ def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
                 live = m.loc[sig, ["SKU", "CUSTNMBR", "Location"]].drop_duplicates()
                 m = m.merge(live, on=["SKU", "CUSTNMBR", "Location"], how="inner")
             if not m.empty:
+                # Original projection over future weeks (this week onward) —
+                # averaged per week — the projected weekly volume being excluded
+                # going forward. Uses the same week boundary as the excluded
+                # table's "future only" toggle.
+                m["_future_proj"] = pd.to_numeric(
+                    m["Projection"], errors="coerce"
+                ).where(m["WeekDate"] >= _this_week_start())
                 g = m.groupby(
                     ["SKU", "Location", "Region", "Customer Grouping", "CUSTNMBR"],
                     as_index=False,
                 ).agg(
                     First_WeekDate=("WeekDate", "min"),
                     Last_WeekDate=("WeekDate", "max"),
+                    Original_Projection=("_future_proj", "mean"),
                 )
                 g["Active in"] = g["SKU"].map(lambda s: sku_active_in.get(s))
                 g["Source"] = "Demand file"
@@ -407,6 +427,82 @@ def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
     out = pd.concat(frames, ignore_index=True)[INACTIVE_COLS]
     out = out.drop_duplicates(subset=["SKU", "Location", "CUSTNMBR"], keep="first")
     return out.sort_values(["SKU", "Location", "CUSTNMBR"]).reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+# Discontinued/inactive-product check (ported from                             #
+# discontinued_with_projections.ipynb): a SKU marked Discontinued or Inactive  #
+# in Plytix should not carry forward-looking projections. We look at the       #
+# demand file, keep the SKUs whose Plytix status is Discontinued/Inactive,     #
+# and surface any that still have future projection weeks.                     #
+# --------------------------------------------------------------------------- #
+DISCONTINUED_COLS = [
+    "SKU", "SKU Status", "Region", "Customer Grouping", "CUSTNMBR",
+    "First_WeekDate", "Last_WeekDate", "Original_Projection",
+]
+
+
+def compute_discontinued_products(plytix_df):
+    """SKU -> 'SKU Status' lookup for Discontinued/Inactive products.
+
+    Mirrors discontinued_with_projections.ipynb: keep rows whose SKU Status is
+    'Discontinued' or 'Inactive'. Trailing '*' markers are stripped so SKUs line
+    up with the demand file. Returns None if the Plytix export lacks the columns
+    the check needs (an older list-price file).
+    """
+    required = {"SKU", "SKU Status"}
+    if plytix_df is None or not required.issubset(plytix_df.columns):
+        return None
+    p = plytix_df.copy()
+    p["SKU"] = p["SKU"].astype(str).str.rstrip("*")
+    disc = p[p["SKU Status"].isin(["Discontinued", "Inactive"])]
+    return dict(zip(disc["SKU"], disc["SKU Status"]))
+
+
+def compute_discontinued_projections(df, disc_status, P, today_ts):
+    """Discontinued/inactive products that still carry future projections.
+
+    Ported from discontinued_with_projections.ipynb: intersect the demand file
+    with the discontinued/inactive SKU set, keep only future projection weeks
+    (WeekDate after today), and aggregate to one row per SKU x customer with the
+    first/last projected week. A Region column (via the pipeline's
+    region_for_group) is added so a by-customer-group view can be scoped to its
+    own region.
+
+    Returns a table (columns = DISCONTINUED_COLS), empty if none or inputs are
+    missing.
+    """
+    if not disc_status or df is None or df.empty:
+        return pd.DataFrame(columns=DISCONTINUED_COLS)
+
+    m = df.copy()
+    m["SKU"] = m["SKU"].astype(str).str.rstrip("*")
+    m = m[m["SKU"].isin(disc_status)]
+    if m.empty:
+        return pd.DataFrame(columns=DISCONTINUED_COLS)
+
+    # Future projections only. Like the active-in table, "future" starts at the
+    # beginning of the current week (Sunday-anchored via _this_week_start), so
+    # the in-progress week is included — e.g. 7/5 counts while the 7/7 week is
+    # not yet over.
+    m["WeekDate"] = pd.to_datetime(m["WeekDate"])
+    week_start = _this_week_start()
+    m = m[m["WeekDate"] >= week_start]
+    if m.empty:
+        return pd.DataFrame(columns=DISCONTINUED_COLS)
+
+    m["Region"] = m["Customer Grouping"].map(lambda g: P.region_for_group(g))
+    m["_future_proj"] = pd.to_numeric(m["Projection"], errors="coerce")
+    g = m.groupby(
+        ["SKU", "Region", "Customer Grouping", "CUSTNMBR"], as_index=False,
+    ).agg(
+        First_WeekDate=("WeekDate", "min"),
+        Last_WeekDate=("WeekDate", "max"),
+        Original_Projection=("_future_proj", "mean"),
+    )
+    g["SKU Status"] = g["SKU"].map(lambda s: disc_status.get(s))
+    out = g[DISCONTINUED_COLS]
+    return out.sort_values(["SKU", "CUSTNMBR"]).reset_index(drop=True)
 
 
 def _clean(raw_df, P):
@@ -1037,6 +1133,18 @@ def main():
         df, active_sku_set, sku_active_in, P, today_ts,
         anchors=(lb, lcw, ffw),
     )
+
+    # ----- Discontinued/inactive-product check -----------------------------
+    # Flag SKUs marked Discontinued/Inactive in Plytix that still carry future
+    # projections (ported from discontinued_with_projections.ipynb). These SKUs
+    # are then dropped from the data BEFORE forecasting — a discontinued product
+    # should not appear in the summary, projections or revenue figures — and
+    # surfaced in their own table below.
+    disc_status = compute_discontinued_products(plytix_df)
+    disc_check_ran = disc_status is not None
+    discontinued_df = compute_discontinued_projections(
+        df, disc_status, P, today_ts,
+    )
     n_excluded_rows = 0
     excluded_counts_by_key = pd.Series(dtype="int64")
     if not inactive_df.empty:
@@ -1056,6 +1164,23 @@ def main():
                 "Active-in check: dropped %d raw rows across %d SKU×customer×"
                 "region combos not in the SKU's 'Active in' list.",
                 n_excluded_rows, len(inactive_df),
+            )
+
+    # Drop discontinued/inactive SKUs entirely so they are excluded from every
+    # summary, projection and revenue figure below. The status is SKU-level, so
+    # the whole SKU is removed (not just the flagged customer combos). Done after
+    # discontinued_df is computed above so the table still lists them.
+    if disc_status:
+        df_sku = df["SKU"].astype(str).str.rstrip("*")
+        disc_mask = df_sku.isin(disc_status)
+        n_disc_rows = int(disc_mask.sum())
+        if n_disc_rows:
+            n_disc_skus = df_sku[disc_mask].nunique()
+            df = df[~disc_mask].reset_index(drop=True)
+            logger.info(
+                "Discontinued check: dropped %d raw rows across %d "
+                "discontinued/inactive SKUs.",
+                n_disc_rows, n_disc_skus,
             )
 
     # ----- View selector ---------------------------------------------------
@@ -1523,9 +1648,25 @@ def main():
             )
 
     # ----- Excluded: active products projected in non-active regions --------
-    # The rows behind these SKU × customer × region combos were dropped from
-    # every table above (the SKU isn't 'Active in' that region). Surface them so
-    # the exclusion is visible and auditable.
+    render_inactive_section(
+        view, region, check_ran, inactive_df,
+        excluded_counts_by_key, n_excluded_rows, today_str,
+    )
+
+    # ----- Discontinued/inactive products with projections ------------------
+    render_discontinued_section(
+        view, region, disc_check_ran, discontinued_df, today_str,
+    )
+
+
+def render_inactive_section(view, region, check_ran, inactive_df,
+                            excluded_counts_by_key, n_excluded_rows, today_str):
+    """Table of active products projected in regions they are not 'Active in'.
+
+    The rows behind these SKU × customer × region combos were dropped from every
+    summary table above (the SKU isn't 'Active in' that region). Surface them so
+    the exclusion is visible and auditable.
+    """
     HEADER = "### Active products with projections in locations they are not active in"
     st.markdown(HEADER)
     if not check_ran:
@@ -1533,80 +1674,153 @@ def main():
             "Upload a Plytix export with an 'Active in' column (sidebar) to run "
             "the active-in check."
         )
-    else:
-        # In a "By customer group" view, mirror the summary table above: only
-        # show rows whose region matches the selected region (e.g. a US view
-        # shouldn't list "JP (NETDEPOT)" rows). ALL CUSTOMERS shows every region.
-        region_scoped = view != ALL_CUSTOMERS_VIEW and region is not None
-        table_df = inactive_df
-        if region_scoped:
-            table_df = inactive_df[inactive_df["Region"] == region]
+        return
 
-        if table_df.empty:
-            if region_scoped:
-                st.success(
-                    f"None found for {region} — every active product here is "
-                    "only forecast in regions it is active in."
-                )
-            else:
-                st.success(
-                    "None found — every active product is only forecast in "
-                    "regions it is active in."
-                )
-            return
-        n_skus = table_df["SKU"].nunique()
+    # In a "By customer group" view, mirror the summary table above: only
+    # show rows whose region matches the selected region (e.g. a US view
+    # shouldn't list "JP (NETDEPOT)" rows). ALL CUSTOMERS shows every region.
+    region_scoped = view != ALL_CUSTOMERS_VIEW and region is not None
+    table_df = inactive_df
+    if region_scoped:
+        table_df = inactive_df[inactive_df["Region"] == region]
+
+    if table_df.empty:
         if region_scoped:
-            scoped_keys = (
-                table_df["SKU"].astype(str) + "||" + table_df["CUSTNMBR"].astype(str)
+            st.success(
+                f"None found for {region} — every active product here is "
+                "only forecast in regions it is active in."
             )
-            n_rows_shown = int(
-                excluded_counts_by_key[
-                    excluded_counts_by_key.index.isin(set(scoped_keys))
-                ].sum()
-            )
-            scope_note = f" for {region}"
         else:
-            n_rows_shown = n_excluded_rows
-            scope_note = ""
-        st.caption(
-            f"Excluded from the forecast above{scope_note}: "
-            f"{n_skus:,} distinct SKUs. Each is an active product being "
-            "forecast in a region (US/CA/EU/JP/AU) that is not in its Plytix "
-            "'Active in' list."
+            st.success(
+                "None found — every active product is only forecast in "
+                "regions it is active in."
+            )
+        return
+    n_skus = table_df["SKU"].nunique()
+    if region_scoped:
+        scoped_keys = (
+            table_df["SKU"].astype(str) + "||" + table_df["CUSTNMBR"].astype(str)
         )
-
-        inactive_df = table_df.copy()
-        inactive_df["First_WeekDate"] = pd.to_datetime(inactive_df["First_WeekDate"]).dt.date
-        inactive_df["Last_WeekDate"] = pd.to_datetime(inactive_df["Last_WeekDate"]).dt.date
-        inactive_df = inactive_df[['SKU', 'Region', 'Active in', 'Customer Grouping', 'First_WeekDate', 'Last_WeekDate']]
-
-        # Toggle: only show rows whose Last_WeekDate is this week and onward.
-        # WeekDates fall on Sunday-anchored 7-day boundaries, so "this week" is
-        # the most recent Sunday on or before today (e.g. today 7/7 -> 7/5, and a
-        # Last_WeekDate of 7/5 counts as this week).
-        today = pd.Timestamp.today().normalize()
-        week_start = (today - pd.Timedelta(days=(today.weekday() + 1) % 7)).date()
-        future_only = st.toggle(
-            "Show only future projections (Last_WeekDate this week and onward)",
-            value=True,
-            key="inactive_future_only",
-            help=(
-                f"Filters to rows where Last_WeekDate is on or after "
-                f"{week_start.month}/{week_start.day} (the start of this week)."
-            ),
+        n_rows_shown = int(
+            excluded_counts_by_key[
+                excluded_counts_by_key.index.isin(set(scoped_keys))
+            ].sum()
         )
+        scope_note = f" for {region}"
+    else:
+        n_rows_shown = n_excluded_rows
+        scope_note = ""
+    st.caption(
+        f"Excluded from the forecast above{scope_note}: "
+        f"{n_skus:,} distinct SKUs. Each is an active product being "
+        "forecast in a region (US/CA/EU/JP/AU) that is not in its Plytix "
+        "'Active in' list."
+    )
 
-        show = inactive_df.copy()
-        if future_only:
-            show = show[show["Last_WeekDate"] >= week_start]
-        st.dataframe(show, width="stretch", hide_index=True)
-        st.download_button(
-            "⬇️ Download the excluded (inactive-region) projections table",
-            data=summary_to_excel(inactive_df, sheet_name="inactive_projections"),
-            file_name=f"inactive_projections_{today_str}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_inactive_projections",
+    inactive_df = table_df.copy()
+    inactive_df["First_WeekDate"] = pd.to_datetime(inactive_df["First_WeekDate"]).dt.date
+    inactive_df["Last_WeekDate"] = pd.to_datetime(inactive_df["Last_WeekDate"]).dt.date
+    inactive_df["Original_Projection"] = pd.to_numeric(
+        inactive_df["Original_Projection"], errors="coerce"
+    ).round(0)
+    inactive_df = inactive_df[[
+        'SKU', 'Region', 'Active in', 'Customer Grouping',
+        'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
+    ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
+
+    # Toggle: only show rows whose Last_WeekDate is this week and onward.
+    # The "future avg/wk" projection column above is averaged over the same
+    # (Sunday-anchored) week boundary via _this_week_start().
+    week_start = _this_week_start().date()
+    future_only = st.toggle(
+        "Show only non-zero future projections (Last_WeekDate this week and onward)",
+        value=True,
+        key="inactive_future_only",
+        help=(
+            f"Filters to rows where Last_WeekDate is on or after "
+            f"{week_start.month}/{week_start.day} (the start of this week)."
+        ),
+    )
+
+    show = inactive_df.copy()
+    if future_only:
+        show = show[(show["Last_WeekDate"] >= week_start) & show['Original Projection (future avg/wk)'] != 0]
+    st.dataframe(show, width="stretch", hide_index=True)
+    st.download_button(
+        "⬇️ Download the excluded (inactive-region) projections table",
+        data=summary_to_excel(inactive_df, sheet_name="inactive_projections"),
+        file_name=f"inactive_projections_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_inactive_projections",
+    )
+
+
+def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
+                                today_str):
+    """Table of Discontinued/Inactive products that still carry projections.
+
+    Ported from discontinued_with_projections.ipynb. In a "By customer group"
+    view, only rows whose region matches the selected region are shown (e.g. an
+    EU view won't list AAFES, a US customer); ALL CUSTOMERS shows every region.
+    """
+    HEADER = "### Inactive/discontinued products with projections"
+    st.markdown(HEADER)
+    if not disc_check_ran:
+        st.info(
+            "Upload a Plytix export with a 'SKU Status' column (sidebar) to run "
+            "the discontinued-product check."
         )
+        return
+
+    region_scoped = view != ALL_CUSTOMERS_VIEW and region is not None
+    table_df = discontinued_df
+    if region_scoped:
+        table_df = discontinued_df[discontinued_df["Region"] == region]
+
+    if table_df.empty:
+        if region_scoped:
+            st.success(
+                f"None found for {region} — no discontinued or inactive "
+                "products carry future projections here."
+            )
+        else:
+            st.success(
+                "None found — no discontinued or inactive products carry "
+                "future projections."
+            )
+        return
+
+    n_skus = table_df["SKU"].nunique()
+    scope_note = f" for {region}" if region_scoped else ""
+    st.caption(
+        f"Flagged{scope_note}: {n_skus:,} distinct SKUs marked Discontinued or "
+        "Inactive in Plytix that still carry future projections (future weeks "
+        "only)."
+    )
+
+    disc = table_df.copy()
+    disc["First_WeekDate"] = pd.to_datetime(disc["First_WeekDate"]).dt.date
+    disc["Last_WeekDate"] = pd.to_datetime(disc["Last_WeekDate"]).dt.date
+    disc["Original_Projection"] = pd.to_numeric(
+        disc["Original_Projection"], errors="coerce"
+    ).round(0)
+    disc = disc[
+        disc["Original_Projection"].notna() &
+        (disc["Original_Projection"] != 0)
+    ]
+    disc = disc[[
+        'SKU', 'SKU Status', 'Region', 'Customer Grouping',
+        'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
+    ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
+
+    st.dataframe(disc, width="stretch", hide_index=True)
+    st.download_button(
+        "⬇️ Download the discontinued/inactive projections table",
+        data=summary_to_excel(disc, sheet_name="discontinued_projections"),
+        file_name=f"discontinued_with_projections_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_discontinued_projections",
+    )
 
 
 def _run():
