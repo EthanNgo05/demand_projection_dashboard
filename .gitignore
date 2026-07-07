@@ -1,8 +1,12 @@
-# raw inputs folder
+# folders
 /raw_inputs
-
-# outputs folder
 /outputs
+/docs
+/notebooks
 
 # pycache
 __pycache__
+
+# logs
+logs.txt
+
