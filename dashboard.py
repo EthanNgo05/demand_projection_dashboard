@@ -118,11 +118,10 @@ def pipeline_path():
 
 ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
 
-# Regions we hold per-warehouse projection files for. A SKU should only be
-# projected in a warehouse region it is "Active in" (per the Plytix export);
-# a future projection in any other region is flagged and excluded from the
-# forecast (see the inactive-projections logic below, ported from
-# inactive_projections.ipynb).
+# The warehouse regions we check "Active in" against. A SKU should only be
+# projected in a region it is "Active in" (per the Plytix export); a projection
+# in any other region is flagged and excluded from the forecast (see the
+# inactive-projections logic below, ported from inactive_projections.ipynb).
 WAREHOUSE_REGIONS = ["AU", "CA", "EU", "JP", "US"]
 
 # Column names produced by the pipeline's fit_regression when list prices are
@@ -272,66 +271,12 @@ def discover_raw_files():
 
 
 # --------------------------------------------------------------------------- #
-# Warehouse projections + "Active in" check (ported from                       #
-# inactive_projections.ipynb): active products should only carry projections   #
-# in regions they are Active in. Future projections in any other region are    #
-# flagged and dropped from the forecast, and surfaced in their own table.      #
+# "Active in" check (ported from inactive_projections.ipynb): active products  #
+# should only carry projections in regions they are Active in. Projections in   #
+# any other region are flagged, dropped from the forecast, and surfaced in     #
+# their own table. The check reads the demand file directly — the same data    #
+# the dashboard forecasts.                                                     #
 # --------------------------------------------------------------------------- #
-def _warehouse_region_from_name(name):
-    """Region code parsed from a warehouse filename, e.g. 'AU' from
-    ``AU_warehouse_projections_2026-07-07.xlsx`` (None if it doesn't match)."""
-    m = re.match(r"([A-Za-z]{2})[_-]warehouse", os.path.basename(name))
-    return m.group(1).upper() if m else None
-
-
-def warehouse_glob():
-    """Glob for the per-region warehouse files, in the raw folder's
-    ``warehouse`` subdir (mirroring the notebook's raw_inputs/warehouse)."""
-    return os.path.join(_raw_dir(), "warehouse", "*_warehouse_projections_*.xlsx")
-
-
-def discover_warehouse_files():
-    """Discover per-region warehouse files on disk as {REGION: (date, path)}.
-
-    Only the newest file per region is kept, so re-running with a fresh export
-    date supersedes an older one automatically.
-    """
-    found = {}
-    for path in glob.glob(warehouse_glob()):
-        region = _warehouse_region_from_name(path)
-        if region not in WAREHOUSE_REGIONS:
-            continue
-        d = _date_from_name(path) or ""
-        prev = found.get(region)
-        if prev is None or d >= prev[0]:
-            found[region] = (d, path)
-    return found
-
-
-def _read_warehouse(df):
-    """Normalise a raw warehouse projection frame to SKU + CUSTNMBR + WeekDate.
-
-    Mirrors the notebook's ``read_warehouse_data``: the DisplaySKU column is
-    renamed to SKU and any trailing '*' (the export's active-flag marker) is
-    stripped so SKUs line up with the Plytix export.
-    """
-    df = df.rename(columns={"'Projection_by_Warehouse'[DisplaySKU]": "SKU"})
-    df["SKU"] = df["SKU"].astype(str).str.rstrip("*")
-    return df
-
-
-@st.cache_data(show_spinner="Reading warehouse projections…")
-def read_warehouse_from_path(path, _mtime, header=2):
-    """Read + normalise a warehouse projection file from disk (cached)."""
-    return _read_warehouse(pd.read_excel(path, header=header))
-
-
-@st.cache_data(show_spinner="Reading warehouse projections…")
-def read_warehouse_from_bytes(_data, name, header=2):
-    """Read + normalise an uploaded warehouse projection file (cached on bytes)."""
-    return _read_warehouse(pd.read_excel(BytesIO(_data), header=header))
-
-
 @st.cache_data(show_spinner="Reading Plytix export…")
 def read_plytix_from_path(path, _mtime):
     """Read the raw Plytix export from disk (for the 'Active in' check)."""
@@ -361,7 +306,7 @@ def compute_active_products(plytix_df):
 
     "Active product" mirrors inactive_projections.ipynb: SKU Status == Active,
     SKU Type == Product, and SKUs starting LS/AS excluded. Trailing '*' markers
-    are stripped so SKUs line up with the demand + warehouse files.
+    are stripped so SKUs line up with the demand file.
 
     Returns (active_sku_set, sku_active_in) or (None, None) if the Plytix export
     lacks the columns the check needs (an older list-price file).
@@ -395,19 +340,15 @@ def _region_code(P, grouping):
 
 
 def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
-                                 today_ts, anchors=None, warehouse_map=None):
+                                 today_ts, anchors=None):
     """Active products showing up in a region they are not 'Active in'.
 
     This is the fix for cases like ST1082 (active in US/CA/UK/SG/EU/AU but not
     JP), which still appeared in the JP (NETDEPOT) summary: the dashboard builds
-    a forward forecast for any SKU with demand history in a region, so simply
-    checking the raw warehouse "future projection" column misses it. Instead we
-    look at the *demand file itself* — the same data the dashboard forecasts —
-    map each customer to its region via the pipeline's region_for_group, and
-    flag any active product whose region is not in its Plytix 'Active in' list.
-
-    The per-region warehouse files (if supplied) are cross-checked the same way
-    (their own future projections), so nothing they surface is missed either.
+    a forward forecast for any SKU with demand history in a region. We look at
+    the *demand file itself* — the same data the dashboard forecasts — map each
+    customer to its region via the pipeline's region_for_group, and flag any
+    active product whose region is not in its Plytix 'Active in' list.
 
     Returns a table (columns = INACTIVE_COLS) of the flagged
     SKU x customer x region combinations, empty if none or inputs are missing.
@@ -460,37 +401,10 @@ def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
                 g["Source"] = "Demand file"
                 frames.append(g)
 
-    # ----- Cross-check: the per-region warehouse files (future projections) --
-    for region, proj in (warehouse_map or {}).items():
-        if region not in WAREHOUSE_REGIONS:
-            continue
-        p = proj.copy()
-        p["SKU"] = p["SKU"].astype(str).str.rstrip("*")
-        p = p[p["SKU"].isin(active_sku_set)]
-        p = p[[region not in _active_in_list(sku_active_in, s) for s in p["SKU"]]]
-        if p.empty:
-            continue
-        p["WeekDate"] = pd.to_datetime(p["WeekDate"])
-        p = p[p["WeekDate"] > today_ts]
-        if p.empty:
-            continue
-        g = p.groupby(["SKU", "CUSTNMBR"], as_index=False).agg(
-            First_WeekDate=("WeekDate", "min"),
-            Last_WeekDate=("WeekDate", "max"),
-        )
-        g["Location"] = region
-        g["Region"] = region
-        g["Customer Grouping"] = g["CUSTNMBR"]
-        g["Active in"] = g["SKU"].map(lambda s: sku_active_in.get(s))
-        g["Source"] = "Warehouse file"
-        frames.append(g)
-
     if not frames:
         return pd.DataFrame(columns=INACTIVE_COLS)
 
     out = pd.concat(frames, ignore_index=True)[INACTIVE_COLS]
-    # If a SKU x customer x region shows up from both sources, keep the demand
-    # file row (appended first) — it's the one the dashboard actually forecasts.
     out = out.drop_duplicates(subset=["SKU", "Location", "CUSTNMBR"], keep="first")
     return out.sort_values(["SKU", "Location", "CUSTNMBR"]).reset_index(drop=True)
 
@@ -1042,7 +956,7 @@ def main():
 
         # ----- List prices (drive revenue risk) ---------------------------
         # The Plytix export doubles as the source of each SKU's list price AND
-        # its 'Active in' regions (used by the warehouse check below), so we read
+        # its 'Active in' regions (used by the active-in check below), so we read
         # both from whichever Plytix file is in play — uploaded or on disk.
         st.header("Revenue risk")
         prices = None
@@ -1053,7 +967,7 @@ def main():
                 "list_prices_*.xlsx", type=["xlsx"], key="price_upload",
                 help="SKU + List Price USD, plus SKU Status / SKU Type / "
                     "'Active in'. Drives revenue risk (projection difference × "
-                    "list price) and the warehouse active-in check.",
+                    "list price) and the active-in check.",
             )
             if up_price is not None:
                 prices = load_prices_from_bytes(
@@ -1074,54 +988,6 @@ def main():
                         f"{len(prices):,} list prices "
                         f"({os.path.basename(price_file)})"
                     )
-
-        # ----- Warehouse projections (active-in check) --------------------
-        # One projection file per region. A SKU should only be projected in a
-        # region it is 'Active in' (per the Plytix export above); future
-        # projections elsewhere are flagged and dropped from the forecast.
-        st.header("Warehouse projections")
-        warehouse_map = {}
-        wh_disk = discover_warehouse_files()
-        for region, (d, path) in wh_disk.items():
-            warehouse_map[region] = read_warehouse_from_path(
-                path, os.path.getmtime(path)
-            )
-        with st.expander(
-            "Upload warehouse projection files (one per region)",
-            expanded=not wh_disk,
-        ):
-            st.caption(
-                "Region and date are read from each filename, e.g. "
-                "`AU_warehouse_projections_2026-07-07.xlsx`. Regions: "
-                + ", ".join(WAREHOUSE_REGIONS) + "."
-            )
-            wh_ups = st.file_uploader(
-                "{REGION}_warehouse_projections_YYYY-MM-DD.xlsx",
-                type=["xlsx"], accept_multiple_files=True, key="warehouse_upload",
-            )
-            for up_wh in wh_ups or []:
-                region = _warehouse_region_from_name(up_wh.name)
-                if region not in WAREHOUSE_REGIONS:
-                    st.warning(
-                        f"Skipped **{up_wh.name}** — the filename must start with "
-                        f"a region code ({', '.join(WAREHOUSE_REGIONS)}), e.g. "
-                        "`AU_warehouse_projections_2026-07-07.xlsx`."
-                    )
-                    continue
-                # An uploaded file overrides the on-disk copy for that region.
-                warehouse_map[region] = read_warehouse_from_bytes(
-                    up_wh.getvalue(), up_wh.name
-                )
-            if warehouse_map:
-                loaded = ", ".join(
-                    f"{r} ({wh_disk[r][0] or '—'})" if r in wh_disk and r not in
-                    {_warehouse_region_from_name(u.name) for u in (wh_ups or [])}
-                    else r
-                    for r in sorted(warehouse_map)
-                )
-                st.success(f"Warehouse regions loaded: {loaded}")
-            else:
-                st.info("No warehouse files loaded — active-in check skipped.")
 
     if df is None:
         st.warning("Pick or upload a raw data file to get started.")
@@ -1162,14 +1028,14 @@ def main():
     # (per the Plytix export). We look at the demand file itself — mapping each
     # customer to its region via the pipeline's region_for_group — and flag any
     # active product whose region is not in its 'Active in' list (e.g. ST1082,
-    # active in US/CA/UK/SG/EU/AU, appearing under JP (NETDEPOT)). The uploaded
-    # warehouse files are cross-checked too. Those SKU × customer rows are then
-    # dropped from the data BEFORE forecasting and surfaced in their own table.
+    # active in US/CA/UK/SG/EU/AU, appearing under JP (NETDEPOT)). Those SKU ×
+    # customer rows are then dropped from the data BEFORE forecasting and
+    # surfaced in their own table.
     active_sku_set, sku_active_in = compute_active_products(plytix_df)
     check_ran = active_sku_set is not None
     inactive_df = compute_inactive_projections(
         df, active_sku_set, sku_active_in, P, today_ts,
-        anchors=(lb, lcw, ffw), warehouse_map=warehouse_map,
+        anchors=(lb, lcw, ffw),
     )
     n_excluded_rows = 0
     if not inactive_df.empty:
@@ -1655,7 +1521,7 @@ def main():
     # The rows behind these SKU × customer × region combos were dropped from
     # every table above (the SKU isn't 'Active in' that region). Surface them so
     # the exclusion is visible and auditable.
-    HEADER = "### Active products with future projections in locations they are not active in"
+    HEADER = "### Active products with projections in locations they are not active in"
     if not check_ran:
         st.markdown(HEADER)
         st.info(
@@ -1676,12 +1542,13 @@ def main():
             f"across {len(inactive_df):,} SKU × customer × region combo(s) "
             f"({n_skus:,} distinct SKUs). Each is an active product being "
             "forecast in a region (US/CA/EU/JP/AU) that is not in its Plytix "
-            "'Active in' list. Region comes from each customer's group; 'Source' "
-            "shows whether it was found in the demand file or a warehouse file."
+            "'Active in' list. Region comes from each customer's group."
         )
+
+        inactive_df["First_WeekDate"] = pd.to_datetime(inactive_df["First_WeekDate"]).dt.date
+        inactive_df["Last_WeekDate"] = pd.to_datetime(inactive_df["Last_WeekDate"]).dt.date
+        inactive_df = inactive_df[['SKU', 'Region', 'Active in', 'Customer Grouping', 'First_WeekDate', 'Last_WeekDate']]
         show = inactive_df.copy()
-        show["First_WeekDate"] = pd.to_datetime(show["First_WeekDate"]).dt.date
-        show["Last_WeekDate"] = pd.to_datetime(show["Last_WeekDate"]).dt.date
         st.dataframe(show, width="stretch", hide_index=True)
         st.download_button(
             "⬇️ Download the excluded (inactive-region) projections table",
