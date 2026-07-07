@@ -1557,7 +1557,7 @@ def main():
         week_start = (today - pd.Timedelta(days=(today.weekday() + 1) % 7)).date()
         future_only = st.toggle(
             "Show only future projections (Last_WeekDate this week and onward)",
-            value=False,
+            value=True,
             key="inactive_future_only",
             help=(
                 f"Filters to rows where Last_WeekDate is on or after "
