@@ -1572,7 +1572,7 @@ def main():
             f"Excluded from the forecast above{scope_note}:"
             f"{n_skus:,} distinct SKUs. Each is an active product being "
             "forecast in a region (US/CA/EU/JP/AU) that is not in its Plytix "
-            "'Active in' list. Region comes from each customer's group."
+            "'Active in' list."
         )
 
         inactive_df = table_df.copy()
