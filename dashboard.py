@@ -1667,7 +1667,7 @@ def render_inactive_section(view, region, check_ran, inactive_df,
     summary table above (the SKU isn't 'Active in' that region). Surface them so
     the exclusion is visible and auditable.
     """
-    HEADER = "### Active products with projections in locations they are not active in"
+    HEADER = "### Active products with future projections in locations they are not active in"
     st.markdown(HEADER)
     if not check_ran:
         st.info(
@@ -1684,7 +1684,23 @@ def render_inactive_section(view, region, check_ran, inactive_df,
     if region_scoped:
         table_df = inactive_df[inactive_df["Region"] == region]
 
-    if table_df.empty:
+    # Always show only non-zero future projections: rows whose Last_WeekDate is
+    # this week and onward (Sunday-anchored via _this_week_start, matching the
+    # "future avg/wk" projection column) with a non-zero projection.
+    week_start = _this_week_start().date()
+    fdf = table_df.copy()
+    fdf["First_WeekDate"] = pd.to_datetime(fdf["First_WeekDate"]).dt.date
+    fdf["Last_WeekDate"] = pd.to_datetime(fdf["Last_WeekDate"]).dt.date
+    fdf["Original_Projection"] = pd.to_numeric(
+        fdf["Original_Projection"], errors="coerce"
+    ).round(0)
+    fdf = fdf[
+        (fdf["Last_WeekDate"] >= week_start)
+        & (fdf["Original_Projection"].notna())
+        & (fdf["Original_Projection"] != 0)
+    ]
+
+    if fdf.empty:
         if region_scoped:
             st.success(
                 f"None found for {region} — every active product here is "
@@ -1696,20 +1712,9 @@ def render_inactive_section(view, region, check_ran, inactive_df,
                 "regions it is active in."
             )
         return
-    n_skus = table_df["SKU"].nunique()
-    if region_scoped:
-        scoped_keys = (
-            table_df["SKU"].astype(str) + "||" + table_df["CUSTNMBR"].astype(str)
-        )
-        n_rows_shown = int(
-            excluded_counts_by_key[
-                excluded_counts_by_key.index.isin(set(scoped_keys))
-            ].sum()
-        )
-        scope_note = f" for {region}"
-    else:
-        n_rows_shown = n_excluded_rows
-        scope_note = ""
+
+    n_skus = fdf["SKU"].nunique()
+    scope_note = f" for {region}" if region_scoped else ""
     st.caption(
         f"Excluded from the forecast above{scope_note}: "
         f"{n_skus:,} distinct SKUs. Each is an active product being "
@@ -1717,38 +1722,14 @@ def render_inactive_section(view, region, check_ran, inactive_df,
         "'Active in' list."
     )
 
-    inactive_df = table_df.copy()
-    inactive_df["First_WeekDate"] = pd.to_datetime(inactive_df["First_WeekDate"]).dt.date
-    inactive_df["Last_WeekDate"] = pd.to_datetime(inactive_df["Last_WeekDate"]).dt.date
-    inactive_df["Original_Projection"] = pd.to_numeric(
-        inactive_df["Original_Projection"], errors="coerce"
-    ).round(0)
-    inactive_df = inactive_df[[
+    show = fdf[[
         'SKU', 'Region', 'Active in', 'Customer Grouping',
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
     ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
-
-    # Toggle: only show rows whose Last_WeekDate is this week and onward.
-    # The "future avg/wk" projection column above is averaged over the same
-    # (Sunday-anchored) week boundary via _this_week_start().
-    week_start = _this_week_start().date()
-    future_only = st.toggle(
-        "Show only non-zero future projections (Last_WeekDate this week and onward)",
-        value=True,
-        key="inactive_future_only",
-        help=(
-            f"Filters to rows where Last_WeekDate is on or after "
-            f"{week_start.month}/{week_start.day} (the start of this week)."
-        ),
-    )
-
-    show = inactive_df.copy()
-    if future_only:
-        show = show[(show["Last_WeekDate"] >= week_start) & show['Original Projection (future avg/wk)'] != 0]
     st.dataframe(show, width="stretch", hide_index=True)
     st.download_button(
         "⬇️ Download the excluded (inactive-region) projections table",
-        data=summary_to_excel(inactive_df, sheet_name="inactive_projections"),
+        data=summary_to_excel(show, sheet_name="inactive_projections"),
         file_name=f"inactive_projections_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="dl_inactive_projections",
@@ -1763,7 +1744,7 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
     view, only rows whose region matches the selected region are shown (e.g. an
     EU view won't list AAFES, a US customer); ALL CUSTOMERS shows every region.
     """
-    HEADER = "### Inactive/discontinued products with projections"
+    HEADER = "### Inactive/discontinued products with future projections"
     st.markdown(HEADER)
     if not disc_check_ran:
         st.info(
