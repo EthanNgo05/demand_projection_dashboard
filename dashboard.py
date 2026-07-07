@@ -1548,7 +1548,26 @@ def main():
         inactive_df["First_WeekDate"] = pd.to_datetime(inactive_df["First_WeekDate"]).dt.date
         inactive_df["Last_WeekDate"] = pd.to_datetime(inactive_df["Last_WeekDate"]).dt.date
         inactive_df = inactive_df[['SKU', 'Region', 'Active in', 'Customer Grouping', 'First_WeekDate', 'Last_WeekDate']]
+
+        # Toggle: only show rows whose Last_WeekDate is this week and onward.
+        # WeekDates fall on Sunday-anchored 7-day boundaries, so "this week" is
+        # the most recent Sunday on or before today (e.g. today 7/7 -> 7/5, and a
+        # Last_WeekDate of 7/5 counts as this week).
+        today = pd.Timestamp.today().normalize()
+        week_start = (today - pd.Timedelta(days=(today.weekday() + 1) % 7)).date()
+        future_only = st.toggle(
+            "Show only future projections (Last_WeekDate this week and onward)",
+            value=False,
+            key="inactive_future_only",
+            help=(
+                f"Filters to rows where Last_WeekDate is on or after "
+                f"{week_start.month}/{week_start.day} (the start of this week)."
+            ),
+        )
+
         show = inactive_df.copy()
+        if future_only:
+            show = show[show["Last_WeekDate"] >= week_start]
         st.dataframe(show, width="stretch", hide_index=True)
         st.download_button(
             "⬇️ Download the excluded (inactive-region) projections table",
