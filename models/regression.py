@@ -51,10 +51,14 @@ RAW_INPUTS_FOLDER = "raw_inputs/demand_projections"
 INPUT_GLOB = os.path.join(RAW_INPUTS_FOLDER, "all_demand_projections_*.xlsx")
 
 # List-price workbook (SKU -> List Price USD), used to value the change in
-# forecast as a revenue risk. See load_list_prices().
-LIST_PRICE_GLOB = os.path.join("raw_inputs", "list_prices_*.xlsx")
+# forecast as a revenue risk. See load_list_prices(). Matches the other
+# pipelines so switching models never changes which folder is scanned.
+LIST_PRICE_GLOB = os.path.join("raw_inputs/list_prices", "list_prices_*.xlsx")
 
-CUSTOMERS_TO_IGNORE = ["Others - HK", "Others - KR", "Others - MALDIV", "Others - MX", "Others - UAE", "Othres - UK", "Others - ZZ"]
+CUSTOMERS_TO_IGNORE = [
+    "Others - HK", "Others - KR", "Others - MALDIV", "Others - MX",
+    "Others - UAE", "Others - UK", "Others - ZZ",
+]
 
 # Maps each raw CUSTNMBR onto a consolidated customer group. Several customers
 # fold into one group (e.g. the three Amazon-DC channels), so forecasts are built
@@ -511,6 +515,7 @@ def write_forecast(summary_df, weekly_df, out_path):
 if __name__ == "__main__":
     INPUT_FILE, today_str, TODAY = resolve_input_file()
     OUTPUT_FOLDER = f"outputs/demand_projections/regression/{today_str}"
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     print(f"Snapshot date (anchor): {today_str}\n")
 
     LIST_PRICES = load_list_prices()
@@ -612,7 +617,3 @@ if __name__ == "__main__":
     print(f"Errors: {len(errors)}/{len(groups)} -> {errors}")
     print(f"Input file: {INPUT_FILE}")
     print(f"Output folder: {OUTPUT_FOLDER}")
-
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-  

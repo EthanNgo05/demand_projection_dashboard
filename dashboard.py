@@ -3,7 +3,8 @@ Demand Projection Dashboard
 ===========================
 
 An interactive Streamlit + Plotly front-end for the 15-week demand forecasts
-produced by ``10-all_demand_projections.py``.
+produced by the pipeline files in ``models/`` (regression, exponential
+smoothing, XGBoost).
 
 Rather than reading the saved Excel files (which only contain the 15 forecast
 weeks), this dashboard reads the *same raw data file* the pipeline uses and
@@ -36,9 +37,11 @@ to this file. Override paths with the DEMAND_PIPELINE / DEMAND_RAW_DIR env vars.
 
 import os
 import re
+import sys
 import glob
 import inspect
 import logging
+import tempfile
 import traceback
 import importlib.util
 from io import BytesIO
@@ -243,10 +246,21 @@ def raw_glob():
 
 
 def price_glob():
-    """Build the list-price glob, mirroring the pipeline's LIST_PRICE_GLOB name."""
+    """Build the list-price glob, mirroring the pipeline's LIST_PRICE_GLOB.
+
+    The pipeline's glob (folder included) is used as-is, resolved relative to
+    this file when it is a relative path — so the dashboard always scans the
+    same folder the batch pipeline does, regardless of the working directory
+    Streamlit was launched from.
+    """
     P = load_pipeline(pipeline_path())
-    pattern = os.path.basename(getattr(P, "LIST_PRICE_GLOB", "list_prices_*.xlsx"))
-    return os.path.join("raw_inputs", pattern)
+    pattern = getattr(
+        P, "LIST_PRICE_GLOB",
+        os.path.join("raw_inputs/list_prices", "list_prices_*.xlsx"),
+    )
+    if not os.path.isabs(pattern):
+        pattern = os.path.join(HERE, pattern)
+    return pattern
 
 
 def discover_price_file():
@@ -352,7 +366,7 @@ def _region_code(P, grouping):
 
 
 def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
-                                 today_ts, anchors=None):
+                                 anchors=None):
     """Active products showing up in a region they are not 'Active in'.
 
     This is the fix for cases like ST1082 (active in US/CA/UK/SG/EU/AU but not
@@ -459,7 +473,7 @@ def compute_discontinued_products(plytix_df):
     return dict(zip(disc["SKU"], disc["SKU Status"]))
 
 
-def compute_discontinued_projections(df, disc_status, P, today_ts):
+def compute_discontinued_projections(df, disc_status, P):
     """Discontinued/inactive products that still carry future projections.
 
     Ported from discontinued_with_projections.ipynb: intersect the demand file
@@ -569,7 +583,6 @@ def load_prices_from_bytes(_data, name, model_path):
     P = load_pipeline(model_path)
     if not hasattr(P, "load_list_prices"):
         return None
-    import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
         tf.write(_data)
@@ -1041,7 +1054,7 @@ def main():
             today_str, path = labels[choice]
             df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
         else:
-            st.info(f"Upload the Demand Planning Details and Plytix files below.")
+            st.info("Upload the Demand Planning Details and Plytix files below.")
 
         with st.expander("Upload the Demand Planning Details Projections from PowerBI", expanded=not files):
             up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
@@ -1130,7 +1143,7 @@ def main():
     active_sku_set, sku_active_in = compute_active_products(plytix_df)
     check_ran = active_sku_set is not None
     inactive_df = compute_inactive_projections(
-        df, active_sku_set, sku_active_in, P, today_ts,
+        df, active_sku_set, sku_active_in, P,
         anchors=(lb, lcw, ffw),
     )
 
@@ -1142,9 +1155,7 @@ def main():
     # surfaced in their own table below.
     disc_status = compute_discontinued_products(plytix_df)
     disc_check_ran = disc_status is not None
-    discontinued_df = compute_discontinued_projections(
-        df, disc_status, P, today_ts,
-    )
+    discontinued_df = compute_discontinued_projections(df, disc_status, P)
     n_excluded_rows = 0
     excluded_counts_by_key = pd.Series(dtype="int64")
     if not inactive_df.empty:
@@ -1194,7 +1205,10 @@ def main():
             view = ALL_CUSTOMERS_VIEW
             region = None
         else:
-            region = st.selectbox("Region", sorted(by_region.keys()))
+            # key=str: a custom pipeline's region_for_group may return non-string
+            # labels; sorting by their string form keeps the selectbox from
+            # crashing on mixed types (see logs.txt, 2026-07-06).
+            region = st.selectbox("Region", sorted(by_region.keys(), key=str))
             view = st.selectbox("Customer group", by_region[region])
 
     # ----- Model parameters (Holt damped-trend smoothing) ------------------
@@ -1822,7 +1836,6 @@ def _run():
             _control_flow = (StopException, RerunException)
         except Exception:
             _control_flow = ()
-        import sys
         exc = sys.exc_info()[1]
         if _control_flow and isinstance(exc, _control_flow):
             raise

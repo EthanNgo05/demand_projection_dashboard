@@ -185,7 +185,10 @@ INPUT_GLOB = os.path.join(RAW_INPUTS_FOLDER, "all_demand_projections_*.xlsx")
 # forecast as a revenue risk. See load_list_prices().
 LIST_PRICE_GLOB = os.path.join("raw_inputs/list_prices", "list_prices_*.xlsx")
 
-CUSTOMERS_TO_IGNORE = ["Others - HK", "Others - KR", "Others - MALDIV", "Others - MX", "Others - UAE", "Othres - UK", "Others - ZZ"]
+CUSTOMERS_TO_IGNORE = [
+    "Others - HK", "Others - KR", "Others - MALDIV", "Others - MX",
+    "Others - UAE", "Others - UK", "Others - ZZ",
+]
 
 # Maps each raw CUSTNMBR onto a consolidated customer group. Several customers
 # fold into one group (e.g. the three Amazon-DC channels), so forecasts are built
@@ -1188,17 +1191,25 @@ if __name__ == "__main__":
     except Exception:
         print(traceback.format_exc())
 
-    valid_subfolders = ["AU (ACR)", "EU (SH-CTS)", "Other", "US (LBC+NJ)"]
+    # Concatenate every per-group summary sheet into one ALL_CUSTOMERS workbook.
+    # Region folders are derived from region_for_group (plus "Other") rather
+    # than hardcoded, so no region's output can be silently skipped.
+    region_folders = sorted({region_for_group(g) for g in groups} | {"Other"})
     customer_dfs = []
-    for folder in valid_subfolders:
+    for folder in region_folders:
         for xlsx_file in (Path(OUTPUT_FOLDER) / folder).rglob("*.xlsx"):
             try:
-                df = pd.read_excel(xlsx_file)
-                customer_dfs.append(df)
+                customer_dfs.append(pd.read_excel(xlsx_file))
             except Exception as e:
                 print(f"Failed: {xlsx_file.name} — {e}")
-    combined = pd.concat(customer_dfs, ignore_index=True)
-    combined.to_excel(f"{OUTPUT_FOLDER}/ALL_CUSTOMERS_demand_projections_{today_str}.xlsx", index = False)
+    if customer_dfs:
+        combined = pd.concat(customer_dfs, ignore_index=True)
+        combined.to_excel(
+            f"{OUTPUT_FOLDER}/ALL_CUSTOMERS_demand_projections_{today_str}.xlsx",
+            index=False,
+        )
+    else:
+        print("No per-group workbooks found; ALL_CUSTOMERS file skipped.")
 
     # ------------------------------------------------------------------ #
     print("\n=== Summary ===")
