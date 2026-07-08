@@ -145,3 +145,11 @@ Runnng the 14 tests:
 pip install -r requirements.txt
 pytest tests/ -v
 ````
+
+Run end-to-end and print a row count for all 3 models:
+
+```
+python -m agent.run --view "ALL CUSTOMERS (combined)"
+python -m agent.run --view "AMAZON-DC"
+python -m agent.run --view "ANOTHER-CUSTOMER-GROUP"
+```
