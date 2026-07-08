@@ -33,5 +33,14 @@ MODEL_OPTIONS = {k: v for k, v in MODEL_OPTIONS.items() if os.path.exists(v)}
 # mismatch silently compares/filters the wrong view.
 ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
 
-MAE_CONFIDENCE_THRESHOLD = None  # set in Phase 3 once real MAE ranges are known
+# Phase 3 calibration (2026-07-08, all_demand_projections_2026-07-07.xlsx):
+# ran evaluate/select across all 48 real views (ALL + 47 groupings). Winning
+# backtest MAEs (shared 6-week single-holdout, raw actuals): p50=7.7, p80=39.1,
+# p90=70.9, max=1208 (one huge-volume view; MAE is unit-scaled, so the largest
+# views dominate the tail). Threshold set at the ~80th percentile per the
+# Phase 3 plan -- flags the worst ~20% of views (incl. the combined view when
+# it backtests poorly) without drowning Phase 4 in false alarms. 7 tiny views
+# produced no backtestable holdout at all; they get flagged via best_model=None
+# regardless of this value. Revisit once MAE is normalised per-view (e.g. MASE).
+MAE_CONFIDENCE_THRESHOLD = 40
 ANTHROPIC_MODEL = "claude-sonnet-5"

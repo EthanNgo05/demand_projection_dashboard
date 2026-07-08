@@ -16,7 +16,8 @@ class ModelResult(TypedDict, total=False):
     summary_df: pd.DataFrame
     weekly_df: pd.DataFrame
     agg: pd.DataFrame
-    mae: float
+    mae: float  # comparison score from the shared _generic_backtest
+    autofit_mae: float  # ES autofit internal MAE (audit only, NOT comparable)
     baseline_mae: float
     params: dict  # alpha/beta/phi if applicable
 

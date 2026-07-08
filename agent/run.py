@@ -23,7 +23,17 @@ def main(argv=None) -> int:
         {"view": args.view, "today_ts": pd.Timestamp.today().normalize()}
     )
     for label, r in final_state.get("results", {}).items():
-        print(label, "->", len(r["summary_df"]), "rows")
+        mae = r.get("mae")
+        print(
+            label, "->", len(r["summary_df"]), "rows,",
+            f"backtest MAE {mae:.2f}" if mae is not None else "backtest MAE n/a",
+        )
+    best = final_state.get("best_model")
+    if best is not None:
+        print(
+            f"Selected: {best}"
+            + (" [LOW CONFIDENCE]" if final_state.get("confidence_flag") else "")
+        )
     if final_state.get("errors"):
         print("ERRORS:", final_state["errors"])
         return 1
