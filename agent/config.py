@@ -43,4 +43,18 @@ ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
 # produced no backtestable holdout at all; they get flagged via best_model=None
 # regardless of this value. Revisit once MAE is normalised per-view (e.g. MASE).
 MAE_CONFIDENCE_THRESHOLD = 40
-ANTHROPIC_MODEL = "claude-sonnet-5"
+
+# --- Phase 4: LLM provider selection ---------------------------------------
+# "anthropic" = Claude API (needs ANTHROPIC_API_KEY in .env)
+# "local"     = any OpenAI-compatible server (LiteLLM / LM Studio / vLLM),
+#               e.g. the gemma4-31b endpoint on james-workstation.
+# agent/llm.py re-reads LLM_PROVIDER from the env at call time, so these are
+# import-time defaults, not the last word.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+LOCAL_LLM_BASE_URL = os.environ.get(
+    "LOCAL_LLM_BASE_URL", "http://james-workstation:4000/v1"
+)
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "gemma4-31b")
+# Most local servers ignore the key but the OpenAI client requires a non-empty one.
+LOCAL_LLM_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "not-needed")

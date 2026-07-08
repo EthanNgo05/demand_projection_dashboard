@@ -29,7 +29,11 @@ def _agent_results(view, sample_raw_path):
             "price_path": None,  # price parity is exercised from Phase 3 on
         }
     )
-    assert not final_state.get("errors"), final_state.get("errors")
+    # Phase 4 wires the LLM reasoning nodes into the same graph; with no API
+    # key (the default test env) they degrade into state["errors"] by design.
+    # This parity test validates the deterministic pipeline, so ignore those.
+    pipeline_errors = [e for e in final_state.get("errors", []) if "LLM call failed" not in e]
+    assert not pipeline_errors, pipeline_errors
     return final_state["results"]
 
 

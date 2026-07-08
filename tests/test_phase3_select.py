@@ -50,6 +50,10 @@ def test_graph_routes_to_low_confidence_branch(monkeypatch):
         lambda state: visited.append("flag_low_confidence") or {},
     )
     monkeypatch.setattr(
+        graph_mod, "flag_anomalies",
+        lambda state: visited.append("flag_anomalies") or {},
+    )
+    monkeypatch.setattr(
         graph_mod, "summarize", lambda state: visited.append("summarize") or {}
     )
 
@@ -59,6 +63,7 @@ def test_graph_routes_to_low_confidence_branch(monkeypatch):
     graph_mod.build_graph().invoke(dict(base))
     assert visited == ["flag_low_confidence"]
 
+    # Phase 4: the confident branch runs flag_anomalies then summarize
     monkeypatch.setattr(graph_mod, "evaluate_models", make_fake_evaluate(1.0))
     graph_mod.build_graph().invoke(dict(base))
-    assert visited == ["flag_low_confidence", "summarize"]
+    assert visited == ["flag_low_confidence", "flag_anomalies", "summarize"]

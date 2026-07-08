@@ -13,3 +13,6 @@ logs.txt
 # secrets
 .env
 
+
+# local tooling
+.claude/

@@ -1,6 +1,7 @@
 import os
 import sys
 
+import pandas as pd
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,3 +29,86 @@ def sample_cleaned_df(sample_raw_path):
     from agent import data_io
 
     return data_io.load_raw(sample_raw_path)
+
+
+# --------------------------------------------------------------------------
+# Phase 4: fake LLM + hand-built states for the reasoning nodes
+# --------------------------------------------------------------------------
+
+
+class RecordingFakeLLM:
+    """Minimal stand-in for any LangChain chat model: .invoke(prompt).content.
+
+    Records every prompt so tests can assert on *inputs* (e.g. the anomaly
+    table was capped), not exact LLM text. Provider-agnostic by construction —
+    it replaces agent.llm.get_llm, which is the single seam both the Claude
+    and local providers flow through.
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.prompts = []
+
+    def invoke(self, prompt):
+        self.prompts.append(prompt)
+        text = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+
+        class _Msg:
+            content = text
+
+        return _Msg()
+
+
+@pytest.fixture
+def fake_llm(monkeypatch):
+    """Install a fake LLM behind agent.llm.get_llm; returns the model so tests
+    can inspect .prompts. Usage: model = fake_llm(["response 1", ...])."""
+
+    def _install(responses):
+        model = RecordingFakeLLM(responses)
+        monkeypatch.setattr(
+            "agent.llm.get_llm", lambda temperature=0, provider=None: model
+        )
+        return model
+
+    return _install
+
+
+def _summary_df(n_rows):
+    """Summary frame with the columns the reasoning nodes actually read."""
+    rows = []
+    for i in range(n_rows):
+        recent = 100.0 + i
+        projected = recent * (3.0 if i == 0 else (0.5 if i == 1 else 1.02))
+        rows.append(
+            {
+                "SKU": f"SKU-{i + 1:03d}",
+                "Description": f"Widget {i + 1}",
+                "8 Week POS/Orders Average": recent,
+                "Updated Projection Average": projected,
+                "Weeks with data": 26,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _state(n_rows, view="TEST GROUP"):
+    return {
+        "view": view,
+        "best_model": "Simple Regression",
+        "results": {"Simple Regression": {"summary_df": _summary_df(n_rows), "mae": 12.3}},
+        "confidence_flag": False,
+        "errors": [],
+    }
+
+
+@pytest.fixture
+def sample_state_with_summary():
+    """Post-select state with a small summary (SKU-001 jumps, SKU-002 drops)."""
+    return _state(10)
+
+
+@pytest.fixture
+def large_summary_state():
+    """ALL CUSTOMERS-sized state: 400+ SKU rows to prove the prompt is capped."""
+    return _state(420, view="ALL CUSTOMERS (combined)")
