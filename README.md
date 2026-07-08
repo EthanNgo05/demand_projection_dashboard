@@ -136,3 +136,12 @@ Ported from the notebooks and run automatically when a Plytix export is loaded:
 Both need the Plytix `list_prices_*.xlsx` export (which also drives the
 revenue-risk columns). Unhandled dashboard errors are logged to `logs.txt`
 (gitignored) with a friendly message shown to the user.
+
+## Testing
+
+Runnng the 14 tests:
+
+```
+pip install -r requirements.txt
+pytest tests/ -v
+````
