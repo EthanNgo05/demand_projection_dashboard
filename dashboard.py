@@ -1199,21 +1199,28 @@ def main():
             )
 
     # Drop discontinued/inactive SKUs entirely so they are excluded from every
-    # summary, projection and revenue figure below. The status is SKU-level, so
-    # the whole SKU is removed (not just the flagged customer combos). Done after
+    # summary, projection and revenue figure below. Two independent signals mark
+    # a SKU discontinued/inactive: a trailing '*' on the SKU code in the demand
+    # file, and a Plytix 'SKU Status' of Discontinued/Inactive. Either one drops
+    # the whole SKU (status is SKU-level, not per-customer). Done after
     # discontinued_df is computed above so the table still lists them.
+    sku_raw = df["SKU"].astype(str)
+    sku_base = sku_raw.str.rstrip("*")
+    # Match at SKU level so every row of a flagged SKU is dropped — even rows
+    # that happen to omit the '*' — if the code is starred anywhere in the file.
+    disc_bases = set(sku_base[sku_raw.str.endswith("*")])
     if disc_status:
-        df_sku = df["SKU"].astype(str).str.rstrip("*")
-        disc_mask = df_sku.isin(disc_status)
-        n_disc_rows = int(disc_mask.sum())
-        if n_disc_rows:
-            n_disc_skus = df_sku[disc_mask].nunique()
-            df = df[~disc_mask].reset_index(drop=True)
-            logger.info(
-                "Discontinued check: dropped %d raw rows across %d "
-                "discontinued/inactive SKUs.",
-                n_disc_rows, n_disc_skus,
-            )
+        disc_bases |= set(disc_status)
+    disc_mask = sku_base.isin(disc_bases)
+    n_disc_rows = int(disc_mask.sum())
+    if n_disc_rows:
+        n_disc_skus = sku_base[disc_mask].nunique()
+        df = df[~disc_mask].reset_index(drop=True)
+        logger.info(
+            "Discontinued check: dropped %d raw rows across %d "
+            "discontinued/inactive SKUs (trailing '*' or Plytix status).",
+            n_disc_rows, n_disc_skus,
+        )
 
     # ----- View selector ---------------------------------------------------
     with st.sidebar:
