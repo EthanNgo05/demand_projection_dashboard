@@ -859,15 +859,10 @@ def main():
             st.stop()
 
         def _on_model_change():
-            # Bump the parameter nonce so the sliders are rebuilt as fresh
-            # widgets keyed to the new nonce, re-reading the newly selected
-            # pipeline's value= defaults. (A structural change also recomputes
-            # automatically via the compute gate.)
-            st.session_state["param_nonce"] = (
-                st.session_state.get("param_nonce", 0) + 1
-            )
             # Autofitted parameters belong to the previous model; drop them so
-            # the new pipeline starts from its own file defaults.
+            # the new pipeline re-autofits (or falls back to its file defaults).
+            # A structural change also recomputes automatically via the compute
+            # gate.
             st.session_state.pop("autofit_params", None)
 
         # After "Run Agent Summary" picks a best model, switch the toggle to it
@@ -899,8 +894,8 @@ def main():
     elif _supports_smoothing(P):
         st.caption(
             "15-week Holt damped-trend forecast from the historical demand "
-            "window (POS where available, else Orders). Tune the smoothing "
-            "(α/β/φ) in the sidebar — changes recompute live."
+            "window (POS where available, else Orders). Smoothing (α/β/φ) is "
+            "autofitted per view by backtesting."
         )
     else:
         tw = getattr(P, "TREND_WEIGHT", None)
@@ -1111,26 +1106,27 @@ def main():
         _render_agent_summary(view)
 
     # ----- Model parameters (Holt damped-trend smoothing) ------------------
+    # Parameters are hidden from the UI entirely: Holt always uses autofitted
+    # α/β/φ (backtested per view/snapshot), falling back to the pipeline's file
+    # defaults when the backtest can't run. min-weeks uses the file default.
     min_weeks = None
+    alpha = beta = phi = None
     with st.sidebar:
-        st.header("Model parameters")
         smoothing_ok = _supports_smoothing(P)
         min_weeks_ok = _supports_min_weeks(P)
 
         if smoothing_ok or min_weeks_ok:
-            # The pipeline's own constants are the "file defaults" the reset
-            # button snaps back to.
+            # The pipeline's own constants are the "file defaults".
             a0 = float(getattr(P, "ALPHA", 0.5))
             b0 = float(getattr(P, "BETA", 0.3))
             p0 = float(getattr(P, "PHI", 0.85))
             mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
 
-            # If Autofit has run (automatically on first sight, or via the
-            # button), its winning parameters become the slider defaults (the
-            # nonce was bumped when they were stored, so the sliders rebuild and
-            # re-read value=). Results are keyed to the model/view/snapshot they
-            # were fitted on; anything else falls back to the file defaults. The
-            # sliders stay fully adjustable afterwards.
+            if min_weeks_ok:
+                min_weeks = mw0
+
+            # Autofit results are keyed to the model/view/snapshot they were
+            # fitted on; anything else falls back to the file defaults.
             autofit = st.session_state.get("autofit_params")
             autofit_active = bool(
                 autofit
@@ -1139,14 +1135,12 @@ def main():
                 and autofit.get("today") == today_str
             )
 
-            # ----- Auto-run Autofit on first sight --------------------------
-            # So that selecting a smoothing model (or a new view / snapshot)
-            # opens the sliders already on the backtested α/β/φ rather than the
-            # file defaults. It runs once per (model, view, snapshot): the
-            # "autofit_tried" marker below records that we've attempted it, so a
-            # failed backtest isn't retried on every rerun and a good fit isn't
-            # re-run on every slider move. The user can re-fit any time with the
-            # Autofit button, or fine-tune the sliders by hand.
+            # ----- Always autofit -------------------------------------------
+            # Selecting a smoothing model (or a new view / snapshot) runs the
+            # backtest once per (model, view, snapshot) and uses the winning
+            # α/β/φ. The "autofit_tried" marker records that we've attempted
+            # it, so a failed backtest isn't retried on every rerun and a good
+            # fit isn't re-run needlessly.
             autofit_key = (pipeline_path(), view, today_str)
             autofit_tried = st.session_state.get("autofit_tried") == autofit_key
             if (
@@ -1156,11 +1150,11 @@ def main():
                 and not autofit_tried
             ):
                 st.session_state["autofit_tried"] = autofit_key
-                with st.spinner("Autofitting α/β/φ for this view…"):
+                with st.spinner("Tuning the forecast for this view…"):
                     best = run_autofit(df, view, today_ts, pipeline_path(), mw0)
                 if best is not None:
                     logger.info(
-                        "Auto-Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
+                        "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
                         "(MAE %.2f vs %.2f with file defaults)",
                         view, best["alpha"], best["beta"], best["phi"],
                         best["mae"], best["baseline_mae"],
@@ -1169,155 +1163,36 @@ def main():
                         **best, "model": pipeline_path(),
                         "view": view, "today": today_str,
                     }
-                    # Rebuild the sliders on the fitted values and recompute the
-                    # forecast with them — exactly like the manual button does.
-                    st.session_state["param_nonce"] = (
-                        st.session_state.get("param_nonce", 0) + 1
-                    )
+                    # Recompute the forecast with the fitted values.
                     st.session_state["_do_recompute"] = True
                     st.rerun()
 
-            if smoothing_ok and autofit_active:
-                a0, b0, p0 = autofit["alpha"], autofit["beta"], autofit["phi"]
-
-            # Slider defaults come from the pipeline constants, passed via each
-            # slider's value= argument. To reset reliably across Streamlit
-            # versions we use a "nonce": the slider keys embed an integer that
-            # we bump on reset (or model switch), which makes Streamlit build
-            # brand-new widgets that re-read value=. This is more robust than
-            # deleting a fixed key, which didn't reliably restore value=.
-            st.session_state.setdefault("param_nonce", 0)
-            nonce = st.session_state["param_nonce"]
-
             if smoothing_ok:
-                st.caption(
-                    "Lower α/β lean on more history and less on recent weeks; "
-                    "lower φ flattens the projection. Moving a slider recomputes."
-                )
-                alpha = st.slider(
-                    "α — level smoothing", min_value=0.01, max_value=0.99,
-                    value=a0, step=0.01, key=f"sl_alpha_{nonce}",
-                    help="Higher tracks recent weeks faster; lower ≈ a longer moving "
-                         "average (effective window ≈ 2/α − 1 weeks).",
-                )
-                beta = st.slider(
-                    "β — trend smoothing", min_value=0.0, max_value=0.99,
-                    value=b0, step=0.01, key=f"sl_beta_{nonce}",
-                    help="Higher re-estimates the slope from recent weeks; 0 freezes it.",
-                )
-                phi = st.slider(
-                    "φ — trend damping", min_value=0.0, max_value=1.0,
-                    value=p0, step=0.05, key=f"sl_phi_{nonce}",
-                    help="Lower flattens the forecast toward the current level; "
-                         "1 = plain (undamped) Holt.",
-                )
-            else:
-                alpha = beta = phi = None
-
-            if min_weeks_ok:
-                min_weeks = st.slider(
-                    "min weeks for trend", min_value=2, max_value=12,
-                    value=mw0, step=1, key=f"sl_min_weeks_{nonce}",
-                    help="SKUs with fewer completed weeks than this are forecast "
-                         "flat at their mean instead of extrapolating a trend — "
-                         "prevents runaway projections from 1–2 weeks of data. "
-                         "2 disables the guard.",
-                )
-
-            # ----- Autofit: backtest a grid of α/β/φ and keep the winner ----
-            if smoothing_ok and _supports_autofit(P):
-                if st.button(
-                    "✨ Autofit α/β/φ",
-                    help="Grid-searches the smoothing parameters by backtesting: "
-                         "the last few completed weeks of each SKU's history are "
-                         "hidden, forecast with each parameter combination, and "
-                         "compared to what actually happened (repeated from "
-                         "several rolling origins). The combination with the "
-                         "lowest total forecast error wins and is applied to the "
-                         "sliders. You can still fine-tune the sliders afterwards.",
-                ):
-                    with st.spinner("Backtesting the parameter grid…"):
-                        best = run_autofit(
-                            df, view, today_ts, pipeline_path(), min_weeks
-                        )
-                    if best is None:
-                        st.warning(
-                            "Not enough completed weeks of history in this view "
-                            "to backtest — autofit needs SKUs with at least "
-                            f"~{getattr(P, 'AUTOFIT_MIN_TRAIN_WEEKS', 8) + 1} "
-                            "completed weeks."
-                        )
-                    else:
-                        logger.info(
-                            "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
-                            "(MAE %.2f vs %.2f with file defaults; "
-                            "%d SKUs, %d holdout points)",
-                            view, best["alpha"], best["beta"], best["phi"],
-                            best["mae"], best["baseline_mae"],
-                            best["n_series"], best["n_points"],
-                        )
-                        st.session_state["autofit_params"] = {
-                            **best, "model": pipeline_path(),
-                            "view": view, "today": today_str,
-                        }
-                        # Mark this (model, view, snapshot) as fitted so the
-                        # auto-run-on-first-sight logic doesn't re-fire over it.
-                        st.session_state["autofit_tried"] = (
-                            pipeline_path(), view, today_str
-                        )
-                        # Rebuild the sliders with the fitted values as their
-                        # defaults and recompute the forecast with them.
-                        st.session_state["param_nonce"] = nonce + 1
-                        st.session_state["_do_recompute"] = True
-                        st.rerun()
-
                 if autofit_active:
-                    improve = autofit["baseline_mae"] - autofit["mae"]
-                    pct = (
-                        f" ({improve / autofit['baseline_mae'] * 100:.0f}% better)"
-                        if autofit["baseline_mae"] > 0 and improve > 0 else ""
+                    alpha, beta, phi = (
+                        autofit["alpha"], autofit["beta"], autofit["phi"]
                     )
-                    st.success(
-                        f"Autofit applied: α={autofit['alpha']:g}, "
-                        f"β={autofit['beta']:g}, φ={autofit['phi']:g} — "
-                        f"backtest error {autofit['mae']:.1f} u/wk vs "
-                        f"{autofit['baseline_mae']:.1f} with file defaults"
-                        f"{pct}. Scored on {autofit['n_series']} SKUs, "
-                        f"{autofit['folds']} rolling folds of "
-                        f"{autofit['holdout_weeks']} held-out weeks."
-                    )
+                else:
+                    alpha, beta, phi = a0, b0, p0
 
-        else:
-            alpha = beta = phi = None
-            st.info(
-                "This pipeline's fit_regression doesn't accept α/β/φ or min-weeks "
-                "overrides, so its own module-level constants are used."
-            )
+            if smoothing_ok and _supports_autofit(P) and autofit_active:
+                improve = autofit["baseline_mae"] - autofit["mae"]
+                pct = (
+                    f" ({improve / autofit['baseline_mae'] * 100:.0f}% better "
+                    "than the default settings)"
+                    if autofit["baseline_mae"] > 0 and improve > 0 else ""
+                )
+                st.success(f"Forecast auto-tuned for this view{pct}.")
 
-        # Recompute is a manual action: moving a slider no longer rebuilds the
-        # whole forecast on every tick. The button sets a flag (via callback,
-        # so it's honoured on the very next run) that the compute gate reads.
-        def _request_recompute():
-            st.session_state["_do_recompute"] = True
-
-        st.button(
-            "🔄 Recompute forecast", type="primary", on_click=_request_recompute,
-            help="Apply the current parameters. Structural changes (view, "
-                 "model, snapshot, data) recompute automatically.",
-        )
-
-    # ----- Compute (manual, with a progress bar) ---------------------------
+    # ----- Compute (with a progress bar) -----------------------------------
     # The forecast is cached in session_state and only (re)built when:
     #   * there is no result yet (first load), or
     #   * a structural input changed (view / model / snapshot / data / prices), or
-    #   * the user pressed "Recompute".
-    # Slider changes alone leave the last result on screen and surface a
-    # "parameters changed — recompute to apply" notice.
+    #   * autofit produced new parameters (it sets _do_recompute).
     price_marker = None if prices is None else int(len(prices))
     structural_sig = (
         view, pipeline_path(), today_str, price_marker, n_excluded_rows
     )
-    param_sig = (alpha, beta, phi, min_weeks)
 
     do_recompute = st.session_state.pop("_do_recompute", False)
     stored = st.session_state.get("fc_result")
@@ -1354,7 +1229,6 @@ def main():
 
         st.session_state["fc_result"] = (summary, weekly, agg, by_cust)
         st.session_state["fc_structural"] = structural_sig
-        st.session_state["fc_params"] = param_sig
     else:
         summary, weekly, agg, by_cust = stored
 
@@ -1365,24 +1239,8 @@ def main():
         )
         st.stop()
 
-    # If the sliders were moved since the on-screen result was built, the view
-    # is stale until the user recomputes. Flag it rather than silently updating.
-    if st.session_state.get("fc_params") != param_sig:
-        st.info(
-            "Parameters changed since this forecast was built — click "
-            "**🔄 Recompute forecast** in the sidebar to apply them.",
-            icon="⚠️",
-        )
-
     # ----- Header / windows -------------------------------------------------
     st.subheader(view)
-    model_bits = []
-    if alpha is not None:
-        model_bits.append(f"α = {alpha:.2f}, β = {beta:.2f}, φ = {phi:.2f}")
-    if min_weeks is not None:
-        model_bits.append(f"min weeks for trend = {min_weeks}")
-    if model_bits:
-        st.caption("Model in use — " + "; ".join(model_bits))
     w1, w2 = st.columns(2)
     # The window's nominal lower bound (lb) can sit earlier than the first week
     # the data actually reaches — e.g. the all-history pipelines anchor lb at
