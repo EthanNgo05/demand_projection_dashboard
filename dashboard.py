@@ -1679,28 +1679,40 @@ def main():
             width="stretch",
         )
     with cR:
-        st.metric("Data source", source)
+        st.metric("Data Source", source)
         avg_col = resolve_avg_col(summary)
-        st.metric(f"{avg_window_phrase(avg_col)} {source} avg", f"{row[avg_col]:,.1f}")
-        st.metric("Updated proj.", f"{row['Updated Projection Average']:,.0f}")
-        sysv = row.get("Initial Projection Average")
-        st.metric("Original proj.", "—" if pd.isna(sysv) else f"{sysv:,.0f}")
+        phrase = avg_window_phrase(avg_col)
+        window_label = "All-Time" if phrase == "All-History" \
+            else phrase.replace(" Week", "-Week")
         st.metric(
-            "Difference",
+            f"{window_label} Historical Demand (avg/wk)",
+            f"{row[avg_col]:,.1f}",
+        )
+        sysv = row.get("Initial Projection Average")
+        st.metric(
+            "Initial Forecast (avg/wk)",
+            "—" if pd.isna(sysv) else f"{sysv:,.0f}",
+        )
+        st.metric(
+            "Updated Forecast (avg/wk)",
+            f"{row['Updated Projection Average']:,.0f}",
+        )
+        st.metric(
+            "Projection Difference (avg/wk)",
             f"{row['Projection Difference']:+,.0f}"
             if pd.notna(row["Projection Difference"]) else "—",
         )
         if RISK_COL in summary.columns:
             pv = row.get(PRICE_COL)
             rv = row.get(RISK_COL)
-            st.metric("List price", "—" if pd.isna(pv) else f"${pv:,.2f}")
+            st.metric("List Price", "—" if pd.isna(pv) else f"${pv:,.2f}")
             st.metric(
-                "Revenue risk",
+                "Revenue Risk",
                 "—" if pd.isna(rv) else f"${rv:+,.0f}",
                 help="Projection difference × list price.",
             )
         if "Top Volume Customer Groups" in summary.columns:
-            st.markdown("**Top volume groups**")
+            st.markdown("**Top Volume Groups**")
             st.caption(row["Top Volume Customer Groups"])
 
     # ----- Summary table ----------------------------------------------------
