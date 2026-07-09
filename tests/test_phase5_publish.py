@@ -9,7 +9,56 @@ is derived from OUTPUT_DIR at call time, so patching OUTPUT_DIR relocates both.
 import json
 import os
 
-from agent.nodes.publish import publish
+import numpy as np
+import pandas as pd
+
+from agent.nodes.publish import _window_excluded_skus, publish
+
+
+def _demand_with_out_of_window_sku():
+    """A view frame where CW1897's only demand predates the 8-week window
+    (as of the 2026-07-09 anchor) while CW9999 sells inside it."""
+    rows = [["CW1897", "45L can", "NETDEPOT-JP",
+             pd.Timestamp("2026-04-19"), 5.0, np.nan, 5, "Others - JP"]]
+    for wk in pd.date_range("2026-05-10", "2026-06-28", freq="7D"):
+        rows.append(["CW9999", "other can", "NETDEPOT-JP", wk, 20.0, np.nan, 20,
+                     "Others - JP"])
+    return pd.DataFrame(rows, columns=[
+        "SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders",
+        "Projection", "Customer Grouping"])
+
+
+def test_window_excluded_skus_flags_out_of_window():
+    """The 8-week moving average drops a SKU whose only sales predate its
+    window; that SKU must be reported so it isn't silently omitted."""
+    state = {
+        "view": "Others - JP",
+        "best_model": "8-Week Moving Average",
+        "today_ts": pd.Timestamp("2026-07-09"),
+        "cleaned_df": _demand_with_out_of_window_sku(),
+    }
+    excluded = _window_excluded_skus(state)
+    skus = {r["SKU"] for r in excluded}
+    assert skus == {"CW1897"}, skus
+    assert excluded[0]["Description"] == "45L can"
+
+
+def test_window_excluded_empty_for_all_history_winner():
+    """An all-history winner (XGBoost/Holt) forecasts every SKU with any demand,
+    so there is nothing outside its window to report."""
+    state = {
+        "view": "Others - JP",
+        "best_model": "XGBoost",
+        "today_ts": pd.Timestamp("2026-07-09"),
+        "cleaned_df": _demand_with_out_of_window_sku(),
+    }
+    assert _window_excluded_skus(state) == []
+
+
+def test_window_excluded_absent_state_is_safe():
+    """No cleaned_df / today_ts (e.g. the hand-built states other tests use) must
+    degrade to an empty list, never raise."""
+    assert _window_excluded_skus({"view": "V", "best_model": "XGBoost"}) == []
 
 
 def test_publish_writes_expected_json(tmp_path, monkeypatch):

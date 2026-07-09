@@ -22,6 +22,9 @@ from agent.graph import build_graph
 
 import dashboard  # noqa: E402  (imports streamlit in bare mode — no runtime needed)
 
+# Slow: backtests every model across all ~48 views. Skipped unless --runslow.
+pytestmark = pytest.mark.slow
+
 TODAY = pd.Timestamp("2026-07-01")  # pinned so both paths see identical anchors
 
 assert ALL_CUSTOMERS_VIEW == dashboard.ALL_CUSTOMERS_VIEW

@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import glob
+import html
 import json
 import inspect
 import logging
@@ -784,6 +785,40 @@ def _render_agent_summary(view):
                 # publish stores bullets as-is; add a marker only if missing.
                 st.markdown(a if a.lstrip().startswith(("-", "*", "•")) else f"- {a}")
 
+        # Active SKUs the winning model leaves out because their demand predates
+        # its history window (e.g. the 8-week moving average). Surfaced so a SKU
+        # that an all-history model (Holt/XGBoost) would forecast isn't silently
+        # dropped without explanation. Empty for an all-history winner.
+        excluded = payload.get("window_excluded_skus") or []
+        if excluded:
+            best_lbl = payload.get("best_model") or "this model"
+            # Rendered as a native HTML <details> dropdown (collapsed by
+            # default) so this list — often 15+ SKUs — doesn't dominate the
+            # summary. A Streamlit st.expander can't be used here: it's illegal
+            # to nest one inside the "Agent summary" expander this runs in.
+            items = "".join(
+                "<li>{}{}</li>".format(
+                    html.escape(str(row.get("SKU", ""))),
+                    " — " + html.escape(str(row.get("Description", "")))
+                    if row.get("Description")
+                    else "",
+                )
+                for row in excluded
+            )
+            st.markdown(
+                "<details style='margin:0.25rem 0 0.5rem;'>"
+                "<summary style='cursor:pointer;font-weight:600;'>"
+                f"Active SKUs outside {html.escape(best_lbl)}'s history window "
+                f"({len(excluded)})</summary>"
+                "<div style='opacity:0.75;font-size:0.9em;margin:0.35rem 0;'>"
+                "These have demand history but none inside the model's window, "
+                "so they carry no projection here. Switch to an all-history "
+                "model (Holt or XGBoost) to forecast them.</div>"
+                f"<ul style='margin:0;padding-left:1.2rem;'>{items}</ul>"
+                "</details>",
+                unsafe_allow_html=True,
+            )
+
 
 def main():
     st.set_page_config(
@@ -834,6 +869,19 @@ def main():
             # Autofitted parameters belong to the previous model; drop them so
             # the new pipeline starts from its own file defaults.
             st.session_state.pop("autofit_params", None)
+
+        # After "Run Agent Summary" picks a best model, switch the toggle to it
+        # so the screen shows that model. The switch is stashed as a pending key
+        # (the button handler runs *after* this widget) and applied here, before
+        # the radio is instantiated — Streamlit forbids writing a widget-keyed
+        # value once its widget exists this run. We replicate _on_model_change's
+        # side effects since applying it programmatically doesn't fire on_change.
+        pending_model = st.session_state.pop("_pending_model_choice", None)
+        if pending_model in MODEL_OPTIONS and pending_model != st.session_state.get(
+            "model_choice"
+        ):
+            st.session_state["model_choice"] = pending_model
+            _on_model_change()
 
         st.radio(
             "Forecasting model", list(MODEL_OPTIONS.keys()),
@@ -1047,7 +1095,15 @@ def main():
         if final_state.get("errors"):
             st.error("\n".join(final_state["errors"]))
         else:
-            st.toast(f"Agent finished: {final_state.get('best_model', 'n/a')}")
+            best = final_state.get("best_model")
+            st.toast(f"Agent finished: {best or 'n/a'}")
+            # Switch the model toggle to the agent's winner so the screen shows
+            # the best model. Stash it as a pending key and rerun: the toggle
+            # widget already rendered above this run, so it can't be written
+            # here — the pending value is applied before the widget next build.
+            if best in MODEL_OPTIONS and best != st.session_state.get("model_choice"):
+                st.session_state["_pending_model_choice"] = best
+                st.rerun()
 
     # Show the cached run (from the JSON publish wrote) only for views the user
     # has run the agent on this session — clicking is what reveals it.

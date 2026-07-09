@@ -49,6 +49,15 @@ def main(argv=None) -> int:
         print("\nAnomalies:")
         for line in final_state["anomalies"]:
             print(" ", line)
+    excluded = final_state.get("window_excluded_skus")
+    if excluded:
+        print(
+            f"\nActive SKUs outside {best}'s history window "
+            f"({len(excluded)}) — an all-history model would forecast these:"
+        )
+        for row in excluded:
+            desc = row.get("Description", "")
+            print(f"  {row.get('SKU', '')}" + (f" — {desc}" if desc else ""))
     if final_state.get("narrative"):
         print("\nNarrative:\n" + final_state["narrative"])
     if final_state.get("errors"):

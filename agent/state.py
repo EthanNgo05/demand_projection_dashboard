@@ -35,4 +35,10 @@ class AgentState(TypedDict, total=False):
     confidence_flag: bool
     anomalies: list[str]
     narrative: Optional[str]
+    # Active SKUs with demand history that fall outside the winning model's
+    # history window (e.g. the 8-week moving average drops a SKU whose only
+    # sales predate its window). Empty when the winner uses all history. Lets
+    # the output name SKUs the model silently omits rather than dropping them
+    # without a trace. Computed in the publish node.
+    window_excluded_skus: list[dict]
     errors: list[str]

@@ -12,6 +12,27 @@ FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures
 FIXTURE_RAW = os.path.join(FIXTURE_DIR, "all_demand_projections_2026-07-01.xlsx")
 
 
+# --------------------------------------------------------------------------
+# `slow` marker: the full-matrix parity suites take minutes (they backtest
+# every model across many views). Skip them by default so `pytest` stays quick;
+# `pytest --runslow` runs everything. Registered in pytest.ini.
+# --------------------------------------------------------------------------
+def pytest_addoption(parser):
+    parser.addoption(
+        "--runslow", action="store_true", default=False,
+        help="run the slow full-matrix parity suites too",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--runslow"):
+        return
+    skip_slow = pytest.mark.skip(reason="slow: pass --runslow to run")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 @pytest.fixture(scope="session")
 def sample_raw_path():
     """Path to the small deterministic raw workbook (built on demand, seeded)."""
