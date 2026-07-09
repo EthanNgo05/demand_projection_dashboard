@@ -45,9 +45,9 @@ TREND_WEIGHT = 0.25
 
 # Header caption shown by the dashboard when this model is selected.
 DASHBOARD_CAPTION = (
-    "15-week simple-regression forecast: anchored to the 8-week average of the "
-    "historical demand window (POS where available, else Orders), nudged by a "
-    f"dampened linear-regression slope (trend weight = {TREND_WEIGHT})."
+    "15-week forecast from an 8-week moving average of the historical demand "
+    "window (POS where available, else Orders), with a light dampened trend "
+    f"adjustment (trend weight = {TREND_WEIGHT})."
 )
 
 # RAW_INPUTS_FOLDER is the constant the dashboard reads to discover raw files,

@@ -2,7 +2,7 @@
 
 A Streamlit + Plotly dashboard for SKU-level demand forecasting. It can dynamically run any of three models:
 
-- **Simple Regression** (8-week average + dampened linear trend)
+- **8-Week Moving Average** (8-week average + a light dampened trend)
 - **Holt's Exponential Smoothing** (damped trend, with outlier cleansing and promo uplift)
 - **XGBoost** (pooled gradient-boosted trees, with the same cleansing/uplift)
 

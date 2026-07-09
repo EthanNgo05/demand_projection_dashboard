@@ -17,7 +17,7 @@ def test_publish_writes_expected_json(tmp_path, monkeypatch):
     state = {
         "view": "ALL CUSTOMERS (combined)",
         "best_model": "XGBoost",
-        "results": {"XGBoost": {"mae": 22.1}, "Simple Regression": {"mae": 30.0}},
+        "results": {"XGBoost": {"mae": 22.1}, "8-Week Moving Average": {"mae": 30.0}},
         "narrative": "Demand is flat.",
         "anomalies": ["- SKU-1 spiked"],
         "confidence_flag": False,
@@ -30,7 +30,7 @@ def test_publish_writes_expected_json(tmp_path, monkeypatch):
     payload = json.loads(out_path.read_text())
     assert payload["best_model"] == "XGBoost"
     assert payload["mae_by_model"]["XGBoost"] == 22.1
-    assert payload["mae_by_model"]["Simple Regression"] == 30.0
+    assert payload["mae_by_model"]["8-Week Moving Average"] == 30.0
     assert payload["narrative"] == "Demand is flat."
     assert payload["anomalies"] == ["- SKU-1 spiked"]
     assert payload["confidence_flag"] is False

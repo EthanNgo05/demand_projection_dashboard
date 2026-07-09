@@ -95,8 +95,8 @@ def _summary_df(n_rows):
 def _state(n_rows, view="TEST GROUP"):
     return {
         "view": view,
-        "best_model": "Simple Regression",
-        "results": {"Simple Regression": {"summary_df": _summary_df(n_rows), "mae": 12.3}},
+        "best_model": "8-Week Moving Average",
+        "results": {"8-Week Moving Average": {"summary_df": _summary_df(n_rows), "mae": 12.3}},
         "confidence_flag": False,
         "errors": [],
     }

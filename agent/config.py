@@ -19,7 +19,7 @@ load_dotenv()
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MODEL_OPTIONS = {
-    "Simple Regression": os.path.join(HERE, "models/regression.py"),
+    "8-Week Moving Average": os.path.join(HERE, "models/regression.py"),
     "Holt's Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
 }

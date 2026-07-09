@@ -12,7 +12,7 @@ from agent.nodes.forecast import run_all_models
 
 @pytest.fixture(scope="module")
 def regression_module():
-    return load_pipeline(MODEL_OPTIONS["Simple Regression"])
+    return load_pipeline(MODEL_OPTIONS["8-Week Moving Average"])
 
 
 @pytest.fixture(scope="module")
