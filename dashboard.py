@@ -1569,28 +1569,29 @@ def main():
     n_orders = int((summary.get("Data Source") == "Orders").sum()) \
         if "Data Source" in summary.columns else 0
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric(
-        "SKUs forecast", f"{len(summary):,}",
+        "SKUs Forecasted", f"{len(summary):,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
     )
-    k2.metric(f"Avg weekly demand", f"{total_avg:,.0f}")
-    k3.metric("Updated proj. (avg/wk)", f"{total_updated:,.0f}")
-    k4.metric(
-        "vs original projection", f"{diff:+,.0f}",
+    k2.metric("Avg. Weekly Demand", f"{total_avg:,.0f}")
+    k3.metric("Initial Projection (avg/wk)", f"{total_initial:,.0f}")
+    k4.metric("Updated Projection (avg/wk)", f"{total_updated:,.0f}")
+    k5.metric(
+        "Projection Difference (avg/wk)", f"{diff:+,.0f}",
         delta=f"{(diff / total_initial * 100):+.1f}%" if total_initial else None,
     )
     has_risk = RISK_COL in summary.columns and summary[RISK_COL].notna().any()
     if has_risk:
         net_risk = summary[RISK_COL].sum()
-        k5.metric(
-            "Revenue risk (net)", f"${net_risk:+,.0f}",
+        k6.metric(
+            "Revenue Risk (net)", f"${net_risk:+,.0f}",
             help="Σ (projection difference × list price) over priced SKUs. "
                  "Negative = forecast fell below the original projection.",
         )
     else:
-        k5.metric(
-            "Revenue risk (net)", "—",
+        k6.metric(
+            "Revenue Risk (net)", "—",
             help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
         )
     if n_orders:

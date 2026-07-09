@@ -2,8 +2,8 @@
 
 Two providers, selected by the LLM_PROVIDER env var (or a per-call override):
 
-- "anthropic" (default): Claude via langchain-anthropic. Needs ANTHROPIC_API_KEY.
-- "local": any OpenAI-compatible server (LiteLLM / LM Studio / vLLM / Ollama),
+- "anthropic": Claude via langchain-anthropic. Needs ANTHROPIC_API_KEY.
+- "local" (default): any OpenAI-compatible server (LiteLLM / LM Studio / vLLM / Ollama),
   e.g. the gemma4-31b endpoint at http://james-workstation:4000/v1. Configured
   via LOCAL_LLM_BASE_URL / LOCAL_LLM_MODEL / LOCAL_LLM_API_KEY.
 

@@ -50,7 +50,7 @@ MAE_CONFIDENCE_THRESHOLD = 40
 #               e.g. the gemma4-31b endpoint on james-workstation.
 # agent/llm.py re-reads LLM_PROVIDER from the env at call time, so these are
 # import-time defaults, not the last word.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "local").strip().lower()
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 LOCAL_LLM_BASE_URL = os.environ.get(
     "LOCAL_LLM_BASE_URL", "http://james-workstation:4000/v1"
