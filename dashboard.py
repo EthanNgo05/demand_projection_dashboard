@@ -955,7 +955,7 @@ def _render_agent_summary(view):
     payload = _load_agent_summary(view)
     if payload is None:
         return
-    with st.expander("🤖 Agent summary", expanded=True):
+    with st.expander("Agent summary", expanded=True):
         gen = payload.get("generated_at")
         if gen:
             st.caption(f"Generated {gen}  ·  view: {payload.get('view', view)}")
@@ -996,7 +996,11 @@ def main():
     st.markdown(
         f"""
         <style>
-        section[data-testid="stSidebar"] {{
+        /* Only widen the sidebar while it's expanded. Scoping to
+           aria-expanded="true" lets Streamlit's collapse animation drive the
+           width to 0 when hidden, so the main content reclaims the full width
+           instead of the min-width pinning it open. */
+        section[data-testid="stSidebar"][aria-expanded="true"] {{
             width: {SIDEBAR_WIDTH_PX}px !important;
             min-width: {SIDEBAR_WIDTH_PX}px !important;
         }}
