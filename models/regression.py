@@ -424,16 +424,20 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
     print(f"  Forecast window:   {forecast_weeks[0].date()} -> {forecast_weeks[-1].date()}")
     print(f"  SKUs projected:    {len(summary_rows)}")
 
-    # initial_projection_avg: average of the existing system Projection from the
-    # first forecast week (first_forecast_week -- the in-progress week, e.g.
-    # 2026-06-28) through the last week that actually has a projection. Anchoring
-    # this to the same first_forecast_week keeps it aligned with the updated
-    # forecast (both start at the in-progress week). Weeks with a missing
-    # projection are excluded from the average (mean() skips NaN), so a SKU whose
-    # projection runs out at, say, 2026-11-22 is not penalised for a blank
-    # 2026-11-29.
+    # initial_projection_avg: average of the existing system Projection over the
+    # SAME 8 completed weeks the regression fits on (lookback_start through
+    # last_complete_week). The simple-regression updated projection is anchored to
+    # the 8-week average of recent actuals (plus a dampened trend), so scoping the
+    # original projection to that same window makes "Projection Difference" a
+    # like-for-like read: how the existing projection compares to what recent
+    # demand implies. (This differs from the Holt/XGBoost pipelines, which cap the
+    # window at the 15-week forecast horizon instead.) Weeks with a missing
+    # projection are excluded from the average (mean() skips NaN).
     avg_initial = (
-        df[df["WeekDate"] >= first_forecast_week]
+        df[
+            (df["WeekDate"] >= lookback_start)
+            & (df["WeekDate"] <= last_complete_week)
+        ]
         .dropna(subset=["Projection"])
         .groupby("SKU")["Projection"]
         .mean()
