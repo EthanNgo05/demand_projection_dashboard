@@ -8,6 +8,7 @@ import pandas as pd
 
 from agent import data_io
 from agent.config import MODEL_OPTIONS
+from agent.logging_util import logger
 from agent.model_loader import load_pipeline
 from agent.state import AgentState
 
@@ -37,6 +38,29 @@ def ingest(state: AgentState) -> dict:
     P = load_pipeline(next(iter(MODEL_OPTIONS.values())))
     raw = pd.read_excel(raw_path, header=2)  # header=2 matches dashboard load_raw_from_path
     cleaned = data_io._clean(raw, P)
+
+    # Apply the exact same pre-forecast exclusions the dashboard does, so the
+    # agent never forecasts or flags a SKU that is discontinued/inactive or in a
+    # region it is not 'Active in'. The Plytix export doubles as the list-price
+    # file, so it is read from the same price_path. With no Plytix file the
+    # checks degrade to no-ops (bar the trailing-'*' drop), preserving parity.
+    plytix_df = data_io.read_plytix(price_path) if price_path else None
+    today_ts = state.get("today_ts")
+    anchors = P.week_anchors(today_ts) if today_ts is not None else None
+    excl = data_io.apply_exclusions(cleaned, plytix_df, P, anchors=anchors)
+    cleaned = excl.df
+    if excl.n_excluded_rows:
+        logger.info(
+            "Active-in check: dropped %d raw rows across %d SKU×customer×region "
+            "combos not in the SKU's 'Active in' list.",
+            excl.n_excluded_rows, len(excl.inactive_df),
+        )
+    if excl.n_disc_rows:
+        logger.info(
+            "Discontinued check: dropped %d raw rows across %d "
+            "discontinued/inactive SKUs (trailing '*' or Plytix status).",
+            excl.n_disc_rows, excl.n_disc_skus,
+        )
 
     prices = (
         P.load_list_prices(price_path)

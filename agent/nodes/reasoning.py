@@ -91,7 +91,8 @@ def flag_anomalies(state: AgentState) -> dict:
     summary = state["results"][best]["summary_df"]
     table = _anomaly_table(summary)
     text, err = safe_invoke(
-        ANOMALY_PROMPT.format(view=state["view"], table=table, max_rows=MAX_ANOMALY_ROWS)
+        ANOMALY_PROMPT.format(view=state["view"], table=table, max_rows=MAX_ANOMALY_ROWS),
+        view=state["view"],
     )
     if err:
         logger.warning("flag_anomalies [%s]: %s", state.get("view", "?"), err)
@@ -121,7 +122,8 @@ def flag_low_confidence(state: AgentState) -> dict:
             best_model=best,
             mae=state["results"][best]["mae"],
             threshold=state.get("mae_confidence_threshold", 50),
-        )
+        ),
+        view=state["view"],
     )
     if err:
         logger.warning("flag_low_confidence [%s]: %s", state.get("view", "?"), err)
@@ -137,7 +139,8 @@ def summarize(state: AgentState) -> dict:
             best_model=best,
             mae=state["results"][best]["mae"],
             anomalies="\n".join(state.get("anomalies", [])) or "None",
-        )
+        ),
+        view=state["view"],
     )
     if err:
         logger.warning("summarize [%s]: %s", state.get("view", "?"), err)

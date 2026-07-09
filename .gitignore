@@ -9,6 +9,7 @@ __pycache__
 
 # logs
 logs.txt
+llm_prompts.log
 
 # secrets
 .env
@@ -18,3 +19,5 @@ logs.txt
 .claude/
 
 /sql
+
+testing.ipynb

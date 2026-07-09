@@ -14,9 +14,18 @@ already succeeded.
 """
 
 import os
+from datetime import datetime
 from typing import Optional
 
 from agent import config
+
+# Every prompt actually sent to an LLM is appended here verbatim, alongside the
+# view it was generated for and the wall-clock time, so you can see exactly what
+# left the machine. Kept separate from logs.txt (which is the terse audit trail)
+# because full prompts are multi-line and would drown the run log.
+LLM_PROMPTS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "llm_prompts.log"
+)
 
 
 def _has_anthropic_credentials() -> bool:
@@ -69,11 +78,48 @@ def get_llm(temperature: float = 0, provider: Optional[str] = None):
     )
 
 
-def safe_invoke(prompt: str, temperature: float = 0, provider: Optional[str] = None):
+def _resolve_model(resolved_provider: str) -> str:
+    """The concrete model name for the resolved provider, matching get_llm."""
+    if resolved_provider == "anthropic":
+        return config.ANTHROPIC_MODEL
+    return os.environ.get("LOCAL_LLM_MODEL", config.LOCAL_LLM_MODEL)
+
+
+def _record_prompt(prompt: str, view: Optional[str], resolved_provider: str) -> None:
+    """Append the exact prompt (with view + timestamp + target model) to
+    LLM_PROMPTS_PATH. Best-effort: a logging failure must never break a run, so
+    a read-only filesystem or encoding error is swallowed silently."""
+    entry = (
+        f"{'=' * 80}\n"
+        f"time:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"view:     {view if view is not None else '(unspecified)'}\n"
+        f"provider: {resolved_provider}\n"
+        f"model:    {_resolve_model(resolved_provider)}\n"
+        f"{'-' * 80}\n"
+        f"{prompt}\n\n"
+    )
+    try:
+        with open(LLM_PROMPTS_PATH, "a", encoding="utf-8") as fh:
+            fh.write(entry)
+    except OSError:
+        pass
+
+
+def safe_invoke(
+    prompt: str,
+    temperature: float = 0,
+    provider: Optional[str] = None,
+    view: Optional[str] = None,
+):
     """Invoke the LLM; return (text, error). Never raises — a missing/invalid
     API key or a network failure must land in state["errors"], not crash the
-    graph after the deterministic pipeline already succeeded."""
+    graph after the deterministic pipeline already succeeded.
+
+    Every prompt is recorded to LLM_PROMPTS_PATH before the call, so the file
+    reflects what was sent even if the call itself then fails."""
+    resolved = _resolve_provider(provider)
+    _record_prompt(prompt, view, resolved)
     try:
         return get_llm(temperature=temperature, provider=provider).invoke(prompt).content, None
     except Exception as e:  # noqa: BLE001 — anything here must degrade, not crash
-        return None, f"LLM call failed (provider={_resolve_provider(provider)}): {e}"
+        return None, f"LLM call failed (provider={resolved}): {e}"
