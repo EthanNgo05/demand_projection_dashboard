@@ -1590,8 +1590,16 @@ def main():
     )
 
     # ----- KPIs -------------------------------------------------------------
+    # Avg. weekly demand = the mean of the TOTAL weekly demand actually plotted
+    # on the chart's "Actual demand" line (POS/Orders summed across SKUs per
+    # week, then averaged over the weeks in the window). Do NOT sum the per-SKU
+    # "N Week POS/Orders Average" column here: that per-SKU average divides each
+    # SKU by its own weeks-with-data, so summing it counts a SKU that sold in
+    # only a few weeks as if it sold every week and overstates the total.
     avg_col = resolve_avg_col(summary)
-    total_avg = summary[avg_col].sum()
+    hist_demand = historical_window(agg, summary, (lb, lcw, ffw))
+    weekly_totals = hist_demand.groupby("WeekDate")["demand"].sum(min_count=1)
+    total_avg = float(weekly_totals.mean()) if not weekly_totals.empty else 0.0
     total_updated = summary["Updated Projection Average"].sum()
     total_initial = summary["Initial Projection Average"].sum()
     diff = total_updated - total_initial
@@ -1603,9 +1611,23 @@ def main():
         "SKUs Forecasted", f"{len(summary):,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
     )
-    k2.metric("Avg. Weekly Demand", f"{total_avg:,.0f}")
-    k3.metric("Initial Projection (avg/wk)", f"{total_initial:,.0f}")
-    k4.metric("Updated Projection (avg/wk)", f"{total_updated:,.0f}")
+    k2.metric(
+        "Historical Demand (avg/wk)", f"{total_avg:,.0f}",
+        help=f"Mean of total weekly actual demand (POS/Orders) over the "
+             f"{avg_window_phrase(avg_col).lower()} window — the average of the "
+             f"chart's actual-demand line.",
+    )
+    k3.metric(
+        "Initial Forecast (avg/wk)", f"{total_initial:,.0f}",
+        help="Mean of the existing system projection over the forecast horizon "
+             "(the 15 future weeks) — the average of the chart's original-"
+             "projection line over the forecast window.",
+    )
+    k4.metric(
+        "Updated Forecast (avg/wk)", f"{total_updated:,.0f}",
+        help="Mean of this model's updated forecast over the 15 future weeks — "
+             "the average of the chart's updated-forecast line.",
+    )
     k5.metric(
         "Projection Difference (avg/wk)", f"{diff:+,.0f}",
         delta=f"{(diff / total_initial * 100):+.1f}%" if total_initial else None,
