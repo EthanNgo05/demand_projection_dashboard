@@ -1248,9 +1248,17 @@ def main():
                  "calls the Claude API (needs ANTHROPIC_API_KEY in .env); Local "
                  "uses the OpenAI-compatible server in LOCAL_LLM_* (.env).",
         )
+        # Anthropic needs a key; without one, block the run and steer the user
+        # to Local rather than silently degrading to it behind the scenes.
+        anthropic_no_key = LLM_PROVIDERS[provider_label] == "anthropic" and not (
+            os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        )
+        if anthropic_no_key:
+            st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the agent.")
         run_agent = st.button(
             "Run Agent Summary",
             key="run_agent_summary",
+            disabled=anthropic_no_key,
             help="Backtests all models for this view, picks the best, and writes "
                  "an LLM narrative + flagged anomalies. Slow/expensive — runs "
                  "only when you click, never on a normal rerun.",
@@ -1258,6 +1266,10 @@ def main():
 
     if run_agent:
         os.environ["LLM_PROVIDER"] = LLM_PROVIDERS[provider_label]
+        # Remember that the agent was run for this view this session, so the
+        # summary expander below appears only after an explicit click — never a
+        # stale persisted summary surfacing on page load.
+        st.session_state.setdefault("agent_ran_views", set()).add(view)
         with st.spinner(f"Running agentic pipeline ({provider_label})…"):
             # Import here, not at module top: keeps langgraph off the hot import
             # path for every rerun and matches the "only touched on click" rule.
@@ -1270,9 +1282,10 @@ def main():
         else:
             st.toast(f"Agent finished: {final_state.get('best_model', 'n/a')}")
 
-    # Show the last cached run for this view (from the JSON publish wrote),
-    # whether it was produced just now or on an earlier click.
-    _render_agent_summary(view)
+    # Show the cached run (from the JSON publish wrote) only for views the user
+    # has run the agent on this session — clicking is what reveals it.
+    if view in st.session_state.get("agent_ran_views", set()):
+        _render_agent_summary(view)
 
     # ----- Model parameters (Holt damped-trend smoothing) ------------------
     min_weeks = None
@@ -1548,13 +1561,25 @@ def main():
     if model_bits:
         st.caption("Model in use — " + "; ".join(model_bits))
     w1, w2 = st.columns(2)
-    # The fixed-window regression pipeline always fits exactly the last 8
-    # completed weeks, so we can state that. The other pipelines expose a
-    # LOOKBACK_WEEKS mechanism (all-history by default), so the window isn't a
-    # fixed 8 weeks — leave the count off rather than mislabel it.
-    hist_span = f"**Historical window** &nbsp; {lb.date()} → {lcw.date()}"
-    if not hasattr(P, "LOOKBACK_WEEKS"):
-        hist_span += " <span style='color:#64748b'>(8 completed weeks)</span>"
+    # The window's nominal lower bound (lb) can sit earlier than the first week
+    # the data actually reaches — e.g. the all-history pipelines anchor lb at
+    # HISTORY_START (2026-03-01) but the raw file's earliest week is later. Show
+    # the first week that is genuinely used in the fit and the chart (earliest
+    # WeekDate within [lb, lcw] carrying a POS/Orders signal) rather than the
+    # nominal lb, so the displayed start matches what the graph plots.
+    win = agg[(agg["WeekDate"] >= lb) & (agg["WeekDate"] <= lcw)]
+    win_sig = win[win["POS"].notna() | win["Orders"].notna()]
+    hist_start = win_sig["WeekDate"].min() if not win_sig.empty else lb
+    # Count the completed weeks actually used — distinct weeks within the window
+    # that carry a POS/Orders signal. The regression pipeline's window is a fixed
+    # 8 weeks; the all-history pipelines (Holt/XGBoost) span however many weeks of
+    # data exist between hist_start and lcw, so the count is derived, not fixed.
+    n_hist_weeks = win_sig["WeekDate"].nunique()
+    week_word = "week" if n_hist_weeks == 1 else "weeks"
+    hist_span = (
+        f"**Historical window** &nbsp; {hist_start.date()} → {lcw.date()} "
+        f"<span style='color:#64748b'>({n_hist_weeks} completed {week_word})</span>"
+    )
     w1.markdown(hist_span, unsafe_allow_html=True)
     fc_weeks = pd.to_datetime(weekly["WeekDate"])
     w2.markdown(

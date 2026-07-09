@@ -19,10 +19,26 @@ from typing import Optional
 from agent import config
 
 
+def _has_anthropic_credentials() -> bool:
+    # ChatAnthropic resolves auth from any of these; without one it raises
+    # "Could not resolve authentication method" the moment it's invoked.
+    return any(
+        os.environ.get(k)
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+    )
+
+
 def _resolve_provider(provider: Optional[str] = None) -> str:
     # Read the env at call time (not import time) so run.py's --provider flag
     # and per-test monkeypatching take effect without re-importing config.
-    return (provider or os.environ.get("LLM_PROVIDER") or config.LLM_PROVIDER).strip().lower()
+    resolved = (provider or os.environ.get("LLM_PROVIDER") or config.LLM_PROVIDER).strip().lower()
+    # If Anthropic is selected but no key is configured, degrade to the local
+    # server instead of failing every call with an auth error. This lets the
+    # dashboard run out-of-the-box (e.g. the agent summary tab on startup)
+    # without an ANTHROPIC_API_KEY in .env.
+    if resolved == "anthropic" and not _has_anthropic_credentials():
+        return "local"
+    return resolved
 
 
 def get_llm(temperature: float = 0, provider: Optional[str] = None):

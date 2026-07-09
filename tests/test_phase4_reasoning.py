@@ -69,9 +69,11 @@ def test_narrative_does_not_invent_skus(fake_llm, sample_state_with_summary):
 
 
 def test_llm_failure_lands_in_errors_not_raised(monkeypatch, sample_state_with_summary):
-    # No key + anthropic provider => safe_invoke must catch, not crash the graph.
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # A failing LLM call must be caught by safe_invoke, not crash the graph.
+    def _boom(*a, **k):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr("agent.llm.get_llm", _boom)
     out = flag_anomalies(sample_state_with_summary)  # should not raise
     assert out["anomalies"] == []
     assert out["errors"] and "LLM call failed" in out["errors"][0]
@@ -132,6 +134,24 @@ def test_get_llm_local_uses_openai_compatible_endpoint(monkeypatch):
     assert isinstance(model, ChatOpenAI)
     assert model.model_name == "gemma4-31b"
     assert "james-workstation:4000/v1" in str(model.openai_api_base)
+
+
+def test_anthropic_without_key_falls_back_to_local(monkeypatch):
+    from langchain_openai import ChatOpenAI
+
+    # Anthropic selected but no credentials => degrade to the local server
+    # instead of failing every call with an auth error.
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    assert llm_mod._resolve_provider() == "local"
+    assert isinstance(llm_mod.get_llm(), ChatOpenAI)
+
+
+def test_anthropic_with_key_stays_anthropic(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-real")
+    assert llm_mod._resolve_provider() == "anthropic"
 
 
 def test_provider_argument_overrides_env(monkeypatch):
