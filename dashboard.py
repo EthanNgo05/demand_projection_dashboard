@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import glob
+import json
 import inspect
 import logging
 import tempfile
@@ -912,6 +913,78 @@ def style_summary(summary_df):
 # --------------------------------------------------------------------------- #
 # App                                                                         #
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Agent integration (Phase 5)                                                 #
+# --------------------------------------------------------------------------- #
+# The LangGraph agent runs out-of-band and writes its result to
+# outputs/agent_summary_{view}.json (see agent/nodes/publish.py). The dashboard
+# only reads that JSON back — it never threads LangGraph's execution model into
+# Streamlit's rerun-on-every-interaction model. The agent is invoked strictly
+# on an explicit button click (it calls an LLM and backtests every model), and
+# the last result is shown from the cached JSON on subsequent reruns.
+
+# Friendly sidebar label -> the LLM_PROVIDER value agent/llm.py resolves at call
+# time. "anthropic" = Claude API (ANTHROPIC_API_KEY); "local" = the
+# OpenAI-compatible server in LOCAL_LLM_* (see agent/config.py and .env.example).
+LLM_PROVIDERS = {
+    "Anthropic (Claude API)": "anthropic",
+    "Local LLM": "local",
+}
+
+
+def _agent_summary_path(view):
+    """Path publish.py writes for a given view (same view->filename mangling)."""
+    safe_view = view.replace(" ", "_").replace("/", "-")
+    return os.path.join(HERE, "outputs", f"agent_summary_{safe_view}.json")
+
+
+def _load_agent_summary(view):
+    """Last agent run for this view, or None if it hasn't run / is unreadable."""
+    path = _agent_summary_path(view)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _render_agent_summary(view):
+    """Render the cached agent summary for `view` in the main body, if any."""
+    payload = _load_agent_summary(view)
+    if payload is None:
+        return
+    with st.expander("🤖 Agent summary", expanded=True):
+        gen = payload.get("generated_at")
+        if gen:
+            st.caption(f"Generated {gen}  ·  view: {payload.get('view', view)}")
+
+        if payload.get("errors"):
+            st.error("\n".join(payload["errors"]))
+
+        best = payload.get("best_model")
+        if best:
+            mae = (payload.get("mae_by_model") or {}).get(best)
+            label = f"Best model: {best}"
+            if mae is not None:
+                label += f"  (backtest MAE {mae:.1f})"
+            if payload.get("confidence_flag"):
+                st.warning(label + "  —  ⚠️ low confidence")
+            else:
+                st.success(label)
+
+        if payload.get("narrative"):
+            st.write(payload["narrative"])
+
+        anomalies = payload.get("anomalies") or []
+        if anomalies:
+            st.markdown("**Flagged anomalies:**")
+            for a in anomalies:
+                # publish stores bullets as-is; add a marker only if missing.
+                st.markdown(a if a.lstrip().startswith(("-", "*", "•")) else f"- {a}")
+
+
 def main():
     st.set_page_config(
         page_title="Demand Projections", page_icon="📦", layout="wide"
@@ -1154,6 +1227,48 @@ def main():
             # crashing on mixed types (see logs.txt, 2026-07-06).
             region = st.selectbox("Region", sorted(by_region.keys(), key=str))
             view = st.selectbox("Customer group", by_region[region])
+
+    # ----- Agent summary (LangGraph pipeline) ------------------------------
+    # Button-triggered only: invoking the graph backtests all three models AND
+    # calls an LLM, which is far too slow/expensive to run on every rerun. The
+    # provider selector switches the reasoning nodes between the Claude API and
+    # a local OpenAI-compatible server; agent/llm.py re-reads LLM_PROVIDER from
+    # the env at call time, so setting it here just before invoke() is enough.
+    with st.sidebar:
+        st.header("Agent")
+        provider_label = st.radio(
+            "Reasoning LLM",
+            list(LLM_PROVIDERS.keys()),
+            key="agent_llm_provider",
+            help="Which LLM writes the narrative + anomaly flags. Anthropic "
+                 "calls the Claude API (needs ANTHROPIC_API_KEY in .env); Local "
+                 "uses the OpenAI-compatible server in LOCAL_LLM_* (.env).",
+        )
+        run_agent = st.button(
+            "Run Agent Summary",
+            key="run_agent_summary",
+            help="Backtests all models for this view, picks the best, and writes "
+                 "an LLM narrative + flagged anomalies. Slow/expensive — runs "
+                 "only when you click, never on a normal rerun.",
+        )
+
+    if run_agent:
+        os.environ["LLM_PROVIDER"] = LLM_PROVIDERS[provider_label]
+        with st.spinner(f"Running agentic pipeline ({provider_label})…"):
+            # Import here, not at module top: keeps langgraph off the hot import
+            # path for every rerun and matches the "only touched on click" rule.
+            from agent.graph import build_graph
+
+            graph = build_graph()
+            final_state = graph.invoke({"view": view, "today_ts": today_ts})
+        if final_state.get("errors"):
+            st.error("\n".join(final_state["errors"]))
+        else:
+            st.toast(f"Agent finished: {final_state.get('best_model', 'n/a')}")
+
+    # Show the last cached run for this view (from the JSON publish wrote),
+    # whether it was produced just now or on an earlier click.
+    _render_agent_summary(view)
 
     # ----- Model parameters (Holt damped-trend smoothing) ------------------
     min_weeks = None
