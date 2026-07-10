@@ -1,24 +1,20 @@
-# folders
+# Data & generated output (live at the repo root, alongside src/)
 /raw_inputs
 /outputs
+/logs
+/sql
+
+# Docs & exploratory notebooks
 /docs
 /notebooks
 
-# pycache
-__pycache__
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
 
-# logs (organized under logs/<date>/)
-/logs
-# legacy root-level log files, kept ignored in case any linger
-logs.txt
-llm_prompts.log
-logs_refresh.txt
-
-# secrets
+# Secrets
 .env
 
-
-# local tooling
+# Local tooling
 .claude/
-
-/sql

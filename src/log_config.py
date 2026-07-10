@@ -13,8 +13,11 @@ import logging
 import os
 import time
 
-# <repo root>/logs — this module lives at the repo root, alongside dashboard.py.
-LOG_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+# <repo root>/logs — this module lives in src/, so climb one level to the repo
+# root (the folder holding raw_inputs/, outputs/, logs/) before appending "logs".
+LOG_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs"
+)
 
 
 def dated_log_path(filename, date_str=None):

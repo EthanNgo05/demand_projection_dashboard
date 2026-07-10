@@ -27,7 +27,7 @@ if REPO_ROOT not in sys.path:
 pytest.importorskip("streamlit")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-DASHBOARD = os.path.join(REPO_ROOT, "dashboard.py")
+DASHBOARD = os.path.join(REPO_ROOT, "src", "dashboard.py")
 HAS_RAW = bool(
     __import__("glob").glob(
         os.path.join(REPO_ROOT, "raw_inputs", "demand_projections", "*.xlsx")

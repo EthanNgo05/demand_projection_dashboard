@@ -61,7 +61,9 @@ load_dotenv()
 log = logging.getLogger("extract_demand_details")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_SQL = os.path.join(HERE, "sql", "demand_details.sql")
+# Repo root (parent of src/) — sql/, raw_inputs/ etc. live there, not under src/.
+REPO_ROOT = os.path.dirname(HERE)
+DEFAULT_SQL = os.path.join(REPO_ROOT, "sql", "demand_details.sql")
 
 # SQL result column -> PowerBI/Excel column the dashboard expects. Only these
 # columns are carried into the output; everything else is dropped (and logged).
@@ -351,7 +353,7 @@ def _default_raw_dir() -> str:
         return data_io._raw_dir()
     except Exception:  # pragma: no cover - defensive fallback
         folder = os.environ.get("DEMAND_RAW_DIR")
-        return folder or os.path.join(HERE, "raw_inputs", "demand_projections")
+        return folder or os.path.join(REPO_ROOT, "raw_inputs", "demand_projections")
 
 
 def default_out_path() -> str:

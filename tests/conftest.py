@@ -5,8 +5,11 @@ import pandas as pd
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+# The app's Python lives under src/ (dashboard, log_config, extract, agent, ...);
+# put it on the path so tests can import those top-level modules and packages.
+SRC_ROOT = os.path.join(REPO_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
 
 FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 FIXTURE_RAW = os.path.join(FIXTURE_DIR, "all_demand_projections_2026-07-01.xlsx")

@@ -2,7 +2,7 @@
     refresh_demand_data.ps1
     -----------------------
     Wrapper for the nightly scheduled pull of the demand snapshot from the SQL
-    data warehouse. Runs extract_demand_details.py (the ~10-minute batch), which
+    data warehouse. Runs src/extract_demand_details.py (the ~10-minute batch), which
     writes all_demand_projections_<date>.xlsx atomically into the folder the
     dashboard discovers snapshots in (raw_inputs/demand_projections). The
     dashboard then serves that pre-computed file instantly — nobody waits 10 min.
@@ -29,7 +29,7 @@ if ([string]::IsNullOrWhiteSpace($Python)) {
     $Python = 'C:\Users\engo\AppData\Local\Python\pythoncore-3.14-64\python.exe'
 }
 
-$Script = Join-Path $Root 'extract_demand_details.py'
+$Script = Join-Path $Root 'src\extract_demand_details.py'
 
 # Logs are organized by day: logs/<yyyy-MM-dd>/logs_refresh.txt
 $Today  = Get-Date -Format 'yyyy-MM-dd'

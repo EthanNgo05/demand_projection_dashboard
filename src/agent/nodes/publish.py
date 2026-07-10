@@ -6,10 +6,10 @@ daily app log, ``logs/<date>/app.log`` (append, never overwrite — matching the
 existing Autofit lines). The dashboard reads the JSON back to show the last run
 without re-invoking the (slow, LLM-backed) graph on every Streamlit rerun.
 
-Path note: this file lives at ``agent/nodes/publish.py``, so the repo root is
-THREE levels up. ``outputs/`` lives at the repo root alongside dashboard.py —
-not under ``agent/``. Tests monkeypatch OUTPUT_DIR for the JSON and
-``log_config.LOG_ROOT`` for the audit line.
+Path note: this file lives at ``src/agent/nodes/publish.py``, so the repo root
+is FOUR levels up. ``outputs/`` lives at the repo root (the folder holding
+raw_inputs/ + logs/) — not under ``src/`` or ``agent/``. Tests monkeypatch
+OUTPUT_DIR for the JSON and ``log_config.LOG_ROOT`` for the audit line.
 """
 
 import json
@@ -21,8 +21,12 @@ from agent.model_loader import load_pipeline
 from agent.state import AgentState
 from log_config import dated_log_path
 
-# agent/nodes/publish.py -> agent/nodes -> agent -> <repo root>
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# src/agent/nodes/publish.py -> agent/nodes -> agent -> src -> <repo root>
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+)
 OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs")
 
 

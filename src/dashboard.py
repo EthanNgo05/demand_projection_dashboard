@@ -96,6 +96,10 @@ if not logger.handlers:
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Repo root (parent of src/) — where the data folders raw_inputs/, outputs/ and
+# logs/ live. HERE is used for sibling CODE (models/, extract script); REPO_ROOT
+# for DATA that stays at the repo root.
+REPO_ROOT = os.path.dirname(HERE)
 
 # The forecasting models on offer. Each entry maps the label shown in the
 # sidebar toggle to the pipeline file implementing it. When a DEMAND_PIPELINE
@@ -943,7 +947,7 @@ LLM_PROVIDERS = {
 def _agent_summary_path(view):
     """Path publish.py writes for a given view (same view->filename mangling)."""
     safe_view = view.replace(" ", "_").replace("/", "-")
-    return os.path.join(HERE, "outputs", f"agent_summary_{safe_view}.json")
+    return os.path.join(REPO_ROOT, "outputs", f"agent_summary_{safe_view}.json")
 
 
 def _load_agent_summary(view):

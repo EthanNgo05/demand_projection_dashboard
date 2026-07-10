@@ -26,9 +26,12 @@ import pandas as pd
 from agent.config import MODEL_OPTIONS
 from agent.model_loader import load_pipeline
 
-# Repo root (the folder holding dashboard.py), so relative RAW_INPUTS_FOLDER /
-# LIST_PRICE_GLOB paths resolve exactly as dashboard.py's HERE does.
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Repo root (parent of src/, the folder holding raw_inputs/ + outputs/), so
+# relative RAW_INPUTS_FOLDER / LIST_PRICE_GLOB paths resolve there. This file is
+# src/agent/data_io.py, so climb three levels: agent -> src -> repo root.
+HERE = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 
 def default_pipeline():

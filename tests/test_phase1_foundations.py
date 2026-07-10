@@ -8,7 +8,8 @@ import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO_ROOT)
+SRC_ROOT = os.path.join(REPO_ROOT, "src")  # the app's code lives under src/
+sys.path.insert(0, SRC_ROOT)
 
 
 def test_state_and_config_importable():
@@ -31,7 +32,7 @@ def test_all_customers_view_matches_dashboard():
     # a drift here silently compares/filters the wrong view in every later phase.
     from agent.config import ALL_CUSTOMERS_VIEW
 
-    with open(os.path.join(REPO_ROOT, "dashboard.py"), encoding="utf-8") as f:
+    with open(os.path.join(SRC_ROOT, "dashboard.py"), encoding="utf-8") as f:
         dashboard_src = f.read()
     assert f'ALL_CUSTOMERS_VIEW = "{ALL_CUSTOMERS_VIEW}"' in dashboard_src
 
@@ -47,14 +48,14 @@ def test_no_streamlit_import_required():
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
-        cwd=REPO_ROOT,
+        cwd=SRC_ROOT,
     )
     assert result.returncode == 0, result.stderr
 
 
 def test_env_key_not_hardcoded():
     # crude guard: no file in agent/ should contain a literal sk-ant- style key
-    agent_dir = os.path.join(REPO_ROOT, "agent")
+    agent_dir = os.path.join(SRC_ROOT, "agent")
     for root, _dirs, files in os.walk(agent_dir):
         for name in files:
             if not name.endswith(".py"):

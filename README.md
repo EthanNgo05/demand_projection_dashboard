@@ -9,13 +9,20 @@ A Streamlit + Plotly dashboard for SKU-level demand forecasting. It can dynamica
 ## Project layout
 
 ```
-dashboard.py                      # Streamlit + Plotly front-end; runs any model live
-models/
-├── regression.py                 # 8-week average + dampened linear-regression slope
-├── exponential_smoothing.py      # Double exponential smoothing (level + trend, damped)
-└── xgboost.py                    # Pooled gradient-boosted trees (XGBoost)
+src/                              # all importable app code
+├── dashboard.py                  # Streamlit + Plotly front-end; runs any model live
+├── log_config.py                 # shared date-organized logging helpers
+├── extract_demand_details.py     # nightly SQL-warehouse pull -> dated .xlsx
+├── active_missing_projections.py # batch "active SKUs missing forecasts" report
+├── agent/                        # LangGraph forecasting/reasoning pipeline
+└── models/
+    ├── regression.py             # 8-week average + dampened linear-regression slope
+    ├── exponential_smoothing.py  # Double exponential smoothing (level + trend, damped)
+    └── xgboost.py                # Pooled gradient-boosted trees (XGBoost)
+tests/                            # pytest suite (adds src/ to sys.path)
 notebooks/                        # EDA + the checks later ported into the dashboard
 docs/agentic_workflow/            # Design notes
+sql/                              # demand_details.sql (the warehouse query)
 raw_inputs/
 ├── demand_projections/           # all_demand_projections_YYYY-MM-DD.xlsx (PowerBI export)
 ├── list_prices/                  # list_prices_*.xlsx (Plytix export: prices + statuses)
@@ -23,20 +30,24 @@ raw_inputs/
 outputs/                          # batch-mode output (gitignored)
 ```
 
+The data folders (`raw_inputs/`, `outputs/`, `logs/`, `sql/`, `docs/`,
+`notebooks/`) stay at the repo root; only the Python code lives under `src/`.
+
 ## Running it
 
 Dashboard (interactive):
 
 ```
 pip install -r requirements.txt
-streamlit run dashboard.py
+streamlit run src/dashboard.py
 ```
 
 Batch mode — each model file is also a standalone script that picks up the newest
-raw file and writes per-group + combined Excel forecasts under `outputs/`:
+raw file and writes per-group + combined Excel forecasts under `outputs/`. Run
+these from the repo root so the `raw_inputs/` / `outputs/` paths resolve:
 
 ```
-python models/exponential_smoothing.py     # or regression.py / xgboost.py
+python src/models/exponential_smoothing.py     # or regression.py / xgboost.py
 ```
 
 ## The pipeline contract
@@ -146,9 +157,12 @@ pip install -r requirements.txt
 pytest tests/ -v
 ````
 
-Run end-to-end and print a row count for all 3 models:
+Run end-to-end and print a row count for all 3 models (the `agent` package lives
+under `src/`, so run these from that folder — data paths still resolve to the
+repo root automatically):
 
 ```
+cd src
 python -m agent.run --view "ALL CUSTOMERS (combined)"
 python -m agent.run --view "AMAZON-DC"
 python -m agent.run --view "ANOTHER-CUSTOMER-GROUP"
