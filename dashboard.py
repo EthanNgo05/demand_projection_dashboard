@@ -38,12 +38,14 @@ to this file. Override paths with the DEMAND_PIPELINE / DEMAND_RAW_DIR env vars.
 import os
 import re
 import sys
+import time
 import glob
 import html
 import json
 import inspect
 import logging
 import tempfile
+import subprocess
 import traceback
 import importlib.util
 from io import BytesIO
@@ -248,6 +250,135 @@ _date_from_name = data_io._date_from_name
 def discover_raw_files():
     """Return [(date_str, path)] newest first, mirroring resolve_input_file()."""
     return data_io.discover_raw_files(load_pipeline(pipeline_path()))
+
+
+# --------------------------------------------------------------------------- #
+# Manual data-warehouse refresh                                               #
+# --------------------------------------------------------------------------- #
+# The demand snapshot is normally refreshed by a nightly scheduled task that
+# runs extract_demand_details.py (the ~10-minute SQL pull) OUT of the request
+# path, so the dashboard always serves a recent file instantly. This button lets
+# a user force a fresh pull on demand WITHOUT blocking the page: it launches the
+# extract as a detached background process and drops a lock file in the snapshot
+# folder. While the lock is live the page stays fully usable on the current
+# snapshot; when the child writes the new (atomic) workbook, the snapshot
+# dropdown auto-selects it. The lock also stops a manual click and the nightly
+# task from overlapping into two concurrent 10-minute queries.
+EXTRACT_SCRIPT = os.path.join(HERE, "extract_demand_details.py")
+REFRESH_LOG = os.path.join(HERE, "logs_refresh.txt")
+# A pull older than this with no new file is treated as crashed, so the button
+# re-enables instead of wedging the UI forever. Comfortably above the ~10-minute
+# typical runtime and the extract's own 900s SQL_QUERY_TIMEOUT default.
+REFRESH_STALE_SECONDS = 30 * 60
+
+
+def _refresh_lock_path():
+    """Lock file marking an in-flight DW pull, kept in the snapshot folder.
+
+    Lives inside the raw folder (not matched by the ``all_demand_projections_*``
+    glob, so it never shows up as a snapshot) so a click and the nightly task
+    coordinate through one file regardless of which one started the pull.
+    """
+    return os.path.join(_raw_dir(), ".refresh.lock")
+
+
+def _clear_refresh_lock():
+    """Remove the refresh lock, ignoring the case where it's already gone."""
+    try:
+        os.remove(_refresh_lock_path())
+    except OSError:
+        pass
+
+
+def refresh_in_progress():
+    """(running, started_str): is a background DW pull active, and when it began.
+
+    Self-healing, so no process has to clean up after itself:
+      * If a snapshot has been written *since* the lock appeared, the pull
+        finished — clear the lock and report idle (the new file is now in the
+        dropdown).
+      * If the lock is older than REFRESH_STALE_SECONDS with no new file, the
+        pull crashed/was killed — clear the lock so the button re-enables.
+    """
+    path = _refresh_lock_path()
+    if not os.path.exists(path):
+        return False, None
+    lock_mtime = os.path.getmtime(path)
+
+    files = discover_raw_files()
+    if files and max(os.path.getmtime(p) for _, p in files) >= lock_mtime:
+        _clear_refresh_lock()
+        return False, None
+
+    if time.time() - lock_mtime > REFRESH_STALE_SECONDS:
+        logger.warning("DW refresh lock is stale (>%ds); clearing it.",
+                       REFRESH_STALE_SECONDS)
+        _clear_refresh_lock()
+        return False, None
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            started = f.read().strip()
+    except OSError:
+        started = ""
+    return True, started
+
+
+def start_refresh():
+    """Launch extract_demand_details.py in the background. Returns (ok, message).
+
+    Reuses THIS interpreter (``sys.executable``) so the pull runs in the same
+    venv the dashboard was started with, and inherits the environment (the SQL_*
+    connection vars). ``DEMAND_RAW_DIR`` is pinned to the exact folder the
+    dashboard reads so the child writes where we look, regardless of CWD. The
+    child's output is appended to logs_refresh.txt for after-the-fact diagnosis.
+    """
+    running, started = refresh_in_progress()
+    if running:
+        return False, f"A refresh is already running (started {started})."
+
+    raw_dir = _raw_dir()
+    os.makedirs(raw_dir, exist_ok=True)
+
+    # Write the lock BEFORE launching so a double-click can't spawn two pulls.
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(_refresh_lock_path(), "w", encoding="utf-8") as f:
+        f.write(now)
+
+    try:
+        env = {**os.environ, "DEMAND_RAW_DIR": raw_dir}
+        # Detach on Windows so the pull outlives this Streamlit run/rerun and
+        # isn't tied to the parent's console.
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        logf = open(REFRESH_LOG, "a", encoding="utf-8")
+        try:
+            logf.write(f"\n===== DW refresh started {now} =====\n")
+            logf.flush()
+            subprocess.Popen(
+                [sys.executable, EXTRACT_SCRIPT],
+                cwd=HERE,
+                env=env,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                close_fds=True,
+            )
+        finally:
+            # The child holds its own duplicated handle; drop ours so the parent
+            # doesn't leak a file handle per click.
+            logf.close()
+    except Exception as exc:
+        _clear_refresh_lock()
+        logger.exception("Failed to launch DW refresh")
+        return False, f"Could not start refresh: {exc}"
+
+    logger.info("DW refresh launched (%s); writing to %s", now, raw_dir)
+    return True, now
 
 
 # --------------------------------------------------------------------------- #
@@ -979,13 +1110,72 @@ def main():
         df = None
         today_str = None
 
+        # A background DW pull is coordinated through a lock file, so its state
+        # is known before the snapshot dropdown is drawn (needed to auto-select
+        # the fresh file the instant a pull finishes — see below).
+        running, started = refresh_in_progress()
+
+        # If a refresh we launched this session just finished AND actually wrote
+        # a newer file than existed when it started, jump the snapshot selection
+        # to that newest file so the page shows the fresh pull without a manual
+        # pick. Done BEFORE the selectbox is instantiated (Streamlit forbids
+        # setting a widget-keyed value once its widget exists this run).
+        if st.session_state.get("_refresh_active") and not running:
+            st.session_state.pop("_refresh_active", None)
+            baseline = st.session_state.pop("_refresh_baseline", 0.0)
+            newest_mtime = max((os.path.getmtime(p) for _, p in files), default=0.0)
+            if files and newest_mtime > baseline:
+                d0, p0 = files[0]
+                st.session_state["snapshot_choice"] = f"{d0}  ({os.path.basename(p0)})"
+                st.toast("Fresh snapshot loaded from the data warehouse.")
+            else:
+                st.warning(
+                    "The data-warehouse refresh didn't produce a new snapshot — "
+                    "see logs_refresh.txt for details."
+                )
+
         if files:
             labels = {f"{d}  ({os.path.basename(p)})": (d, p) for d, p in files}
-            choice = st.selectbox("Snapshot (raw file)", list(labels.keys()))
+            choice = st.selectbox(
+                "Snapshot (raw file)", list(labels.keys()), key="snapshot_choice"
+            )
             today_str, path = labels[choice]
             df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
         else:
             st.info("Upload the Demand Planning Details and Plytix files below.")
+
+        # ----- Pull fresh data straight from the warehouse -----------------
+        # The ~10-minute SQL pull runs in the background (see start_refresh);
+        # the page keeps serving the current snapshot and switches to the new
+        # one once it lands. A nightly scheduled task refreshes this too, so the
+        # button is only for "I need it fresher than last night".
+        if running:
+            st.info(
+                f"⏳ Refreshing from the data warehouse… started {started}. "
+                "You can keep working on the current snapshot; it switches to "
+                "the fresh pull automatically when it finishes (~10 min)."
+            )
+            if st.button("Check for new data", key="check_refresh"):
+                st.rerun()
+        elif st.button(
+            "🔄 Refresh from data warehouse",
+            key="refresh_dw",
+            help="Run the ~10-minute SQL pull now, in the background. The page "
+                 "stays usable and switches to the new snapshot when it's ready. "
+                 "A nightly job also refreshes this automatically.",
+        ):
+            ok, msg = start_refresh()
+            if ok:
+                # Remember the newest mtime NOW so we can tell, on completion,
+                # whether the pull actually produced a newer file.
+                st.session_state["_refresh_active"] = True
+                st.session_state["_refresh_baseline"] = max(
+                    (os.path.getmtime(p) for _, p in files), default=0.0
+                )
+                st.success(f"Refresh started ({msg}) — running in the background.")
+                st.rerun()
+            else:
+                st.warning(msg)
 
         with st.expander("Upload the Demand Planning Details Projections from PowerBI", expanded=not files):
             up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])

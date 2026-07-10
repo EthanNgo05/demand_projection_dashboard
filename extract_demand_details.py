@@ -44,9 +44,12 @@ Run:
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import os
+import re
 import sys
+import tempfile
 from datetime import date
 
 import pandas as pd
@@ -103,6 +106,11 @@ FILTER_BANNER = (
 # query timeout bounds the multi-minute batch. 0 disables the query timeout.
 LOGIN_TIMEOUT = int(os.environ.get("SQL_LOGIN_TIMEOUT", "30"))
 QUERY_TIMEOUT = int(os.environ.get("SQL_QUERY_TIMEOUT", "900"))
+
+# How many dated snapshot workbooks to keep in the output folder after a
+# successful write. Older ones are pruned so the folder (and the dashboard's
+# snapshot dropdown) don't grow without bound. 0 (or less) disables pruning.
+KEEP_SNAPSHOTS = int(os.environ.get("DEMAND_KEEP_SNAPSHOTS", "10"))
 
 _TRUTHY = {"yes", "true", "1", "on"}
 
@@ -304,20 +312,93 @@ def write_powerbi_xlsx(df: pd.DataFrame, out_path: str, banner: str = FILTER_BAN
 
     Header lands on the 3rd row (``startrow=2``); the banner goes in cell A1 and
     the 2nd row is left blank — matching ``pd.read_excel(path, header=2)``.
+
+    Written atomically: the workbook is built in a temp file in the same folder
+    and then ``os.replace``-d onto ``out_path``. A reader (the dashboard) polling
+    this folder therefore never sees a half-written workbook mid-refresh, and its
+    mtime-keyed cache flips to the complete file in a single step. The temp file
+    sits in the destination directory so the replace is a same-filesystem atomic
+    rename rather than a cross-device copy.
     """
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Sheet1", index=False, startrow=2)
-        writer.sheets["Sheet1"].cell(row=1, column=1, value=banner)
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".xlsx", dir=out_dir)
+    os.close(fd)
+    try:
+        with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Sheet1", index=False, startrow=2)
+            writer.sheets["Sheet1"].cell(row=1, column=1, value=banner)
+        os.replace(tmp, out_path)
+    except BaseException:
+        # Never leave a partial temp workbook behind on failure/interrupt.
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def _default_raw_dir() -> str:
+    """The folder the dashboard discovers snapshots in (single source of truth).
+
+    Delegates to the dashboard's own resolver (``agent.data_io._raw_dir``) so the
+    two never drift: DEMAND_RAW_DIR if set, else the pipeline's
+    ``RAW_INPUTS_FOLDER`` (``raw_inputs/demand_projections``) resolved against the
+    repo root. Falls back to that standard location if the agent package can't be
+    imported (keeps this script runnable stand-alone).
+    """
+    try:
+        from agent import data_io
+
+        return data_io._raw_dir()
+    except Exception:  # pragma: no cover - defensive fallback
+        folder = os.environ.get("DEMAND_RAW_DIR")
+        return folder or os.path.join(HERE, "raw_inputs", "demand_projections")
 
 
 def default_out_path() -> str:
-    """Dated output workbook, in DEMAND_RAW_DIR if set, else next to this file.
+    """Dated output workbook, in the folder the dashboard reads snapshots from.
 
     Uses the ``all_demand_projections_YYYY-MM-DD.xlsx`` name the pipeline globs
-    for, so the file is discoverable by the dashboard/models without a rename.
+    for, written into ``_default_raw_dir()`` — so a plain run of this script
+    drops the file straight into the dashboard's "Snapshot (raw file)" dropdown
+    with no copy step and no rename.
     """
-    folder = os.environ.get("DEMAND_RAW_DIR", HERE)
-    return os.path.join(folder, f"all_demand_projections_{date.today():%Y-%m-%d}.xlsx")
+    return os.path.join(
+        _default_raw_dir(), f"all_demand_projections_{date.today():%Y-%m-%d}.xlsx"
+    )
+
+
+def prune_old_snapshots(folder: str, keep: int = KEEP_SNAPSHOTS) -> list[str]:
+    """Delete all but the newest ``keep`` dated snapshot workbooks in ``folder``.
+
+    Keeps the output folder — and the dashboard's snapshot dropdown — from
+    growing without bound as the nightly pull adds a file per day. "Newest" is by
+    the ``YYYY-MM-DD`` date embedded in the filename (the same ordering the
+    dashboard uses), NOT mtime, so re-running today's pull never evicts an older
+    day. Files whose name carries no date are left untouched — never
+    auto-deleted. ``keep <= 0`` disables pruning entirely. Returns the list of
+    removed paths.
+    """
+    if keep <= 0:
+        return []
+    dated = []
+    for path in glob.glob(os.path.join(folder, "all_demand_projections_*.xlsx")):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(path))
+        if m:
+            dated.append((m.group(1), path))
+    dated.sort(reverse=True)  # newest date first
+    removed = []
+    for _, path in dated[keep:]:
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError as exc:
+            log.warning("Could not prune old snapshot %s: %s", path, exc)
+    if removed:
+        log.info(
+            "Pruned %d old snapshot(s), keeping newest %d: %s",
+            len(removed), keep, [os.path.basename(p) for p in removed],
+        )
+    return removed
 
 
 def ping() -> tuple[dict, object]:
@@ -397,8 +478,12 @@ def main(argv: list[str] | None = None) -> int:
         df = _apply_output_filters(df)
 
         out_path = args.out or default_out_path()
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        os.makedirs(out_dir, exist_ok=True)
         write_powerbi_xlsx(df, out_path)
+        # Prune only after the new file is safely written, so a failed/partial
+        # pull never deletes good history.
+        prune_old_snapshots(out_dir)
 
         print(f"Pulled {len(df):,} rows x {len(df.columns)} columns")
         print("Columns:", list(df.columns))
