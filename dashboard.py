@@ -1709,15 +1709,22 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
         )
         return
 
-    region_scoped = view != ALL_CUSTOMERS_VIEW and region is not None
+    # Each CUSTNMBR folds to its forecast customer group (e.g. AMAZON-DS ->
+    # AMAZON-DC); used both to scope a by-customer view and to look up the source.
+    grouping = getattr(P, "COMBINED_GROUPING", {}) if P is not None else {}
+    row_group = missing_df["CUSTNMBR"].map(lambda c: grouping.get(c, c))
+
+    # A by-customer-group view shows only that group's rows (not every customer
+    # in the region); ALL CUSTOMERS shows everything.
+    group_scoped = view != ALL_CUSTOMERS_VIEW
     table_df = missing_df
-    if region_scoped:
-        table_df = missing_df[missing_df["Region"] == region]
+    if group_scoped:
+        table_df = missing_df[row_group == view]
 
     if table_df.empty:
-        if region_scoped:
+        if group_scoped:
             st.success(
-                f"None found for {region} — every active product here has "
+                f"None found for {view} — every active product here has "
                 "future projections in the regions it is active in."
             )
         else:
@@ -1728,7 +1735,7 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
         return
 
     n_skus = table_df["SKU"].nunique()
-    scope_note = f" for {region}" if region_scoped else ""
+    scope_note = f" for {view}" if group_scoped else ""
     st.caption(
         f"Flagged{scope_note}: {n_skus:,} distinct SKUs. Each is an active "
         "product (Plytix) with no projection for one or more of the coming 15 "
@@ -1743,9 +1750,6 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
         "Last_WeekDate": "Last Missing Week",
     })
     # Data source (POS/Orders) from the summary table, keyed by (customer, SKU).
-    # CUSTNMBRs are folded to their forecast customer group (e.g. AMAZON-DS ->
-    # AMAZON-DC) so they match the group the summary was built for.
-    grouping = getattr(P, "COMBINED_GROUPING", {}) if P is not None else {}
     src_lookup = cust_source or {}
     show.insert(
         show.columns.get_loc("CUSTNMBR") + 1,
