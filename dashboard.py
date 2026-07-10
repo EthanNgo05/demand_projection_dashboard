@@ -553,6 +553,28 @@ def source_map(summary):
     return dict(zip(summary["SKU"].astype(str), summary["Data Source"]))
 
 
+def customer_source_map(summary):
+    """(Customer Grouping, SKU) -> 'POS' or 'Orders' from a summary frame.
+
+    Keyed per customer group so a table that carries raw CUSTNMBRs (e.g. the
+    missing-projections table) can be labelled with the same source the forecast
+    used for that SKU in that group. SKUs are '*'-stripped on both sides so a
+    trailing-star SKU still matches. Works for either the by-SKU summary (single
+    group) or the by-SKU-and-customer table (every group)."""
+    if summary is None or summary.empty:
+        return {}
+    if not {"Customer Grouping", "SKU", "Data Source"} <= set(summary.columns):
+        return {}
+    return {
+        (str(g), str(s).rstrip("*")): src
+        for g, s, src in zip(
+            summary["Customer Grouping"],
+            summary["SKU"],
+            summary["Data Source"],
+        )
+    }
+
+
 def historical_window(agg, summary, anchors):
     """Per SKU-week actual demand in the 8-week window, using each SKU's source.
 
@@ -1566,8 +1588,13 @@ def main():
     # ----- Active products MISSING projections in regions they ARE active in --
     # Uses the warehouse projection grid (sidebar), not the demand file.
     missing_df = compute_missing_projections(warehouse_df, plytix_df, df, P)
+    # Per-(customer group, SKU) data source to label the missing table. The
+    # by-customer table (ALL CUSTOMERS view) carries every group; otherwise the
+    # single-group summary does.
+    cust_source = customer_source_map(by_cust) or customer_source_map(summary)
     render_missing_section(
         view, region, warehouse_df, check_ran, missing_df, today_str,
+        cust_source, P,
     )
 
     # ----- Discontinued/inactive products with projections ------------------
@@ -1657,7 +1684,7 @@ def render_inactive_section(view, region, check_ran, inactive_df,
 
 
 def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
-                           today_str):
+                           today_str, cust_source=None, P=None):
     """Table of active products MISSING future projections in active regions.
 
     Ported from active_missing_projections.py. The inverse of the inactive
@@ -1715,6 +1742,19 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
         "First_WeekDate": "First Missing Week",
         "Last_WeekDate": "Last Missing Week",
     })
+    # Data source (POS/Orders) from the summary table, keyed by (customer, SKU).
+    # CUSTNMBRs are folded to their forecast customer group (e.g. AMAZON-DS ->
+    # AMAZON-DC) so they match the group the summary was built for.
+    grouping = getattr(P, "COMBINED_GROUPING", {}) if P is not None else {}
+    src_lookup = cust_source or {}
+    show.insert(
+        show.columns.get_loc("CUSTNMBR") + 1,
+        "Data Source",
+        [
+            src_lookup.get((grouping.get(c, c), str(s).rstrip("*")))
+            for s, c in zip(show["SKU"], show["CUSTNMBR"])
+        ],
+    )
     st.dataframe(
         search_filter(show, key="search_missing"),
         width="stretch", hide_index=True,
