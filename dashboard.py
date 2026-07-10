@@ -734,6 +734,28 @@ def style_summary(summary_df):
     return sty
 
 
+def search_filter(df, key, columns=None, placeholder="e.g. a SKU, region, or customer"):
+    """Render a search box above a table and return ``df`` filtered to matches.
+
+    Matches the typed query as a case-insensitive substring against every
+    column (or just ``columns`` if given). An empty query returns ``df``
+    unchanged. Each table needs a unique ``key``. Downloads should stay on the
+    unfiltered frame; this only narrows what's shown on screen.
+    """
+    query = st.text_input("🔍 Search", key=key, placeholder=placeholder).strip()
+    if not query:
+        return df
+    cols = [c for c in (columns or list(df.columns)) if c in df.columns]
+    mask = pd.Series(False, index=df.index)
+    for c in cols:
+        mask |= df[c].astype(str).str.contains(
+            query, case=False, na=False, regex=False
+        )
+    out = df[mask]
+    st.caption(f"{len(out):,} of {len(df):,} rows match “{query}”.")
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # App                                                                         #
 # --------------------------------------------------------------------------- #
@@ -1476,7 +1498,8 @@ def main():
         )
         st.caption("Ordered by largest revenue risk (by magnitude); blanks last.")
     st.dataframe(
-        style_summary(summary_table), width="stretch", hide_index=True
+        style_summary(search_filter(summary_table, key="search_by_sku")),
+        width="stretch", hide_index=True,
     )
     st.download_button(
         "⬇️ Download the summary table by SKU",
@@ -1521,7 +1544,10 @@ def main():
                 )
                 st.caption("Each SKU broken out by customer group.")
             st.dataframe(
-                style_summary(by_cust_table), width="stretch", hide_index=True
+                style_summary(
+                    search_filter(by_cust_table, key="search_by_customer")
+                ),
+                width="stretch", hide_index=True,
             )
             st.download_button(
                 "⬇️ Download the summary table by SKU and Customer",
@@ -1617,7 +1643,10 @@ def render_inactive_section(view, region, check_ran, inactive_df,
         'SKU', 'Region', 'Active in', 'Customer Grouping',
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
     ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
-    st.dataframe(show, width="stretch", hide_index=True)
+    st.dataframe(
+        search_filter(show, key="search_inactive"),
+        width="stretch", hide_index=True,
+    )
     st.download_button(
         "⬇️ Download the excluded (inactive-region) projections table",
         data=summary_to_excel(show, sheet_name="inactive_projections"),
@@ -1686,7 +1715,10 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
         "First_WeekDate": "First Missing Week",
         "Last_WeekDate": "Last Missing Week",
     })
-    st.dataframe(show, width="stretch", hide_index=True)
+    st.dataframe(
+        search_filter(show, key="search_missing"),
+        width="stretch", hide_index=True,
+    )
     st.download_button(
         "⬇️ Download the missing-projections table",
         data=summary_to_excel(show, sheet_name="missing_projections"),
@@ -1758,7 +1790,10 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
     ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
 
-    st.dataframe(disc, width="stretch", hide_index=True)
+    st.dataframe(
+        search_filter(disc, key="search_discontinued"),
+        width="stretch", hide_index=True,
+    )
     st.download_button(
         "⬇️ Download the discontinued/inactive projections table",
         data=summary_to_excel(disc, sheet_name="discontinued_projections"),
