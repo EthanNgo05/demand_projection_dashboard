@@ -276,6 +276,7 @@ def read_plytix_from_bytes(_data, name):
 WAREHOUSE_REGIONS = data_io.WAREHOUSE_REGIONS
 INACTIVE_COLS = data_io.INACTIVE_COLS
 DISCONTINUED_COLS = data_io.DISCONTINUED_COLS
+MISSING_COLS = data_io.MISSING_COLS
 _this_week_start = data_io._this_week_start
 _active_in_list = data_io._active_in_list
 _region_code = data_io._region_code
@@ -283,6 +284,7 @@ compute_active_products = data_io.compute_active_products
 compute_inactive_projections = data_io.compute_inactive_projections
 compute_discontinued_products = data_io.compute_discontinued_products
 compute_discontinued_projections = data_io.compute_discontinued_projections
+compute_missing_projections = data_io.compute_missing_projections
 
 
 # Cleaning lives in agent/data_io.py (shared with the agent's ingest node);
@@ -308,6 +310,27 @@ def load_raw_from_bytes(_data, name, model_path):
     P = load_pipeline(model_path)
     raw = pd.read_excel(BytesIO(_data), header=2)
     return _clean(raw, P)
+
+
+@st.cache_data(show_spinner="Cleaning warehouse projections…")
+def load_warehouse_from_paths(paths, _mtimes):
+    """Clean + combine warehouse exports from disk into one long frame.
+
+    ``_mtimes`` (a tuple aligned with ``paths``) busts the cache when any file
+    changes. Used by the 'missing future projections' table only.
+    """
+    return data_io.combine_warehouse_projections([(p, p) for p in paths])
+
+
+@st.cache_data(show_spinner="Cleaning warehouse projections…")
+def load_warehouse_from_uploads(items):
+    """Clean + combine uploaded warehouse exports (cached on their bytes).
+
+    ``items`` is a tuple of (name, bytes) pairs, one per uploaded file.
+    """
+    return data_io.combine_warehouse_projections(
+        [(BytesIO(data), name) for name, data in items]
+    )
 
 
 @st.cache_data(show_spinner="Loading list prices…")
@@ -962,6 +985,49 @@ def main():
                         f"({os.path.basename(price_file)})"
                     )
 
+        # ----- Warehouse projections (drive the "missing projections" table) --
+        # A DIFFERENT data source than the demand file above: the warehouse
+        # projection exports are wide grids (one per region: AU/CA/EU/JP/US) that
+        # list every active-in SKU×customer×week, with a blank cell where no
+        # projection exists. That blank is exactly what the "missing future
+        # projections" table finds, so it needs these files, not the demand file.
+        st.header("Warehouse projections")
+        warehouse_df = None
+        wh_snapshots = data_io.discover_warehouse_files()
+        with st.expander(
+            "Upload warehouse projection files (AU/CA/EU/JP/US)",
+            expanded=not wh_snapshots,
+        ):
+            if wh_snapshots:
+                wh_choice = st.selectbox(
+                    "Warehouse snapshot",
+                    list(wh_snapshots.keys()),
+                    key="warehouse_snapshot",
+                    help="Each snapshot is the set of regional warehouse exports "
+                         "sharing that date.",
+                )
+                wh_paths = tuple(wh_snapshots[wh_choice])
+                warehouse_df = load_warehouse_from_paths(
+                    wh_paths, tuple(os.path.getmtime(p) for p in wh_paths)
+                )
+                st.caption(
+                    f"{len(wh_paths)} file(s): "
+                    + ", ".join(os.path.basename(p) for p in wh_paths)
+                )
+            up_wh = st.file_uploader(
+                "AU/CA/EU/JP/US_warehouse_projections_*.xlsx",
+                type=["xlsx"], accept_multiple_files=True, key="warehouse_upload",
+                help="One wide export per region. The region is read from the "
+                     "filename prefix (AU/CA/EU/JP/US).",
+            )
+            if up_wh:
+                warehouse_df = load_warehouse_from_uploads(
+                    tuple((f.name, f.getvalue()) for f in up_wh)
+                )
+            if warehouse_df is not None and not warehouse_df.empty:
+                locs = ", ".join(sorted(warehouse_df["Location"].unique()))
+                st.success(f"{len(warehouse_df):,} projection rows ({locs})")
+
     if df is None:
         st.warning("Upload the Demand Planning Details Projections file to get started.")
         st.stop()
@@ -1471,6 +1537,13 @@ def main():
         excluded_counts_by_key, n_excluded_rows, today_str,
     )
 
+    # ----- Active products MISSING projections in regions they ARE active in --
+    # Uses the warehouse projection grid (sidebar), not the demand file.
+    missing_df = compute_missing_projections(warehouse_df, plytix_df, df, P)
+    render_missing_section(
+        view, region, warehouse_df, check_ran, missing_df, today_str,
+    )
+
     # ----- Discontinued/inactive products with projections ------------------
     render_discontinued_section(
         view, region, disc_check_ran, discontinued_df, today_str,
@@ -1485,7 +1558,7 @@ def render_inactive_section(view, region, check_ran, inactive_df,
     summary table above (the SKU isn't 'Active in' that region). Surface them so
     the exclusion is visible and auditable.
     """
-    HEADER = "### Active products with future projections in locations they are not active in"
+    HEADER = "### SKUs with forecasts in locations they are not active in"
     st.markdown(HEADER)
     if not check_ran:
         st.info(
@@ -1554,6 +1627,75 @@ def render_inactive_section(view, region, check_ran, inactive_df,
     )
 
 
+def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
+                           today_str):
+    """Table of active products MISSING future projections in active regions.
+
+    Ported from active_missing_projections.py. The inverse of the inactive
+    section above: these are active SKUs that ARE 'Active in' a region but have
+    no projection for one or more of the coming 15 weeks there. Sourced from the
+    warehouse projection grid (sidebar), the only place a blank/missing week is
+    visible. In a "By customer group" view, only rows whose region matches the
+    selected region are shown; ALL CUSTOMERS shows every region.
+    """
+    HEADER = "### SKUs missing forecasts in locations they are active in"
+    st.markdown(HEADER)
+    if warehouse_df is None or warehouse_df.empty:
+        st.info(
+            "Upload the warehouse projection files (AU/CA/EU/JP/US) in the "
+            "sidebar to run the missing-projections check."
+        )
+        return
+    if not check_ran:
+        st.info(
+            "Upload a Plytix export with an 'Active in' column (sidebar) to run "
+            "the missing-projections check."
+        )
+        return
+
+    region_scoped = view != ALL_CUSTOMERS_VIEW and region is not None
+    table_df = missing_df
+    if region_scoped:
+        table_df = missing_df[missing_df["Region"] == region]
+
+    if table_df.empty:
+        if region_scoped:
+            st.success(
+                f"None found for {region} — every active product here has "
+                "future projections in the regions it is active in."
+            )
+        else:
+            st.success(
+                "None found — every active product has future projections in "
+                "the regions it is active in."
+            )
+        return
+
+    n_skus = table_df["SKU"].nunique()
+    scope_note = f" for {region}" if region_scoped else ""
+    st.caption(
+        f"Flagged{scope_note}: {n_skus:,} distinct SKUs. Each is an active "
+        "product (Plytix) with no projection for one or more of the coming 15 "
+        "weeks in a region (US/CA/EU/JP/AU) it IS 'Active in'."
+    )
+
+    show = table_df[[
+        'SKU', 'Location', 'Active in', 'CUSTNMBR',
+        'First_WeekDate', 'Last_WeekDate',
+    ]].rename(columns={
+        "First_WeekDate": "First Missing Week",
+        "Last_WeekDate": "Last Missing Week",
+    })
+    st.dataframe(show, width="stretch", hide_index=True)
+    st.download_button(
+        "⬇️ Download the missing-projections table",
+        data=summary_to_excel(show, sheet_name="missing_projections"),
+        file_name=f"missing_projections_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_missing_projections",
+    )
+
+
 def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
                                 today_str):
     """Table of Discontinued/Inactive products that still carry projections.
@@ -1562,7 +1704,7 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
     view, only rows whose region matches the selected region are shown (e.g. an
     EU view won't list AAFES, a US customer); ALL CUSTOMERS shows every region.
     """
-    HEADER = "### Inactive/discontinued products with future projections"
+    HEADER = "### Inactive/discontinued SKUs with forecasts"
     st.markdown(HEADER)
     if not disc_check_ran:
         st.info(

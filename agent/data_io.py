@@ -20,6 +20,7 @@ import re
 from typing import NamedTuple
 
 import numpy as np
+import openpyxl
 import pandas as pd
 
 from agent.config import MODEL_OPTIONS
@@ -466,3 +467,220 @@ def apply_exclusions(df, plytix_df, P, anchors=None):
         n_disc_rows=n_disc_rows,
         n_disc_skus=n_disc_skus,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Warehouse projection exports -> "missing future projections" table.          #
+#                                                                              #
+# Ported from active_missing_projections.py. This uses a DIFFERENT data source #
+# than everything above: the warehouse projection exports (one wide grid per   #
+# region, raw_inputs/warehouse_projections), NOT the demand-projection frame   #
+# the dashboard forecasts. The demand file only carries SKU×customer combos    #
+# that already have projections, so a *missing* projection is only visible in   #
+# the warehouse grid, which lists every active-in SKU×customer×week with a NaN  #
+# cell where no projection exists.                                             #
+# --------------------------------------------------------------------------- #
+
+# Region prefix on a warehouse filename (e.g. "AU_warehouse_projections_*.xlsx").
+REGION_PREFIXES = ("AU", "CA", "EU", "JP", "US")
+
+WAREHOUSE_DIRNAME = "raw_inputs/warehouse_projections"
+
+# Long-format columns produced when a wide warehouse grid is melted.
+WAREHOUSE_LONG_COLS = ["SKU", "CUSTNMBR", "WeekDate", "Projection", "Location"]
+
+MISSING_COLS = [
+    "SKU", "Location", "Region", "Active in", "CUSTNMBR",
+    "First_WeekDate", "Last_WeekDate",
+]
+
+
+def _warehouse_dir(warehouse_dir=None):
+    """Resolve the folder holding the warehouse projection exports.
+
+    Honours WAREHOUSE_RAW_DIR if set; otherwise uses the standard location,
+    resolved relative to the repo root when it is a relative path."""
+    folder = warehouse_dir or os.environ.get("WAREHOUSE_RAW_DIR") or WAREHOUSE_DIRNAME
+    if not os.path.isabs(folder):
+        folder = os.path.join(HERE, folder)
+    return folder
+
+
+def warehouse_glob(warehouse_dir=None):
+    """Glob matching every warehouse export in the warehouse folder."""
+    return os.path.join(_warehouse_dir(warehouse_dir), "*.xlsx")
+
+
+def discover_warehouse_files(warehouse_dir=None):
+    """Return {snapshot_date: [paths]} for warehouse exports, newest date first.
+
+    Each snapshot date normally has one file per region (AU/CA/EU/JP/US), so we
+    group by the date embedded in the filename (files without a date land under
+    "undated")."""
+    groups = {}
+    for path in glob.glob(warehouse_glob(warehouse_dir)):
+        d = _date_from_name(path) or "undated"
+        groups.setdefault(d, []).append(path)
+    for paths in groups.values():
+        paths.sort()
+    return dict(sorted(groups.items(), reverse=True))
+
+
+def _warehouse_region(name):
+    """Region code (AU/CA/EU/JP/US) from a warehouse filename, or None."""
+    base = os.path.basename(str(name))
+    return next((p for p in REGION_PREFIXES if base.startswith(p)), None)
+
+
+def warehouse_wide_to_long(source, name=None):
+    """Clean one wide warehouse export into a long frame with a Location column.
+
+    ``source`` is a filesystem path or a file-like object (e.g. a BytesIO of an
+    uploaded workbook); ``name`` supplies the filename used to detect the region
+    prefix (defaults to ``source`` when it is a path). Returns (long_df,
+    location), or (None, None) if the name has no known region prefix.
+
+    Ported verbatim from active_missing_projections.py: unmerge the SKU column
+    and forward-fill it, cut the footer notes, then melt wide -> long. Blank
+    projection cells are kept as NaN (that is exactly what "missing" means).
+    """
+    name = name if name is not None else source
+    location = _warehouse_region(name)
+    if location is None:
+        return None, None
+
+    # 1) Load with openpyxl so we can unmerge the SKU column and propagate its value
+    wb = openpyxl.load_workbook(source, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    for merged_range in list(ws.merged_cells.ranges):
+        top_left_value = ws.cell(row=merged_range.min_row, column=merged_range.min_col).value
+        ws.unmerge_cells(str(merged_range))
+        for row in ws.iter_rows(
+            min_row=merged_range.min_row, max_row=merged_range.max_row,
+            min_col=merged_range.min_col, max_col=merged_range.max_col,
+        ):
+            for cell in row:
+                cell.value = top_left_value
+
+    raw = pd.DataFrame(ws.values)
+
+    # 2) Row 0 = title row with week dates starting at column index 2
+    #    Row 1 = "SKU" / "CUSTNMBR" / "Proj..." labels
+    #    Row 2+ = actual data, until a blank row (end of data / start of footer)
+    week_dates = raw.iloc[0, 2:].tolist()
+    data = raw.iloc[2:].reset_index(drop=True)
+
+    # Stop at the first row with no customer AND no projection values at all
+    # (cuts off the blank separator row + the "Applied filters..." footer note).
+    def is_end_row(row):
+        return pd.isna(row[1]) and row[2:].isna().all()
+
+    end_idx = len(data)
+    for i, row in data.iterrows():
+        if is_end_row(row):
+            end_idx = i
+            break
+    data = data.iloc[:end_idx]
+
+    # Forward-fill SKU since it only appears on the first row of each merged block
+    data[0] = data[0].ffill()
+
+    # 3) Melt wide -> long
+    data.columns = ["SKU", "CUSTNMBR"] + week_dates
+    long_df = data.melt(
+        id_vars=["SKU", "CUSTNMBR"],
+        value_vars=week_dates,
+        var_name="WeekDate",
+        value_name="Projection",
+    )
+    long_df = long_df.sort_values(["SKU", "CUSTNMBR", "WeekDate"]).reset_index(drop=True)
+    long_df["Location"] = location
+    return long_df, location
+
+
+def combine_warehouse_projections(sources):
+    """Clean and concatenate many warehouse exports into one long frame.
+
+    ``sources`` is an iterable of (source, name) pairs, where ``source`` is a
+    path or file-like object and ``name`` is the filename (for region
+    detection). Files whose name lacks a region prefix are skipped. Returns an
+    empty (but correctly-columned) frame when nothing usable is provided.
+    """
+    frames = []
+    for source, name in sources:
+        long_df, _ = warehouse_wide_to_long(source, name)
+        if long_df is not None:
+            frames.append(long_df)
+    if not frames:
+        return pd.DataFrame(columns=WAREHOUSE_LONG_COLS)
+    return pd.concat(frames, ignore_index=True)
+
+
+def compute_missing_projections(projections, plytix_df, df, P):
+    """Active SKUs missing future projections in regions they ARE 'Active in'.
+
+    Mirrors active_missing_projections.py: from the combined warehouse grid
+    (``projections``), keep the NaN projection cells, intersect with active
+    products in a region that IS in their Plytix 'Active in' list, restrict to
+    the coming 15-week window, and roll up to one row per SKU×Location×customer
+    with the first/last missing week. A Region label (via the pipeline's
+    region_for_group) is added from ``df``'s customer groupings so a
+    by-customer-group view can scope to its own region, matching the sibling
+    excluded tables.
+
+    Returns a table (columns = MISSING_COLS), empty if none or inputs missing.
+    """
+    active_sku_set, sku_active_in = compute_active_products(plytix_df)
+    if not active_sku_set or projections is None or projections.empty:
+        return pd.DataFrame(columns=MISSING_COLS)
+
+    # Missing projection cells only.
+    missing = projections[projections["Projection"].isna()].copy()
+    if missing.empty:
+        return pd.DataFrame(columns=MISSING_COLS)
+
+    # Active (SKU, Location) pairs, restricted to the warehouse regions.
+    pairs = [
+        (sku, loc)
+        for sku in active_sku_set
+        for loc in _active_in_list(sku_active_in, sku)
+        if loc in WAREHOUSE_REGIONS
+    ]
+    if not pairs:
+        return pd.DataFrame(columns=MISSING_COLS)
+    active_pairs = pd.DataFrame(pairs, columns=["SKU", "Location"]).drop_duplicates()
+
+    m = active_pairs.merge(missing, on=["SKU", "Location"], how="inner")
+    if m.empty:
+        return pd.DataFrame(columns=MISSING_COLS)
+
+    # Coming 15-week window (today < WeekDate <= today + 15 weeks), per notebook.
+    m["WeekDate"] = pd.to_datetime(m["WeekDate"])
+    today = pd.Timestamp.today().normalize()
+    cutoff = today + pd.Timedelta(weeks=15)
+    m = m[(m["WeekDate"] > today) & (m["WeekDate"] <= cutoff)]
+    if m.empty:
+        return pd.DataFrame(columns=MISSING_COLS)
+
+    g = m.groupby(["SKU", "Location", "CUSTNMBR"], as_index=False).agg(
+        First_WeekDate=("WeekDate", "min"),
+        Last_WeekDate=("WeekDate", "max"),
+    )
+    # Full (un-exploded) 'Active in' string per SKU, e.g. "US,CA,UK,SG,EU,AU".
+    g["Active in"] = g["SKU"].map(lambda s: sku_active_in.get(s))
+
+    # Region label from the Location code, consistent with the sibling tables
+    # (e.g. Location "JP" -> "JP (NETDEPOT)"). Fall back to the raw code when a
+    # region has no customer group in the demand frame.
+    code_to_label = {}
+    if df is not None and not df.empty:
+        for grp in df["Customer Grouping"].dropna().unique():
+            code = _region_code(P, grp)
+            if code is not None:
+                code_to_label[code] = P.region_for_group(grp)
+    g["Region"] = g["Location"].map(code_to_label).fillna(g["Location"])
+
+    return g[MISSING_COLS].sort_values(
+        ["SKU", "Location", "CUSTNMBR"]
+    ).reset_index(drop=True)
