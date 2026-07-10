@@ -39,6 +39,8 @@ import os
 import re
 import sys
 import glob
+import html
+import json
 import inspect
 import logging
 import tempfile
@@ -50,6 +52,12 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+# Shared, Streamlit-free I/O (Phase 2 of the agentic workflow): file discovery
+# and raw-frame cleaning live in agent/data_io.py so the dashboard and the
+# LangGraph agent share one source of truth. The @st.cache_data wrappers below
+# stay here, wrapping thin calls into the shared module.
+from agent import data_io
 
 # --------------------------------------------------------------------------- #
 # Logging                                                                     #
@@ -88,7 +96,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # sidebar toggle to the pipeline file implementing it. When a DEMAND_PIPELINE
 # env var is set, that file is offered as an extra option and is the default.
 MODEL_OPTIONS = {
-    "Simple Regression": os.path.join(HERE, "models/regression.py"),
+    "8-Week Moving Average": os.path.join(HERE, "models/regression.py"),
     "Holt's Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
 }
@@ -215,333 +223,71 @@ def _supports_autofit(P):
 
 
 def _raw_dir():
-    """Resolve the folder holding the raw + price files.
-
-    Honours DEMAND_RAW_DIR if set; otherwise uses the pipeline's own
-    RAW_INPUTS_FOLDER constant (e.g. ``raw_inputs/demand_projections``), resolved
-    relative to this file when it is a relative path. This means moving the raw
-    folder in the pipeline is picked up here automatically.
-    """
-    P = load_pipeline(pipeline_path())
-    folder = os.environ.get("DEMAND_RAW_DIR")
-    if folder is None:
-        folder = getattr(P, "RAW_INPUTS_FOLDER", None)
-        if folder is None:
-            # Older pipeline without the constant: derive it from INPUT_GLOB
-            # if present, otherwise use the standard default location.
-            input_glob = getattr(P, "INPUT_GLOB", None)
-            folder = (
-                os.path.dirname(input_glob)
-                if input_glob
-                else "raw_inputs/demand_projections"
-            )
-        if not os.path.isabs(folder):
-            folder = os.path.join(HERE, folder)
-    return folder
+    """Resolve the folder holding the raw + price files (agent/data_io.py)."""
+    return data_io._raw_dir(load_pipeline(pipeline_path()))
 
 
 def raw_glob():
     """Build the raw-file glob, tracking the pipeline's RAW_INPUTS_FOLDER."""
-    return os.path.join(_raw_dir(), "all_demand_projections_*.xlsx")
+    return data_io.raw_glob(load_pipeline(pipeline_path()))
 
 
 def price_glob():
-    """Build the list-price glob, mirroring the pipeline's LIST_PRICE_GLOB.
-
-    The pipeline's glob (folder included) is used as-is, resolved relative to
-    this file when it is a relative path — so the dashboard always scans the
-    same folder the batch pipeline does, regardless of the working directory
-    Streamlit was launched from.
-    """
-    P = load_pipeline(pipeline_path())
-    pattern = getattr(
-        P, "LIST_PRICE_GLOB",
-        os.path.join("raw_inputs/list_prices", "list_prices_*.xlsx"),
-    )
-    if not os.path.isabs(pattern):
-        pattern = os.path.join(HERE, pattern)
-    return pattern
+    """Build the list-price glob, mirroring the pipeline's LIST_PRICE_GLOB."""
+    return data_io.price_glob(load_pipeline(pipeline_path()))
 
 
 def discover_price_file():
     """Newest list-price file in the raw folder, or None if there isn't one."""
-    matches = glob.glob(price_glob())
-    return max(matches, key=os.path.getmtime) if matches else None
+    return data_io.discover_price_file(load_pipeline(pipeline_path()))
 
 
-def _date_from_name(name):
-    m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(name))
-    return m.group(1) if m else None
+_date_from_name = data_io._date_from_name
 
 
 def discover_raw_files():
     """Return [(date_str, path)] newest first, mirroring resolve_input_file()."""
-    out = []
-    for path in glob.glob(raw_glob()):
-        d = _date_from_name(path)
-        if d:
-            out.append((d, path))
-    return sorted(out, reverse=True)
+    return data_io.discover_raw_files(load_pipeline(pipeline_path()))
 
 
 # --------------------------------------------------------------------------- #
-# "Active in" check (ported from inactive_projections.ipynb): active products  #
-# should only carry projections in regions they are Active in. Projections in   #
-# any other region are flagged, dropped from the forecast, and surfaced in     #
-# their own table. The check reads the demand file directly — the same data    #
-# the dashboard forecasts.                                                     #
+# Plytix-based SKU exclusions live in agent/data_io.py (streamlit-free) so the #
+# dashboard and the agent's ingest node drop the EXACT same rows before        #
+# forecasting: a SKU is never projected or flagged when it is discontinued/    #
+# inactive, or in a region it is not "Active in" (see data_io.apply_exclusions #
+# and its use in main()). The aliases keep the dashboard's call sites          #
+# unchanged; the cached readers stay here because @st.cache_data is            #
+# Streamlit-only.                                                              #
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner="Reading Plytix export…")
 def read_plytix_from_path(path, _mtime):
     """Read the raw Plytix export from disk (for the 'Active in' check)."""
-    return pd.read_excel(path)
+    return data_io.read_plytix(path)
 
 
 @st.cache_data(show_spinner="Reading Plytix export…")
 def read_plytix_from_bytes(_data, name):
     """Read the raw Plytix export from uploaded bytes (for the 'Active in' check)."""
-    return pd.read_excel(BytesIO(_data))
+    return data_io.read_plytix(BytesIO(_data))
 
 
-INACTIVE_COLS = [
-    "SKU", "Location", "Region", "Active in", "Customer Grouping",
-    "CUSTNMBR", "First_WeekDate", "Last_WeekDate", "Original_Projection", "Source",
-]
+# Filter logic + constants live in agent/data_io.py (single source of truth);
+# these aliases keep the dashboard's existing call sites unchanged.
+WAREHOUSE_REGIONS = data_io.WAREHOUSE_REGIONS
+INACTIVE_COLS = data_io.INACTIVE_COLS
+DISCONTINUED_COLS = data_io.DISCONTINUED_COLS
+_this_week_start = data_io._this_week_start
+_active_in_list = data_io._active_in_list
+_region_code = data_io._region_code
+compute_active_products = data_io.compute_active_products
+compute_inactive_projections = data_io.compute_inactive_projections
+compute_discontinued_products = data_io.compute_discontinued_products
+compute_discontinued_projections = data_io.compute_discontinued_projections
 
 
-def _this_week_start():
-    """Sunday-anchored start of the current week as a Timestamp.
-
-    WeekDates fall on Sunday-anchored 7-day boundaries, so "this week" is the
-    most recent Sunday on or before today (e.g. today 7/7 -> 7/5). Shared by the
-    excluded-table future-projection column and its "future only" toggle so both
-    use the exact same boundary.
-    """
-    today = pd.Timestamp.today().normalize()
-    return today - pd.Timedelta(days=(today.weekday() + 1) % 7)
-
-
-def _active_in_list(sku_active_in, sku):
-    """The list of regions a SKU is 'Active in' (e.g. ['US', 'CA', 'EU'])."""
-    return [x.strip() for x in str(sku_active_in.get(sku, "")).split(",")]
-
-
-def compute_active_products(plytix_df):
-    """From the Plytix export, the set of active-product SKUs and a
-    SKU -> 'Active in' string lookup.
-
-    "Active product" mirrors inactive_projections.ipynb: SKU Status == Active,
-    SKU Type == Product, and SKUs starting LS/AS excluded. Trailing '*' markers
-    are stripped so SKUs line up with the demand file.
-
-    Returns (active_sku_set, sku_active_in) or (None, None) if the Plytix export
-    lacks the columns the check needs (an older list-price file).
-    """
-    required = {"SKU", "SKU Status", "SKU Type", "Active in"}
-    if plytix_df is None or not required.issubset(plytix_df.columns):
-        return None, None
-    p = plytix_df.copy()
-    p["SKU"] = p["SKU"].astype(str).str.rstrip("*")
-    act = p[(p["SKU Status"] == "Active") & (p["SKU Type"] == "Product")]
-    act = act[~act["SKU"].str.startswith(("LS", "AS"))]
-    active_sku_set = set(act["SKU"])
-    # Full (un-exploded) Active-in string per SKU, e.g. "US,CA,UK,SG,EU,AU".
-    sku_active_in = dict(zip(p["SKU"], p["Active in"].astype(str)))
-    return active_sku_set, sku_active_in
-
-
-def _region_code(P, grouping):
-    """Two-letter region code for a customer grouping (US/CA/EU/JP/AU), or None.
-
-    The pipeline's region_for_group returns labels like "JP (NETDEPOT)" or
-    "US (LBC+NJ)"; the leading two letters are the region code we match against
-    Plytix 'Active in'. Anything else (e.g. "Other") returns None.
-    """
-    try:
-        label = P.region_for_group(grouping)
-    except Exception:
-        return None
-    code = str(label)[:2].upper()
-    return code if code in WAREHOUSE_REGIONS else None
-
-
-def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
-                                 anchors=None):
-    """Active products showing up in a region they are not 'Active in'.
-
-    This is the fix for cases like ST1082 (active in US/CA/UK/SG/EU/AU but not
-    JP), which still appeared in the JP (NETDEPOT) summary: the dashboard builds
-    a forward forecast for any SKU with demand history in a region. We look at
-    the *demand file itself* — the same data the dashboard forecasts — map each
-    customer to its region via the pipeline's region_for_group, and flag any
-    active product whose region is not in its Plytix 'Active in' list.
-
-    Returns a table (columns = INACTIVE_COLS) of the flagged
-    SKU x customer x region combinations, empty if none or inputs are missing.
-    """
-    if not active_sku_set or not sku_active_in:
-        return pd.DataFrame(columns=INACTIVE_COLS)
-
-    frames = []
-
-    # ----- Primary: the demand file, by customer-group region ---------------
-    if df is not None and not df.empty:
-        m = df.copy()
-        m["SKU"] = m["SKU"].astype(str).str.rstrip("*")
-        m = m[m["SKU"].isin(active_sku_set)]
-        if not m.empty:
-            m["Region"] = m["Customer Grouping"].map(
-                lambda g: P.region_for_group(g)
-            )
-            m["Location"] = m["Customer Grouping"].map(
-                lambda g: _region_code(P, g)
-            )
-            m = m[m["Location"].notna()]
-            keep = [
-                loc not in _active_in_list(sku_active_in, sku)
-                for sku, loc in zip(m["SKU"], m["Location"])
-            ]
-            m = m[keep]
-            m["WeekDate"] = pd.to_datetime(m["WeekDate"])
-            # Only flag pairs the dashboard would actually forecast — i.e. that
-            # carry a POS/Orders demand signal in the historical window (that is
-            # exactly what puts a SKU in a region's summary). Without anchors we
-            # fall back to any presence.
-            if anchors is not None and not m.empty:
-                lb, lcw, _ = anchors
-                sig = (
-                    (m["WeekDate"] >= lb) & (m["WeekDate"] <= lcw)
-                    & (m["POS"].notna() | m.get("Orders", pd.Series(index=m.index)).notna())
-                )
-                live = m.loc[sig, ["SKU", "CUSTNMBR", "Location"]].drop_duplicates()
-                m = m.merge(live, on=["SKU", "CUSTNMBR", "Location"], how="inner")
-            if not m.empty:
-                # Original projection over future weeks (this week onward) —
-                # averaged per week — the projected weekly volume being excluded
-                # going forward. Uses the same week boundary as the excluded
-                # table's "future only" toggle.
-                m["_future_proj"] = pd.to_numeric(
-                    m["Projection"], errors="coerce"
-                ).where(m["WeekDate"] >= _this_week_start())
-                g = m.groupby(
-                    ["SKU", "Location", "Region", "Customer Grouping", "CUSTNMBR"],
-                    as_index=False,
-                ).agg(
-                    First_WeekDate=("WeekDate", "min"),
-                    Last_WeekDate=("WeekDate", "max"),
-                    Original_Projection=("_future_proj", "mean"),
-                )
-                g["Active in"] = g["SKU"].map(lambda s: sku_active_in.get(s))
-                g["Source"] = "Demand file"
-                frames.append(g)
-
-    if not frames:
-        return pd.DataFrame(columns=INACTIVE_COLS)
-
-    out = pd.concat(frames, ignore_index=True)[INACTIVE_COLS]
-    out = out.drop_duplicates(subset=["SKU", "Location", "CUSTNMBR"], keep="first")
-    return out.sort_values(["SKU", "Location", "CUSTNMBR"]).reset_index(drop=True)
-
-
-# --------------------------------------------------------------------------- #
-# Discontinued/inactive-product check (ported from                             #
-# discontinued_with_projections.ipynb): a SKU marked Discontinued or Inactive  #
-# in Plytix should not carry forward-looking projections. We look at the       #
-# demand file, keep the SKUs whose Plytix status is Discontinued/Inactive,     #
-# and surface any that still have future projection weeks.                     #
-# --------------------------------------------------------------------------- #
-DISCONTINUED_COLS = [
-    "SKU", "SKU Status", "Region", "Customer Grouping", "CUSTNMBR",
-    "First_WeekDate", "Last_WeekDate", "Original_Projection",
-]
-
-
-def compute_discontinued_products(plytix_df):
-    """SKU -> 'SKU Status' lookup for Discontinued/Inactive products.
-
-    Mirrors discontinued_with_projections.ipynb: keep rows whose SKU Status is
-    'Discontinued' or 'Inactive'. Trailing '*' markers are stripped so SKUs line
-    up with the demand file. Returns None if the Plytix export lacks the columns
-    the check needs (an older list-price file).
-    """
-    required = {"SKU", "SKU Status"}
-    if plytix_df is None or not required.issubset(plytix_df.columns):
-        return None
-    p = plytix_df.copy()
-    p["SKU"] = p["SKU"].astype(str).str.rstrip("*")
-    disc = p[p["SKU Status"].isin(["Discontinued", "Inactive"])]
-    return dict(zip(disc["SKU"], disc["SKU Status"]))
-
-
-def compute_discontinued_projections(df, disc_status, P):
-    """Discontinued/inactive products that still carry future projections.
-
-    Ported from discontinued_with_projections.ipynb: intersect the demand file
-    with the discontinued/inactive SKU set, keep only future projection weeks
-    (WeekDate after today), and aggregate to one row per SKU x customer with the
-    first/last projected week. A Region column (via the pipeline's
-    region_for_group) is added so a by-customer-group view can be scoped to its
-    own region.
-
-    Returns a table (columns = DISCONTINUED_COLS), empty if none or inputs are
-    missing.
-    """
-    if not disc_status or df is None or df.empty:
-        return pd.DataFrame(columns=DISCONTINUED_COLS)
-
-    m = df.copy()
-    m["SKU"] = m["SKU"].astype(str).str.rstrip("*")
-    m = m[m["SKU"].isin(disc_status)]
-    if m.empty:
-        return pd.DataFrame(columns=DISCONTINUED_COLS)
-
-    # Future projections only. Like the active-in table, "future" starts at the
-    # beginning of the current week (Sunday-anchored via _this_week_start), so
-    # the in-progress week is included — e.g. 7/5 counts while the 7/7 week is
-    # not yet over.
-    m["WeekDate"] = pd.to_datetime(m["WeekDate"])
-    week_start = _this_week_start()
-    m = m[m["WeekDate"] >= week_start]
-    if m.empty:
-        return pd.DataFrame(columns=DISCONTINUED_COLS)
-
-    m["Region"] = m["Customer Grouping"].map(lambda g: P.region_for_group(g))
-    m["_future_proj"] = pd.to_numeric(m["Projection"], errors="coerce")
-    g = m.groupby(
-        ["SKU", "Region", "Customer Grouping", "CUSTNMBR"], as_index=False,
-    ).agg(
-        First_WeekDate=("WeekDate", "min"),
-        Last_WeekDate=("WeekDate", "max"),
-        Original_Projection=("_future_proj", "mean"),
-    )
-    g["SKU Status"] = g["SKU"].map(lambda s: disc_status.get(s))
-    out = g[DISCONTINUED_COLS]
-    return out.sort_values(["SKU", "CUSTNMBR"]).reset_index(drop=True)
-
-
-def _clean(raw_df, P):
-    """Apply the exact preprocessing from the pipeline's __main__ block.
-
-    Mirrors the updated pipeline: 'Sum of Quantity' -> Orders, and POS / Orders /
-    Projection are all carried through. Falls back gracefully if an older file
-    lacks the Orders column (an all-NaN Orders column is added so the
-    POS-then-Orders logic still runs without a KeyError).
-    """
-    rename = {"'Demand'[DisplaySKU]": "SKU", "Custnmbr": "CUSTNMBR"}
-    if "Sum of Quantity" in raw_df.columns:
-        rename["Sum of Quantity"] = "Orders"
-    df = raw_df.rename(columns=rename)
-
-    if "Orders" not in df.columns:
-        df["Orders"] = np.nan  # legacy file without an Orders/Sum of Quantity col
-
-    df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
-    df = df[~df["CUSTNMBR"].isin(P.CUSTOMERS_TO_IGNORE)]
-    df["WeekDate"] = pd.to_datetime(df["WeekDate"])
-    df["Customer Grouping"] = (
-        df["CUSTNMBR"].map(P.COMBINED_GROUPING).fillna(df["CUSTNMBR"])
-    )
-    return df
+# Cleaning lives in agent/data_io.py (shared with the agent's ingest node);
+# the alias keeps the dashboard's internal call sites unchanged.
+_clean = data_io._clean
 
 
 @st.cache_data(show_spinner="Loading raw data…")
@@ -968,6 +714,112 @@ def style_summary(summary_df):
 # --------------------------------------------------------------------------- #
 # App                                                                         #
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Agent integration (Phase 5)                                                 #
+# --------------------------------------------------------------------------- #
+# The LangGraph agent runs out-of-band and writes its result to
+# outputs/agent_summary_{view}.json (see agent/nodes/publish.py). The dashboard
+# only reads that JSON back — it never threads LangGraph's execution model into
+# Streamlit's rerun-on-every-interaction model. The agent is invoked strictly
+# on an explicit button click (it calls an LLM and backtests every model), and
+# the last result is shown from the cached JSON on subsequent reruns.
+
+# Friendly sidebar label -> the LLM_PROVIDER value agent/llm.py resolves at call
+# time. "anthropic" = Claude API (ANTHROPIC_API_KEY); "local" = the
+# OpenAI-compatible server in LOCAL_LLM_* (see agent/config.py and .env.example).
+LLM_PROVIDERS = {
+    "Anthropic (Claude API)": "anthropic",
+    "Local LLM": "local",
+}
+
+
+def _agent_summary_path(view):
+    """Path publish.py writes for a given view (same view->filename mangling)."""
+    safe_view = view.replace(" ", "_").replace("/", "-")
+    return os.path.join(HERE, "outputs", f"agent_summary_{safe_view}.json")
+
+
+def _load_agent_summary(view):
+    """Last agent run for this view, or None if it hasn't run / is unreadable."""
+    path = _agent_summary_path(view)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _render_agent_summary(view):
+    """Render the cached agent summary for `view` in the main body, if any."""
+    payload = _load_agent_summary(view)
+    if payload is None:
+        return
+    with st.expander("Agent summary", expanded=True):
+        gen = payload.get("generated_at")
+        if gen:
+            st.caption(f"Generated {gen}  ·  view: {payload.get('view', view)}")
+
+        if payload.get("errors"):
+            st.error("\n".join(payload["errors"]))
+
+        best = payload.get("best_model")
+        if best:
+            mae = (payload.get("mae_by_model") or {}).get(best)
+            label = f"Best model: {best}"
+            if mae is not None:
+                label += f"  (backtest MAE {mae:.1f})"
+            if payload.get("confidence_flag"):
+                st.warning(label + "  —  ⚠️ low confidence")
+            else:
+                st.success(label)
+
+        if payload.get("narrative"):
+            st.write(payload["narrative"])
+
+        anomalies = payload.get("anomalies") or []
+        if anomalies:
+            st.markdown("**Flagged anomalies:**")
+            for a in anomalies:
+                # publish stores bullets as-is; add a marker only if missing.
+                st.markdown(a if a.lstrip().startswith(("-", "*", "•")) else f"- {a}")
+
+        # Active SKUs the winning model leaves out because their demand predates
+        # its history window (e.g. the 8-week moving average). Surfaced so a SKU
+        # that an all-history model (Holt/XGBoost) would forecast isn't silently
+        # dropped without explanation. Empty for an all-history winner.
+        excluded = payload.get("window_excluded_skus") or []
+        if excluded:
+            best_lbl = payload.get("best_model") or "this model"
+            # Rendered as a native HTML <details> dropdown (collapsed by
+            # default) so this list — often 15+ SKUs — doesn't dominate the
+            # summary. A Streamlit st.expander can't be used here: it's illegal
+            # to nest one inside the "Agent summary" expander this runs in.
+            items = "".join(
+                "<li>{}{}</li>".format(
+                    html.escape(str(row.get("SKU", ""))),
+                    " — " + html.escape(str(row.get("Description", "")))
+                    if row.get("Description")
+                    else "",
+                )
+                for row in excluded
+            )
+            st.markdown(
+                "<details style='margin:0.25rem 0 0.5rem;'>"
+                "<summary style='cursor:pointer;font-weight:600;'>"
+                f"Active SKUs outside {html.escape(best_lbl)}'s history window "
+                f"({len(excluded)})</summary>"
+                "<div style='opacity:0.75;font-size:0.9em;margin:0.35rem 0;'>"
+                "These have demand history but none inside the model's window, "
+                "so they carry no projection here. Switch to an all-history "
+                "model (Holt or XGBoost) to forecast them.</div>"
+                f"<ul style='margin:0;padding-left:1.2rem;'>{items}</ul>"
+                "</details>",
+                unsafe_allow_html=True,
+            )
+
+
 def main():
     st.set_page_config(
         page_title="Demand Projections", page_icon="📦", layout="wide"
@@ -979,7 +831,11 @@ def main():
     st.markdown(
         f"""
         <style>
-        section[data-testid="stSidebar"] {{
+        /* Only widen the sidebar while it's expanded. Scoping to
+           aria-expanded="true" lets Streamlit's collapse animation drive the
+           width to 0 when hidden, so the main content reclaims the full width
+           instead of the min-width pinning it open. */
+        section[data-testid="stSidebar"][aria-expanded="true"] {{
             width: {SIDEBAR_WIDTH_PX}px !important;
             min-width: {SIDEBAR_WIDTH_PX}px !important;
         }}
@@ -1003,16 +859,24 @@ def main():
             st.stop()
 
         def _on_model_change():
-            # Bump the parameter nonce so the sliders are rebuilt as fresh
-            # widgets keyed to the new nonce, re-reading the newly selected
-            # pipeline's value= defaults. (A structural change also recomputes
-            # automatically via the compute gate.)
-            st.session_state["param_nonce"] = (
-                st.session_state.get("param_nonce", 0) + 1
-            )
             # Autofitted parameters belong to the previous model; drop them so
-            # the new pipeline starts from its own file defaults.
+            # the new pipeline re-autofits (or falls back to its file defaults).
+            # A structural change also recomputes automatically via the compute
+            # gate.
             st.session_state.pop("autofit_params", None)
+
+        # After "Run Agent Summary" picks a best model, switch the toggle to it
+        # so the screen shows that model. The switch is stashed as a pending key
+        # (the button handler runs *after* this widget) and applied here, before
+        # the radio is instantiated — Streamlit forbids writing a widget-keyed
+        # value once its widget exists this run. We replicate _on_model_change's
+        # side effects since applying it programmatically doesn't fire on_change.
+        pending_model = st.session_state.pop("_pending_model_choice", None)
+        if pending_model in MODEL_OPTIONS and pending_model != st.session_state.get(
+            "model_choice"
+        ):
+            st.session_state["model_choice"] = pending_model
+            _on_model_change()
 
         st.radio(
             "Forecasting model", list(MODEL_OPTIONS.keys()),
@@ -1030,8 +894,8 @@ def main():
     elif _supports_smoothing(P):
         st.caption(
             "15-week Holt damped-trend forecast from the historical demand "
-            "window (POS where available, else Orders). Tune the smoothing "
-            "(α/β/φ) in the sidebar — changes recompute live."
+            "window (POS where available, else Orders). Smoothing (α/β/φ) is "
+            "autofitted per view by backtesting."
         )
     else:
         tw = getattr(P, "TREND_WEIGHT", None)
@@ -1132,67 +996,34 @@ def main():
     today_ts = pd.Timestamp(today_str)
     lb, lcw, ffw = P.week_anchors(today_ts)
 
-    # ----- Active-in check: flag + drop out-of-region projections ----------
-    # An active product should only be forecast in a region it is 'Active in'
-    # (per the Plytix export). We look at the demand file itself — mapping each
-    # customer to its region via the pipeline's region_for_group — and flag any
-    # active product whose region is not in its 'Active in' list (e.g. ST1082,
-    # active in US/CA/UK/SG/EU/AU, appearing under JP (NETDEPOT)). Those SKU ×
-    # customer rows are then dropped from the data BEFORE forecasting and
-    # surfaced in their own table.
-    active_sku_set, sku_active_in = compute_active_products(plytix_df)
-    check_ran = active_sku_set is not None
-    inactive_df = compute_inactive_projections(
-        df, active_sku_set, sku_active_in, P,
-        anchors=(lb, lcw, ffw),
-    )
-
-    # ----- Discontinued/inactive-product check -----------------------------
-    # Flag SKUs marked Discontinued/Inactive in Plytix that still carry future
-    # projections (ported from discontinued_with_projections.ipynb). These SKUs
-    # are then dropped from the data BEFORE forecasting — a discontinued product
-    # should not appear in the summary, projections or revenue figures — and
-    # surfaced in their own table below.
-    disc_status = compute_discontinued_products(plytix_df)
-    disc_check_ran = disc_status is not None
-    discontinued_df = compute_discontinued_projections(df, disc_status, P)
-    n_excluded_rows = 0
-    excluded_counts_by_key = pd.Series(dtype="int64")
-    if not inactive_df.empty:
-        exclude_keys = {
-            f"{str(s)}||{str(c)}"
-            for s, c in zip(inactive_df["SKU"], inactive_df["CUSTNMBR"])
-        }
-        key = df["SKU"].astype(str).str.rstrip("*") + "||" + df["CUSTNMBR"].astype(str)
-        drop_mask = key.isin(exclude_keys)
-        n_excluded_rows = int(drop_mask.sum())
-        # Per SKU||CUSTNMBR demand-row counts, so the excluded table can report
-        # accurate row totals when scoped to a single region's view below.
-        excluded_counts_by_key = key[drop_mask].value_counts()
-        if n_excluded_rows:
-            df = df[~drop_mask].reset_index(drop=True)
-            logger.info(
-                "Active-in check: dropped %d raw rows across %d SKU×customer×"
-                "region combos not in the SKU's 'Active in' list.",
-                n_excluded_rows, len(inactive_df),
-            )
-
-    # Drop discontinued/inactive SKUs entirely so they are excluded from every
-    # summary, projection and revenue figure below. The status is SKU-level, so
-    # the whole SKU is removed (not just the flagged customer combos). Done after
-    # discontinued_df is computed above so the table still lists them.
-    if disc_status:
-        df_sku = df["SKU"].astype(str).str.rstrip("*")
-        disc_mask = df_sku.isin(disc_status)
-        n_disc_rows = int(disc_mask.sum())
-        if n_disc_rows:
-            n_disc_skus = df_sku[disc_mask].nunique()
-            df = df[~disc_mask].reset_index(drop=True)
-            logger.info(
-                "Discontinued check: dropped %d raw rows across %d "
-                "discontinued/inactive SKUs.",
-                n_disc_rows, n_disc_skus,
-            )
+    # ----- Exclusions: never forecast a SKU that shouldn't be projected -----
+    # Two Plytix-driven filters, applied to the demand frame BEFORE forecasting
+    # so a discontinued/inactive SKU — or an active SKU in a region it is not
+    # 'Active in' (e.g. ST1082, active in US/CA/UK/SG/EU/AU, appearing under JP
+    # (NETDEPOT)) — is never projected, flagged, or counted in revenue, and is
+    # surfaced in its own table below. The identical logic runs in the agent's
+    # ingest node (agent/data_io.py is the single source of truth), so the
+    # dashboard and the agent agree on which SKUs are in scope.
+    excl = data_io.apply_exclusions(df, plytix_df, P, anchors=(lb, lcw, ffw))
+    df = excl.df
+    check_ran = excl.active_check_ran
+    inactive_df = excl.inactive_df
+    disc_check_ran = excl.disc_check_ran
+    discontinued_df = excl.discontinued_df
+    n_excluded_rows = excl.n_excluded_rows
+    excluded_counts_by_key = excl.excluded_counts_by_key
+    if n_excluded_rows:
+        logger.info(
+            "Active-in check: dropped %d raw rows across %d SKU×customer×"
+            "region combos not in the SKU's 'Active in' list.",
+            n_excluded_rows, len(inactive_df),
+        )
+    if excl.n_disc_rows:
+        logger.info(
+            "Discontinued check: dropped %d raw rows across %d "
+            "discontinued/inactive SKUs (trailing '*' or Plytix status).",
+            excl.n_disc_rows, excl.n_disc_skus,
+        )
 
     # ----- View selector ---------------------------------------------------
     with st.sidebar:
@@ -1211,27 +1042,91 @@ def main():
             region = st.selectbox("Region", sorted(by_region.keys(), key=str))
             view = st.selectbox("Customer group", by_region[region])
 
-    # ----- Model parameters (Holt damped-trend smoothing) ------------------
-    min_weeks = None
+    # ----- Agent summary (LangGraph pipeline) ------------------------------
+    # Button-triggered only: invoking the graph backtests all three models AND
+    # calls an LLM, which is far too slow/expensive to run on every rerun. The
+    # provider selector switches the reasoning nodes between the Claude API and
+    # a local OpenAI-compatible server; agent/llm.py re-reads LLM_PROVIDER from
+    # the env at call time, so setting it here just before invoke() is enough.
     with st.sidebar:
-        st.header("Model parameters")
+        st.header("Agent")
+        provider_label = st.radio(
+            "Reasoning LLM",
+            list(LLM_PROVIDERS.keys()),
+            key="agent_llm_provider",
+            help="Which LLM writes the narrative + anomaly flags. Anthropic "
+                 "calls the Claude API (needs ANTHROPIC_API_KEY in .env); Local "
+                 "uses the OpenAI-compatible server in LOCAL_LLM_* (.env).",
+        )
+        # Anthropic needs a key; without one, block the run and steer the user
+        # to Local rather than silently degrading to it behind the scenes.
+        anthropic_no_key = LLM_PROVIDERS[provider_label] == "anthropic" and not (
+            os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        )
+        if anthropic_no_key:
+            st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the agent.")
+        run_agent = st.button(
+            "Run Agent Summary",
+            key="run_agent_summary",
+            disabled=anthropic_no_key,
+            help="Backtests all models for this view, picks the best, and writes "
+                 "an LLM narrative + flagged anomalies. Slow/expensive — runs "
+                 "only when you click, never on a normal rerun.",
+        )
+
+    if run_agent:
+        os.environ["LLM_PROVIDER"] = LLM_PROVIDERS[provider_label]
+        # Remember that the agent was run for this view this session, so the
+        # summary expander below appears only after an explicit click — never a
+        # stale persisted summary surfacing on page load.
+        st.session_state.setdefault("agent_ran_views", set()).add(view)
+        with st.spinner(f"Running agentic pipeline ({provider_label})…"):
+            # Import here, not at module top: keeps langgraph off the hot import
+            # path for every rerun and matches the "only touched on click" rule.
+            from agent.graph import build_graph
+
+            graph = build_graph()
+            final_state = graph.invoke({"view": view, "today_ts": today_ts})
+        if final_state.get("errors"):
+            st.error("\n".join(final_state["errors"]))
+        else:
+            best = final_state.get("best_model")
+            st.toast(f"Agent finished: {best or 'n/a'}")
+            # Switch the model toggle to the agent's winner so the screen shows
+            # the best model. Stash it as a pending key and rerun: the toggle
+            # widget already rendered above this run, so it can't be written
+            # here — the pending value is applied before the widget next build.
+            if best in MODEL_OPTIONS and best != st.session_state.get("model_choice"):
+                st.session_state["_pending_model_choice"] = best
+                st.rerun()
+
+    # Show the cached run (from the JSON publish wrote) only for views the user
+    # has run the agent on this session — clicking is what reveals it.
+    if view in st.session_state.get("agent_ran_views", set()):
+        _render_agent_summary(view)
+
+    # ----- Model parameters (Holt damped-trend smoothing) ------------------
+    # Parameters are hidden from the UI entirely: Holt always uses autofitted
+    # α/β/φ (backtested per view/snapshot), falling back to the pipeline's file
+    # defaults when the backtest can't run. min-weeks uses the file default.
+    min_weeks = None
+    alpha = beta = phi = None
+    with st.sidebar:
         smoothing_ok = _supports_smoothing(P)
         min_weeks_ok = _supports_min_weeks(P)
 
         if smoothing_ok or min_weeks_ok:
-            # The pipeline's own constants are the "file defaults" the reset
-            # button snaps back to.
+            # The pipeline's own constants are the "file defaults".
             a0 = float(getattr(P, "ALPHA", 0.5))
             b0 = float(getattr(P, "BETA", 0.3))
             p0 = float(getattr(P, "PHI", 0.85))
             mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
 
-            # If Autofit has run (automatically on first sight, or via the
-            # button), its winning parameters become the slider defaults (the
-            # nonce was bumped when they were stored, so the sliders rebuild and
-            # re-read value=). Results are keyed to the model/view/snapshot they
-            # were fitted on; anything else falls back to the file defaults. The
-            # sliders stay fully adjustable afterwards.
+            if min_weeks_ok:
+                min_weeks = mw0
+
+            # Autofit results are keyed to the model/view/snapshot they were
+            # fitted on; anything else falls back to the file defaults.
             autofit = st.session_state.get("autofit_params")
             autofit_active = bool(
                 autofit
@@ -1240,14 +1135,12 @@ def main():
                 and autofit.get("today") == today_str
             )
 
-            # ----- Auto-run Autofit on first sight --------------------------
-            # So that selecting a smoothing model (or a new view / snapshot)
-            # opens the sliders already on the backtested α/β/φ rather than the
-            # file defaults. It runs once per (model, view, snapshot): the
-            # "autofit_tried" marker below records that we've attempted it, so a
-            # failed backtest isn't retried on every rerun and a good fit isn't
-            # re-run on every slider move. The user can re-fit any time with the
-            # Autofit button, or fine-tune the sliders by hand.
+            # ----- Always autofit -------------------------------------------
+            # Selecting a smoothing model (or a new view / snapshot) runs the
+            # backtest once per (model, view, snapshot) and uses the winning
+            # α/β/φ. The "autofit_tried" marker records that we've attempted
+            # it, so a failed backtest isn't retried on every rerun and a good
+            # fit isn't re-run needlessly.
             autofit_key = (pipeline_path(), view, today_str)
             autofit_tried = st.session_state.get("autofit_tried") == autofit_key
             if (
@@ -1257,11 +1150,11 @@ def main():
                 and not autofit_tried
             ):
                 st.session_state["autofit_tried"] = autofit_key
-                with st.spinner("Autofitting α/β/φ for this view…"):
+                with st.spinner("Tuning the forecast for this view…"):
                     best = run_autofit(df, view, today_ts, pipeline_path(), mw0)
                 if best is not None:
                     logger.info(
-                        "Auto-Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
+                        "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
                         "(MAE %.2f vs %.2f with file defaults)",
                         view, best["alpha"], best["beta"], best["phi"],
                         best["mae"], best["baseline_mae"],
@@ -1270,155 +1163,36 @@ def main():
                         **best, "model": pipeline_path(),
                         "view": view, "today": today_str,
                     }
-                    # Rebuild the sliders on the fitted values and recompute the
-                    # forecast with them — exactly like the manual button does.
-                    st.session_state["param_nonce"] = (
-                        st.session_state.get("param_nonce", 0) + 1
-                    )
+                    # Recompute the forecast with the fitted values.
                     st.session_state["_do_recompute"] = True
                     st.rerun()
 
-            if smoothing_ok and autofit_active:
-                a0, b0, p0 = autofit["alpha"], autofit["beta"], autofit["phi"]
-
-            # Slider defaults come from the pipeline constants, passed via each
-            # slider's value= argument. To reset reliably across Streamlit
-            # versions we use a "nonce": the slider keys embed an integer that
-            # we bump on reset (or model switch), which makes Streamlit build
-            # brand-new widgets that re-read value=. This is more robust than
-            # deleting a fixed key, which didn't reliably restore value=.
-            st.session_state.setdefault("param_nonce", 0)
-            nonce = st.session_state["param_nonce"]
-
             if smoothing_ok:
-                st.caption(
-                    "Lower α/β lean on more history and less on recent weeks; "
-                    "lower φ flattens the projection. Moving a slider recomputes."
-                )
-                alpha = st.slider(
-                    "α — level smoothing", min_value=0.01, max_value=0.99,
-                    value=a0, step=0.01, key=f"sl_alpha_{nonce}",
-                    help="Higher tracks recent weeks faster; lower ≈ a longer moving "
-                         "average (effective window ≈ 2/α − 1 weeks).",
-                )
-                beta = st.slider(
-                    "β — trend smoothing", min_value=0.0, max_value=0.99,
-                    value=b0, step=0.01, key=f"sl_beta_{nonce}",
-                    help="Higher re-estimates the slope from recent weeks; 0 freezes it.",
-                )
-                phi = st.slider(
-                    "φ — trend damping", min_value=0.0, max_value=1.0,
-                    value=p0, step=0.05, key=f"sl_phi_{nonce}",
-                    help="Lower flattens the forecast toward the current level; "
-                         "1 = plain (undamped) Holt.",
-                )
-            else:
-                alpha = beta = phi = None
-
-            if min_weeks_ok:
-                min_weeks = st.slider(
-                    "min weeks for trend", min_value=2, max_value=12,
-                    value=mw0, step=1, key=f"sl_min_weeks_{nonce}",
-                    help="SKUs with fewer completed weeks than this are forecast "
-                         "flat at their mean instead of extrapolating a trend — "
-                         "prevents runaway projections from 1–2 weeks of data. "
-                         "2 disables the guard.",
-                )
-
-            # ----- Autofit: backtest a grid of α/β/φ and keep the winner ----
-            if smoothing_ok and _supports_autofit(P):
-                if st.button(
-                    "✨ Autofit α/β/φ",
-                    help="Grid-searches the smoothing parameters by backtesting: "
-                         "the last few completed weeks of each SKU's history are "
-                         "hidden, forecast with each parameter combination, and "
-                         "compared to what actually happened (repeated from "
-                         "several rolling origins). The combination with the "
-                         "lowest total forecast error wins and is applied to the "
-                         "sliders. You can still fine-tune the sliders afterwards.",
-                ):
-                    with st.spinner("Backtesting the parameter grid…"):
-                        best = run_autofit(
-                            df, view, today_ts, pipeline_path(), min_weeks
-                        )
-                    if best is None:
-                        st.warning(
-                            "Not enough completed weeks of history in this view "
-                            "to backtest — autofit needs SKUs with at least "
-                            f"~{getattr(P, 'AUTOFIT_MIN_TRAIN_WEEKS', 8) + 1} "
-                            "completed weeks."
-                        )
-                    else:
-                        logger.info(
-                            "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
-                            "(MAE %.2f vs %.2f with file defaults; "
-                            "%d SKUs, %d holdout points)",
-                            view, best["alpha"], best["beta"], best["phi"],
-                            best["mae"], best["baseline_mae"],
-                            best["n_series"], best["n_points"],
-                        )
-                        st.session_state["autofit_params"] = {
-                            **best, "model": pipeline_path(),
-                            "view": view, "today": today_str,
-                        }
-                        # Mark this (model, view, snapshot) as fitted so the
-                        # auto-run-on-first-sight logic doesn't re-fire over it.
-                        st.session_state["autofit_tried"] = (
-                            pipeline_path(), view, today_str
-                        )
-                        # Rebuild the sliders with the fitted values as their
-                        # defaults and recompute the forecast with them.
-                        st.session_state["param_nonce"] = nonce + 1
-                        st.session_state["_do_recompute"] = True
-                        st.rerun()
-
                 if autofit_active:
-                    improve = autofit["baseline_mae"] - autofit["mae"]
-                    pct = (
-                        f" ({improve / autofit['baseline_mae'] * 100:.0f}% better)"
-                        if autofit["baseline_mae"] > 0 and improve > 0 else ""
+                    alpha, beta, phi = (
+                        autofit["alpha"], autofit["beta"], autofit["phi"]
                     )
-                    st.success(
-                        f"Autofit applied: α={autofit['alpha']:g}, "
-                        f"β={autofit['beta']:g}, φ={autofit['phi']:g} — "
-                        f"backtest error {autofit['mae']:.1f} u/wk vs "
-                        f"{autofit['baseline_mae']:.1f} with file defaults"
-                        f"{pct}. Scored on {autofit['n_series']} SKUs, "
-                        f"{autofit['folds']} rolling folds of "
-                        f"{autofit['holdout_weeks']} held-out weeks."
-                    )
+                else:
+                    alpha, beta, phi = a0, b0, p0
 
-        else:
-            alpha = beta = phi = None
-            st.info(
-                "This pipeline's fit_regression doesn't accept α/β/φ or min-weeks "
-                "overrides, so its own module-level constants are used."
-            )
+            if smoothing_ok and _supports_autofit(P) and autofit_active:
+                improve = autofit["baseline_mae"] - autofit["mae"]
+                pct = (
+                    f" ({improve / autofit['baseline_mae'] * 100:.0f}% better "
+                    "than the default settings)"
+                    if autofit["baseline_mae"] > 0 and improve > 0 else ""
+                )
+                st.success(f"Forecast auto-tuned for this view{pct}.")
 
-        # Recompute is a manual action: moving a slider no longer rebuilds the
-        # whole forecast on every tick. The button sets a flag (via callback,
-        # so it's honoured on the very next run) that the compute gate reads.
-        def _request_recompute():
-            st.session_state["_do_recompute"] = True
-
-        st.button(
-            "🔄 Recompute forecast", type="primary", on_click=_request_recompute,
-            help="Apply the current parameters. Structural changes (view, "
-                 "model, snapshot, data) recompute automatically.",
-        )
-
-    # ----- Compute (manual, with a progress bar) ---------------------------
+    # ----- Compute (with a progress bar) -----------------------------------
     # The forecast is cached in session_state and only (re)built when:
     #   * there is no result yet (first load), or
     #   * a structural input changed (view / model / snapshot / data / prices), or
-    #   * the user pressed "Recompute".
-    # Slider changes alone leave the last result on screen and surface a
-    # "parameters changed — recompute to apply" notice.
+    #   * autofit produced new parameters (it sets _do_recompute).
     price_marker = None if prices is None else int(len(prices))
     structural_sig = (
         view, pipeline_path(), today_str, price_marker, n_excluded_rows
     )
-    param_sig = (alpha, beta, phi, min_weeks)
 
     do_recompute = st.session_state.pop("_do_recompute", False)
     stored = st.session_state.get("fc_result")
@@ -1455,7 +1229,6 @@ def main():
 
         st.session_state["fc_result"] = (summary, weekly, agg, by_cust)
         st.session_state["fc_structural"] = structural_sig
-        st.session_state["fc_params"] = param_sig
     else:
         summary, weekly, agg, by_cust = stored
 
@@ -1466,32 +1239,28 @@ def main():
         )
         st.stop()
 
-    # If the sliders were moved since the on-screen result was built, the view
-    # is stale until the user recomputes. Flag it rather than silently updating.
-    if st.session_state.get("fc_params") != param_sig:
-        st.info(
-            "Parameters changed since this forecast was built — click "
-            "**🔄 Recompute forecast** in the sidebar to apply them.",
-            icon="⚠️",
-        )
-
     # ----- Header / windows -------------------------------------------------
     st.subheader(view)
-    model_bits = []
-    if alpha is not None:
-        model_bits.append(f"α = {alpha:.2f}, β = {beta:.2f}, φ = {phi:.2f}")
-    if min_weeks is not None:
-        model_bits.append(f"min weeks for trend = {min_weeks}")
-    if model_bits:
-        st.caption("Model in use — " + "; ".join(model_bits))
     w1, w2 = st.columns(2)
-    # The fixed-window regression pipeline always fits exactly the last 8
-    # completed weeks, so we can state that. The other pipelines expose a
-    # LOOKBACK_WEEKS mechanism (all-history by default), so the window isn't a
-    # fixed 8 weeks — leave the count off rather than mislabel it.
-    hist_span = f"**Historical window** &nbsp; {lb.date()} → {lcw.date()}"
-    if not hasattr(P, "LOOKBACK_WEEKS"):
-        hist_span += " <span style='color:#64748b'>(8 completed weeks)</span>"
+    # The window's nominal lower bound (lb) can sit earlier than the first week
+    # the data actually reaches — e.g. the all-history pipelines anchor lb at
+    # HISTORY_START (2026-03-01) but the raw file's earliest week is later. Show
+    # the first week that is genuinely used in the fit and the chart (earliest
+    # WeekDate within [lb, lcw] carrying a POS/Orders signal) rather than the
+    # nominal lb, so the displayed start matches what the graph plots.
+    win = agg[(agg["WeekDate"] >= lb) & (agg["WeekDate"] <= lcw)]
+    win_sig = win[win["POS"].notna() | win["Orders"].notna()]
+    hist_start = win_sig["WeekDate"].min() if not win_sig.empty else lb
+    # Count the completed weeks actually used — distinct weeks within the window
+    # that carry a POS/Orders signal. The regression pipeline's window is a fixed
+    # 8 weeks; the all-history pipelines (Holt/XGBoost) span however many weeks of
+    # data exist between hist_start and lcw, so the count is derived, not fixed.
+    n_hist_weeks = win_sig["WeekDate"].nunique()
+    week_word = "week" if n_hist_weeks == 1 else "weeks"
+    hist_span = (
+        f"**Historical window** &nbsp; {hist_start.date()} → {lcw.date()} "
+        f"<span style='color:#64748b'>({n_hist_weeks} completed {week_word})</span>"
+    )
     w1.markdown(hist_span, unsafe_allow_html=True)
     fc_weeks = pd.to_datetime(weekly["WeekDate"])
     w2.markdown(
@@ -1502,36 +1271,59 @@ def main():
     )
 
     # ----- KPIs -------------------------------------------------------------
+    # Avg. weekly demand = the mean of the TOTAL weekly demand actually plotted
+    # on the chart's "Actual demand" line (POS/Orders summed across SKUs per
+    # week, then averaged over the weeks in the window). Do NOT sum the per-SKU
+    # "N Week POS/Orders Average" column here: that per-SKU average divides each
+    # SKU by its own weeks-with-data, so summing it counts a SKU that sold in
+    # only a few weeks as if it sold every week and overstates the total.
     avg_col = resolve_avg_col(summary)
-    total_avg = summary[avg_col].sum()
+    hist_demand = historical_window(agg, summary, (lb, lcw, ffw))
+    weekly_totals = hist_demand.groupby("WeekDate")["demand"].sum(min_count=1)
+    total_avg = float(weekly_totals.mean()) if not weekly_totals.empty else 0.0
     total_updated = summary["Updated Projection Average"].sum()
     total_initial = summary["Initial Projection Average"].sum()
     diff = total_updated - total_initial
     n_orders = int((summary.get("Data Source") == "Orders").sum()) \
         if "Data Source" in summary.columns else 0
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric(
-        "SKUs forecast", f"{len(summary):,}",
+        "SKUs Forecasted", f"{len(summary):,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
     )
-    k2.metric(f"Avg weekly demand", f"{total_avg:,.0f}")
-    k3.metric("Updated proj. (avg/wk)", f"{total_updated:,.0f}")
+    k2.metric(
+        "Historical Demand (avg/wk)", f"{total_avg:,.0f}",
+        help=f"Mean of total weekly actual demand (POS/Orders) over the "
+             f"{avg_window_phrase(avg_col).lower()} window — the average of the "
+             f"chart's actual-demand line.",
+    )
+    k3.metric(
+        "Initial Forecast (avg/wk)", f"{total_initial:,.0f}",
+        help="Mean of the existing system projection over the forecast horizon "
+             "(the 15 future weeks) — the average of the chart's original-"
+             "projection line over the forecast window.",
+    )
     k4.metric(
-        "vs original projection", f"{diff:+,.0f}",
+        "Updated Forecast (avg/wk)", f"{total_updated:,.0f}",
+        help="Mean of this model's updated forecast over the 15 future weeks — "
+             "the average of the chart's updated-forecast line.",
+    )
+    k5.metric(
+        "Projection Difference (avg/wk)", f"{diff:+,.0f}",
         delta=f"{(diff / total_initial * 100):+.1f}%" if total_initial else None,
     )
     has_risk = RISK_COL in summary.columns and summary[RISK_COL].notna().any()
     if has_risk:
         net_risk = summary[RISK_COL].sum()
-        k5.metric(
-            "Revenue risk (net)", f"${net_risk:+,.0f}",
+        k6.metric(
+            "Revenue Risk (net)", f"${net_risk:+,.0f}",
             help="Σ (projection difference × list price) over priced SKUs. "
                  "Negative = forecast fell below the original projection.",
         )
     else:
-        k5.metric(
-            "Revenue risk (net)", "—",
+        k6.metric(
+            "Revenue Risk (net)", "—",
             help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
         )
     if n_orders:
@@ -1568,28 +1360,40 @@ def main():
             width="stretch",
         )
     with cR:
-        st.metric("Data source", source)
+        st.metric("Data Source", source)
         avg_col = resolve_avg_col(summary)
-        st.metric(f"{avg_window_phrase(avg_col)} {source} avg", f"{row[avg_col]:,.1f}")
-        st.metric("Updated proj.", f"{row['Updated Projection Average']:,.0f}")
-        sysv = row.get("Initial Projection Average")
-        st.metric("Original proj.", "—" if pd.isna(sysv) else f"{sysv:,.0f}")
+        phrase = avg_window_phrase(avg_col)
+        window_label = "All-Time" if phrase == "All-History" \
+            else phrase.replace(" Week", "-Week")
         st.metric(
-            "Difference",
+            f"{window_label} Historical Demand (avg/wk)",
+            f"{row[avg_col]:,.1f}",
+        )
+        sysv = row.get("Initial Projection Average")
+        st.metric(
+            "Initial Forecast (avg/wk)",
+            "—" if pd.isna(sysv) else f"{sysv:,.0f}",
+        )
+        st.metric(
+            "Updated Forecast (avg/wk)",
+            f"{row['Updated Projection Average']:,.0f}",
+        )
+        st.metric(
+            "Projection Difference (avg/wk)",
             f"{row['Projection Difference']:+,.0f}"
             if pd.notna(row["Projection Difference"]) else "—",
         )
         if RISK_COL in summary.columns:
             pv = row.get(PRICE_COL)
             rv = row.get(RISK_COL)
-            st.metric("List price", "—" if pd.isna(pv) else f"${pv:,.2f}")
+            st.metric("List Price", "—" if pd.isna(pv) else f"${pv:,.2f}")
             st.metric(
-                "Revenue risk",
+                "Revenue Risk",
                 "—" if pd.isna(rv) else f"${rv:+,.0f}",
                 help="Projection difference × list price.",
             )
         if "Top Volume Customer Groups" in summary.columns:
-            st.markdown("**Top volume groups**")
+            st.markdown("**Top Volume Groups**")
             st.caption(row["Top Volume Customer Groups"])
 
     # ----- Summary table ----------------------------------------------------
@@ -1772,7 +1576,21 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
     if region_scoped:
         table_df = discontinued_df[discontinued_df["Region"] == region]
 
-    if table_df.empty:
+    # Apply the non-zero future-projection filter BEFORE the empty check, so a
+    # scope whose rows all zero out still shows the "None found" message rather
+    # than an empty table (mirrors render_inactive_section above).
+    disc = table_df.copy()
+    disc["First_WeekDate"] = pd.to_datetime(disc["First_WeekDate"]).dt.date
+    disc["Last_WeekDate"] = pd.to_datetime(disc["Last_WeekDate"]).dt.date
+    disc["Original_Projection"] = pd.to_numeric(
+        disc["Original_Projection"], errors="coerce"
+    ).round(0)
+    disc = disc[
+        disc["Original_Projection"].notna() &
+        (disc["Original_Projection"] != 0)
+    ]
+
+    if disc.empty:
         if region_scoped:
             st.success(
                 f"None found for {region} — no discontinued or inactive "
@@ -1785,7 +1603,7 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
             )
         return
 
-    n_skus = table_df["SKU"].nunique()
+    n_skus = disc["SKU"].nunique()
     scope_note = f" for {region}" if region_scoped else ""
     st.caption(
         f"Flagged{scope_note}: {n_skus:,} distinct SKUs marked Discontinued or "
@@ -1793,16 +1611,6 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
         "only)."
     )
 
-    disc = table_df.copy()
-    disc["First_WeekDate"] = pd.to_datetime(disc["First_WeekDate"]).dt.date
-    disc["Last_WeekDate"] = pd.to_datetime(disc["Last_WeekDate"]).dt.date
-    disc["Original_Projection"] = pd.to_numeric(
-        disc["Original_Projection"], errors="coerce"
-    ).round(0)
-    disc = disc[
-        disc["Original_Projection"].notna() &
-        (disc["Original_Projection"] != 0)
-    ]
     disc = disc[[
         'SKU', 'SKU Status', 'Region', 'Customer Grouping',
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',

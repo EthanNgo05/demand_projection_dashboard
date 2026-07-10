@@ -5,3 +5,10 @@ plotly
 openpyxl
 scikit-learn
 xgboost
+langgraph
+langchain-core
+langchain-anthropic
+langchain-openai
+python-dotenv
+pyodbc
+tabulate

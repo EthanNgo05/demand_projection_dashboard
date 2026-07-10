@@ -9,4 +9,15 @@ __pycache__
 
 # logs
 logs.txt
+llm_prompts.log
 
+# secrets
+.env
+
+
+# local tooling
+.claude/
+
+/sql
+
+testing.ipynb

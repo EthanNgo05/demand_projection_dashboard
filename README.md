@@ -2,7 +2,7 @@
 
 A Streamlit + Plotly dashboard for SKU-level demand forecasting. It can dynamically run any of three models:
 
-- **Simple Regression** (8-week average + dampened linear trend)
+- **8-Week Moving Average** (8-week average + a light dampened trend)
 - **Holt's Exponential Smoothing** (damped trend, with outlier cleansing and promo uplift)
 - **XGBoost** (pooled gradient-boosted trees, with the same cleansing/uplift)
 
@@ -136,3 +136,20 @@ Ported from the notebooks and run automatically when a Plytix export is loaded:
 Both need the Plytix `list_prices_*.xlsx` export (which also drives the
 revenue-risk columns). Unhandled dashboard errors are logged to `logs.txt`
 (gitignored) with a friendly message shown to the user.
+
+## Testing
+
+Runnng the 14 tests:
+
+```
+pip install -r requirements.txt
+pytest tests/ -v
+````
+
+Run end-to-end and print a row count for all 3 models:
+
+```
+python -m agent.run --view "ALL CUSTOMERS (combined)"
+python -m agent.run --view "AMAZON-DC"
+python -m agent.run --view "ANOTHER-CUSTOMER-GROUP"
+```

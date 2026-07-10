@@ -5,12 +5,18 @@ Uses the last 8 *completed* weeks of historical POS data to calculate a 15-week
 projection. The in-progress week is excluded so a partially-elapsed week's POS
 never drags the average (see week_anchors).
 
-    projected_pos(week_k) = avg_pos_over_8_weeks + adjustment(k)
+    projected_pos(week_k) = avg_weekly_demand + adjustment(k)
         adjustment(k) = slope * TREND_WEIGHT * k     (k = 1 .. 15 weeks out)
 
+    - avg_weekly_demand : total demand in the window averaged over every week
+                        from the SKU's FIRST sale through the last completed
+                        week -- so weeks it sold nothing after first appearing
+                        count as zeros and a one-time bulk order isn't read as
+                        a recurring weekly rate. A SKU selling all 8 weeks gets
+                        the plain 8-week mean.
     - slope        : slope from a linear regression of the last 8 weeks of POS
     - TREND_WEIGHT : 0.25 (dampens the trend so the forecast doesn't over-react)
-                        0 -> pure 8-week average, 1 -> pure trend
+                        0 -> pure average, 1 -> pure trend
     - updated_projection_avg (per SKU) = mean of the 15 weekly projected_pos values
                        (equivalently: avg + slope * TREND_WEIGHT * 6.5,
                         since mean(1..15) = 8.0)
@@ -39,9 +45,9 @@ TREND_WEIGHT = 0.25
 
 # Header caption shown by the dashboard when this model is selected.
 DASHBOARD_CAPTION = (
-    "15-week simple-regression forecast: anchored to the 8-week average of the "
-    "historical demand window (POS where available, else Orders), nudged by a "
-    f"dampened linear-regression slope (trend weight = {TREND_WEIGHT})."
+    "15-week forecast from an 8-week moving average of the historical demand "
+    "window (POS where available, else Orders), with a light dampened trend "
+    f"adjustment (trend weight = {TREND_WEIGHT})."
 )
 
 # RAW_INPUTS_FOLDER is the constant the dashboard reads to discover raw files,
@@ -383,11 +389,22 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
         src_grp = src_grp.sort_values("WeekDate").reset_index(drop=True)
         y = src_grp[source].values
         n = len(src_grp)
-        mean_val = y.mean()
+
+        # Anchor level = total demand averaged over every week from the SKU's
+        # FIRST sale in the window through the last completed week. Weeks the SKU
+        # sold nothing *after it first appeared* count as real zeros, so a
+        # one-time bulk order (e.g. a single 8,064-unit week) is spread across
+        # the weeks since and not mistaken for a recurring weekly run-rate.
+        # Weeks BEFORE the first sale are excluded, so a SKU that only launched
+        # partway through the window isn't diluted by pre-launch weeks it could
+        # not have sold in. For a SKU present in all 8 weeks this equals y.mean().
+        first_week = src_grp["WeekDate"].min()
+        weeks_since_first = int(round((last_complete_week - first_week).days / 7)) + 1
+        mean_val = y.sum() / max(weeks_since_first, 1)
 
         # Use real week offsets (not positional index) so gaps in the history
         # don't distort the slope.
-        x = ((src_grp["WeekDate"] - src_grp["WeekDate"].min()).dt.days / 7).round().values
+        x = ((src_grp["WeekDate"] - first_week).dt.days / 7).round().values
         slope = np.polyfit(x, y, 1)[0] if n >= 2 and len(set(x)) >= 2 else 0.0
 
         # Anchor to the mean; nudge by the dampened slope each week out.
@@ -424,16 +441,21 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
     print(f"  Forecast window:   {forecast_weeks[0].date()} -> {forecast_weeks[-1].date()}")
     print(f"  SKUs projected:    {len(summary_rows)}")
 
-    # initial_projection_avg: average of the existing system Projection from the
-    # first forecast week (first_forecast_week -- the in-progress week, e.g.
-    # 2026-06-28) through the last week that actually has a projection. Anchoring
-    # this to the same first_forecast_week keeps it aligned with the updated
-    # forecast (both start at the in-progress week). Weeks with a missing
-    # projection are excluded from the average (mean() skips NaN), so a SKU whose
-    # projection runs out at, say, 2026-11-22 is not penalised for a blank
-    # 2026-11-29.
+    # initial_projection_avg: average of the existing system Projection over the
+    # SAME 15 forecast weeks the updated average uses -- from the current
+    # in-progress week (first_forecast_week) through the 15th forecast week
+    # (forecast_weeks[-1]). Scoping to the forward horizon (not the historical
+    # window) makes "Initial Forecast" and "Updated Forecast" apples-to-apples --
+    # both are forward projections over the same weeks -- so "Projection
+    # Difference" / "Revenue Risk" agree in sign with the forecast-vs-original
+    # comparison shown on the chart. This matches the Holt/XGBoost pipelines.
+    # Weeks with a missing projection are excluded (mean() skips NaN), so a SKU
+    # whose projection runs out mid-horizon isn't penalised for the blank weeks.
     avg_initial = (
-        df[df["WeekDate"] >= first_forecast_week]
+        df[
+            (df["WeekDate"] >= first_forecast_week)
+            & (df["WeekDate"] <= forecast_weeks[-1])
+        ]
         .dropna(subset=["Projection"])
         .groupby("SKU")["Projection"]
         .mean()

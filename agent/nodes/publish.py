@@ -1,0 +1,111 @@
+"""Phase 5 publish node: persist the agent's output for the dashboard.
+
+The terminal node of the graph. It writes a per-view JSON summary to
+``outputs/agent_summary_{view}.json`` and appends one ``AGENT`` line to
+``logs.txt`` (append, never overwrite — matching the existing Autofit lines).
+The dashboard reads the JSON back to show the last run without re-invoking the
+(slow, LLM-backed) graph on every Streamlit rerun.
+
+Path note: this file lives at ``agent/nodes/publish.py``, so the repo root is
+THREE levels up. ``outputs/`` and ``logs.txt`` both live at the repo root
+alongside dashboard.py — not under ``agent/``. Tests monkeypatch OUTPUT_DIR,
+and the log path is derived from it at call time so the two stay consistent.
+"""
+
+import json
+import os
+from datetime import datetime
+
+from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS
+from agent.model_loader import load_pipeline
+from agent.state import AgentState
+
+# agent/nodes/publish.py -> agent/nodes -> agent -> <repo root>
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs")
+
+
+def _window_excluded_skus(state: AgentState) -> list[dict]:
+    """Active SKUs the winning model omits because their demand predates its
+    history window.
+
+    A SKU is forecast only if it has POS/Orders inside the model's window. The
+    8-week moving average uses the last 8 completed weeks, so a SKU whose only
+    sales are older than that gets no projection — while an all-history model
+    (Holt/XGBoost) still forecasts it. This returns exactly that gap: SKUs with
+    demand history in the view but none inside the WINNER's window, using the
+    winner's own ``week_anchors``. An all-history winner therefore returns [].
+
+    The frame is the post-exclusion ``cleaned_df`` (discontinued/inactive and
+    out-of-region SKUs were already dropped at ingest), so every SKU here is an
+    active, in-region product the model is silently leaving out.
+    """
+    best = state.get("best_model")
+    df = state.get("cleaned_df")
+    today_ts = state.get("today_ts")
+    view = state.get("view")
+    if best is None or best not in MODEL_OPTIONS or df is None or today_ts is None:
+        return []
+    try:
+        P = load_pipeline(MODEL_OPTIONS[best])
+        lookback_start, last_complete_week, _ = P.week_anchors(today_ts)
+    except Exception:  # noqa: BLE001 — a note must never break the terminal node
+        return []
+
+    sub = df if view == ALL_CUSTOMERS_VIEW else df[df["Customer Grouping"] == view]
+    demand = sub[sub["POS"].notna() | sub["Orders"].notna()]
+    if demand.empty:
+        return []
+    in_window = demand[
+        (demand["WeekDate"] >= lookback_start)
+        & (demand["WeekDate"] <= last_complete_week)
+    ]
+    excluded = set(demand["SKU"].astype(str)) - set(in_window["SKU"].astype(str))
+    if not excluded:
+        return []
+
+    desc_map: dict[str, str] = {}
+    if "Description" in demand.columns:
+        for sku, d in zip(demand["SKU"].astype(str), demand["Description"]):
+            if sku not in desc_map and d == d and d is not None:  # d==d skips NaN
+                desc_map[sku] = str(d)
+    return [{"SKU": s, "Description": desc_map.get(s, "")} for s in sorted(excluded)]
+
+
+def publish(state: AgentState) -> dict:
+    view = state["view"]
+    best = state.get("best_model")
+    results = state.get("results", {})
+    window_excluded = _window_excluded_skus(state)
+    payload = {
+        "view": view,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "best_model": best,
+        "mae_by_model": {k: v.get("mae") for k, v in results.items()},
+        "narrative": state.get("narrative"),
+        "anomalies": state.get("anomalies", []),
+        # SKUs the winning model omits for having no demand inside its window
+        # (see _window_excluded_skus). Empty for an all-history winner.
+        "window_excluded_skus": window_excluded,
+        # Persist these too — the dashboard (and anyone reading the JSON later)
+        # needs to know whether the run was low-confidence or partially failed.
+        "confidence_flag": state.get("confidence_flag", False),
+        "errors": state.get("errors", []),
+    }
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    safe_view = view.replace(" ", "_").replace("/", "-")
+    path = os.path.join(OUTPUT_DIR, f"agent_summary_{safe_view}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    # logs.txt sits one level up from outputs/ (i.e. the repo root). Deriving it
+    # from OUTPUT_DIR keeps the monkeypatched test layout consistent.
+    log_path = os.path.join(os.path.dirname(OUTPUT_DIR), "logs.txt")
+    with open(log_path, "a") as f:
+        f.write(
+            f"{datetime.now():%Y-%m-%d %H:%M:%S}  AGENT     [{view}] "
+            f"best={best} mae={payload['mae_by_model'].get(best)} -> {path}\n"
+        )
+
+    return {"window_excluded_skus": window_excluded}
