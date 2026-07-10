@@ -1,15 +1,15 @@
 """Phase 5 publish node: persist the agent's output for the dashboard.
 
 The terminal node of the graph. It writes a per-view JSON summary to
-``outputs/agent_summary_{view}.json`` and appends one ``AGENT`` line to
-``logs.txt`` (append, never overwrite — matching the existing Autofit lines).
-The dashboard reads the JSON back to show the last run without re-invoking the
-(slow, LLM-backed) graph on every Streamlit rerun.
+``outputs/agent_summary_{view}.json`` and appends one ``AGENT`` line to the
+daily app log, ``logs/<date>/app.log`` (append, never overwrite — matching the
+existing Autofit lines). The dashboard reads the JSON back to show the last run
+without re-invoking the (slow, LLM-backed) graph on every Streamlit rerun.
 
 Path note: this file lives at ``agent/nodes/publish.py``, so the repo root is
-THREE levels up. ``outputs/`` and ``logs.txt`` both live at the repo root
-alongside dashboard.py — not under ``agent/``. Tests monkeypatch OUTPUT_DIR,
-and the log path is derived from it at call time so the two stay consistent.
+THREE levels up. ``outputs/`` lives at the repo root alongside dashboard.py —
+not under ``agent/``. Tests monkeypatch OUTPUT_DIR for the JSON and
+``log_config.LOG_ROOT`` for the audit line.
 """
 
 import json
@@ -19,6 +19,7 @@ from datetime import datetime
 from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS
 from agent.model_loader import load_pipeline
 from agent.state import AgentState
+from log_config import dated_log_path
 
 # agent/nodes/publish.py -> agent/nodes -> agent -> <repo root>
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -99,10 +100,10 @@ def publish(state: AgentState) -> dict:
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
-    # logs.txt sits one level up from outputs/ (i.e. the repo root). Deriving it
-    # from OUTPUT_DIR keeps the monkeypatched test layout consistent.
-    log_path = os.path.join(os.path.dirname(OUTPUT_DIR), "logs.txt")
-    with open(log_path, "a") as f:
+    # The agent's audit line joins the same daily log the dashboard writes:
+    # logs/<date>/app.log at the repo root (tests redirect via log_config.LOG_ROOT).
+    log_path = dated_log_path("app.log")
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             f"{datetime.now():%Y-%m-%d %H:%M:%S}  AGENT     [{view}] "
             f"best={best} mae={payload['mae_by_model'].get(best)} -> {path}\n"

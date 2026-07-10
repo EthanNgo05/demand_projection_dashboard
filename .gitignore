@@ -7,9 +7,12 @@
 # pycache
 __pycache__
 
-# logs
+# logs (organized under logs/<date>/)
+/logs
+# legacy root-level log files, kept ignored in case any linger
 logs.txt
 llm_prompts.log
+logs_refresh.txt
 
 # secrets
 .env
@@ -19,5 +22,3 @@ llm_prompts.log
 .claude/
 
 /sql
-
-testing.ipynb

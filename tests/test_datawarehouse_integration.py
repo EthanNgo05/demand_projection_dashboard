@@ -139,7 +139,8 @@ def dash(monkeypatch, tmp_path):
 
     monkeypatch.setattr(dashboard, "_raw_dir", lambda: folder)
     monkeypatch.setattr(dashboard, "discover_raw_files", _discover)
-    monkeypatch.setattr(dashboard, "REFRESH_LOG", os.path.join(folder, "logs_refresh.txt"))
+    monkeypatch.setattr(dashboard, "_refresh_log_path",
+                        lambda: os.path.join(folder, "logs_refresh.txt"))
     return dashboard, folder
 
 

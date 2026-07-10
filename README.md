@@ -134,8 +134,8 @@ Ported from the notebooks and run automatically when a Plytix export is loaded:
   future projections are flagged and excluded.
 
 Both need the Plytix `list_prices_*.xlsx` export (which also drives the
-revenue-risk columns). Unhandled dashboard errors are logged to `logs.txt`
-(gitignored) with a friendly message shown to the user.
+revenue-risk columns). Unhandled dashboard errors are logged to
+`logs/<date>/app.log` (gitignored) with a friendly message shown to the user.
 
 ## Testing
 

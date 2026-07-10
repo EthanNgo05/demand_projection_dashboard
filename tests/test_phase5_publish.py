@@ -1,9 +1,9 @@
 """Phase 5: the `publish` node's file/log output + graph wiring.
 
 `publish` is the terminal node: it writes outputs/agent_summary_{view}.json and
-appends one AGENT line to logs.txt. These tests monkeypatch OUTPUT_DIR to a
-tmp_path so they never touch the repo's real outputs/ or logs.txt. The log path
-is derived from OUTPUT_DIR at call time, so patching OUTPUT_DIR relocates both.
+appends one AGENT line to logs/<date>/app.log. These tests monkeypatch
+OUTPUT_DIR (for the JSON) and log_config.LOG_ROOT (for the audit line) to a
+tmp_path so they never touch the repo's real outputs/ or logs/.
 """
 
 import json
@@ -97,13 +97,18 @@ def test_publish_mangles_view_into_filename(tmp_path, monkeypatch):
 
 
 def test_publish_appends_to_logs_not_overwrites(tmp_path, monkeypatch):
-    log_path = tmp_path / "logs.txt"
-    log_path.write_text("existing line\n")
+    from log_config import dated_log_path
+    monkeypatch.setattr("log_config.LOG_ROOT", str(tmp_path / "logs"))
+    # Seed today's log so we can prove publish appends rather than overwrites.
+    log_path = dated_log_path("app.log")  # today's folder under tmp_path
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("existing line\n")
     monkeypatch.setattr("agent.nodes.publish.OUTPUT_DIR", str(tmp_path / "outputs"))
     os.makedirs(tmp_path / "outputs")
     publish({"view": "ALL CUSTOMERS (combined)", "best_model": "XGBoost",
              "results": {"XGBoost": {"mae": 22.1}}, "narrative": "", "anomalies": []})
-    contents = log_path.read_text()
+    with open(log_path, encoding="utf-8") as f:
+        contents = f.read()
     assert "existing line" in contents  # not clobbered
     assert "AGENT" in contents          # our line appended
     assert "best=XGBoost" in contents

@@ -61,14 +61,20 @@ import streamlit as st
 # stay here, wrapping thin calls into the shared module.
 from agent import data_io
 
+# Date-organized logging (logs/<date>/...), Streamlit-free so the agent can
+# share it. See log_config.py.
+from log_config import DateFolderHandler, dated_log_path
+
 # --------------------------------------------------------------------------- #
 # Logging                                                                     #
 # --------------------------------------------------------------------------- #
-# Developer-facing log. Written next to this file as ``logs.txt`` so issues can
-# be inspected after the fact (on Streamlit Cloud, also visible via Manage app
-# → logs). Configured once per process; Streamlit reruns import the module only
-# once, so the handler isn't attached repeatedly.
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs.txt")
+# Developer-facing log, organized by day under ``logs/<date>/app.log`` at the
+# repo root so issues can be inspected after the fact (on Streamlit Cloud, also
+# visible via Manage app → logs). Configured once per process; Streamlit reruns
+# import the module only once, so the handler isn't attached repeatedly. The
+# DateFolderHandler rolls to a new day's folder on its own, so a dashboard left
+# running for days still files each line under the date it was written.
+LOG_FILENAME = "app.log"
 
 logger = logging.getLogger("demand_dashboard")
 if not logger.handlers:
@@ -76,14 +82,11 @@ if not logger.handlers:
     _fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
-    try:
-        _fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-        _fh.setFormatter(_fmt)
-        logger.addHandler(_fh)
-    except OSError:
-        # Read-only filesystem (some hosts): fall back to the console only so
-        # the app still runs; logs then live in the platform's own log stream.
-        pass
+    # File output is best-effort (read-only hosts): the handler swallows OSError
+    # internally, and the StreamHandler below still logs to the console.
+    _fh = DateFolderHandler(LOG_FILENAME)
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
     _sh = logging.StreamHandler()
     _sh.setFormatter(_fmt)
     logger.addHandler(_sh)
@@ -265,7 +268,13 @@ def discover_raw_files():
 # dropdown auto-selects it. The lock also stops a manual click and the nightly
 # task from overlapping into two concurrent 10-minute queries.
 EXTRACT_SCRIPT = os.path.join(HERE, "extract_demand_details.py")
-REFRESH_LOG = os.path.join(HERE, "logs_refresh.txt")
+
+
+def _refresh_log_path():
+    """Today's refresh log: ``logs/<date>/logs_refresh.txt``. Computed per call
+    (not at import) so a long-running dashboard files each refresh under the day
+    it ran, and shares the exact file the scheduled task writes."""
+    return dated_log_path("logs_refresh.txt")
 # A pull older than this with no new file is treated as crashed, so the button
 # re-enables instead of wedging the UI forever. Comfortably above the ~10-minute
 # typical runtime and the extract's own 900s SQL_QUERY_TIMEOUT default.
@@ -331,7 +340,7 @@ def start_refresh():
     venv the dashboard was started with, and inherits the environment (the SQL_*
     connection vars). ``DEMAND_RAW_DIR`` is pinned to the exact folder the
     dashboard reads so the child writes where we look, regardless of CWD. The
-    child's output is appended to logs_refresh.txt for after-the-fact diagnosis.
+    child's output is appended to logs/<date>/logs_refresh.txt for diagnosis.
     """
     running, started = refresh_in_progress()
     if running:
@@ -354,7 +363,7 @@ def start_refresh():
             creationflags = (
                 subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             )
-        logf = open(REFRESH_LOG, "a", encoding="utf-8")
+        logf = open(_refresh_log_path(), "a", encoding="utf-8")
         try:
             logf.write(f"\n===== DW refresh started {now} =====\n")
             logf.flush()
@@ -1131,7 +1140,7 @@ def main():
             else:
                 st.warning(
                     "The data-warehouse refresh didn't produce a new snapshot — "
-                    "see logs_refresh.txt for details."
+                    "see logs/<date>/logs_refresh.txt for details."
                 )
 
         if files:
@@ -2071,7 +2080,7 @@ def _run():
         )
         with st.expander("Technical details (for developers)"):
             st.exception(exc)
-            st.caption(f"Full traceback is also recorded in {LOG_PATH}.")
+            st.caption(f"Full traceback is also recorded in {dated_log_path(LOG_FILENAME)}.")
         st.stop()
 
 

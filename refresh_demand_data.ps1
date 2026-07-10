@@ -8,9 +8,10 @@
     dashboard then serves that pre-computed file instantly — nobody waits 10 min.
 
     Register it with Windows Task Scheduler (see the schtasks command in the
-    project notes). It logs each run, with timestamps, to logs_refresh.txt next
-    to this script, and exits with the extract's own exit code so Task Scheduler
-    records success/failure (Last Run Result).
+    project notes). It logs each run, with timestamps, to
+    logs/<yyyy-MM-dd>/logs_refresh.txt next to this script, and exits with the
+    extract's own exit code so Task Scheduler records success/failure (Last Run
+    Result).
 
     The interpreter defaults to the repo's Python but can be overridden with the
     DEMAND_PYTHON environment variable (e.g. to point at a venv).
@@ -29,7 +30,12 @@ if ([string]::IsNullOrWhiteSpace($Python)) {
 }
 
 $Script = Join-Path $Root 'extract_demand_details.py'
-$Log    = Join-Path $Root 'logs_refresh.txt'
+
+# Logs are organized by day: logs/<yyyy-MM-dd>/logs_refresh.txt
+$Today  = Get-Date -Format 'yyyy-MM-dd'
+$LogDir = Join-Path (Join-Path $Root 'logs') $Today
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$Log    = Join-Path $LogDir 'logs_refresh.txt'
 $Stamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
 Add-Content -Path $Log -Value "`n===== scheduled DW refresh started $Stamp ====="
