@@ -1174,7 +1174,7 @@ def main():
             st.info(
                 f"⏳ Refreshing from the data warehouse… started {started}. "
                 "You can keep working on the current snapshot; it switches to "
-                "the fresh pull automatically when it finishes (~10 min)."
+                "the fresh pull automatically when it finishes (~20 min)."
             )
             if st.button("Check for new data", key="check_refresh"):
                 st.rerun()
@@ -1564,8 +1564,8 @@ def main():
     st.subheader(view)
     w1, w2 = st.columns(2)
     # The window's nominal lower bound (lb) can sit earlier than the first week
-    # the data actually reaches — e.g. the all-history pipelines anchor lb at
-    # HISTORY_START (2026-03-01) but the raw file's earliest week is later. Show
+    # the data actually reaches — e.g. the all-history pipelines anchor lb a few
+    # years before the run date but the raw file's earliest week is later. Show
     # the first week that is genuinely used in the fit and the chart (earliest
     # WeekDate within [lb, lcw] carrying a POS/Orders signal) rather than the
     # nominal lb, so the displayed start matches what the graph plots.

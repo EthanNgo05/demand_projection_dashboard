@@ -112,9 +112,10 @@ MIN_WEEKS_FOR_TREND = 4
 # The in-progress week is always excluded (see week_anchors).
 LOOKBACK_WEEKS = None
 
-# Sentinel "beginning of time" used as the lower bound when LOOKBACK_WEEKS is
-# None, so a ``WeekDate >= HISTORY_START`` filter keeps every historical week.
-HISTORY_START = pd.Timestamp("2026-03-01")
+# When LOOKBACK_WEEKS is None the lower bound is set to this many years before
+# the run date -- effectively "all history" for our data, while still guarding
+# against a stray ancient row dragging the fit. See week_anchors.
+HISTORY_YEARS = 3
 
 # Display label for the descriptive-average column. Reflects LOOKBACK_WEEKS so
 # the header never claims "8 Week" when it's actually averaging all history
@@ -415,8 +416,9 @@ def week_anchors(today):
     exactly this in-progress week.
 
     The window *start* depends on LOOKBACK_WEEKS: with the default ``None`` the
-    lower bound is HISTORY_START (i.e. all available history); set LOOKBACK_WEEKS
-    to an int to use only that many most-recent completed weeks instead.
+    lower bound is HISTORY_YEARS years before the run date (i.e. all available
+    history in practice); set LOOKBACK_WEEKS to an int to use only that many
+    most-recent completed weeks instead.
 
     Returns (lookback_start, last_complete_week, first_forecast_week).
     """
@@ -424,7 +426,7 @@ def week_anchors(today):
     current_week_start = today - pd.Timedelta(days=days_since_sunday)
     last_complete_week = current_week_start - pd.Timedelta(weeks=1)
     if LOOKBACK_WEEKS is None:
-        lookback_start = HISTORY_START                     # all available history
+        lookback_start = today - pd.DateOffset(years=HISTORY_YEARS)  # all history
     else:
         # N weeks inclusive -> step back N-1 from the last completed week.
         lookback_start = last_complete_week - pd.Timedelta(weeks=LOOKBACK_WEEKS - 1)
@@ -977,8 +979,8 @@ def fit_xgboost(df, today, grouping_label, breakdown_df=None,
     if not summary_rows:
         return None, None
 
-    # Report the actual span of data used (the lower bound is a far-past
-    # sentinel when LOOKBACK_WEEKS is None, so show the earliest week present).
+    # Report the actual span of data used (the lower bound is a far-past floor
+    # when LOOKBACK_WEEKS is None, so show the earliest week present).
     actual_start = window["WeekDate"].min()
     span_label = (
         "all completed weeks"
