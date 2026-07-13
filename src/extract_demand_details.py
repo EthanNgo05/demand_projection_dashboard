@@ -36,8 +36,10 @@ python-dotenv). SQL-login auth:
 Leave SQL_USER blank to use Windows (trusted) authentication instead.
 
 Run:
-    python extract_demand_details.py            # full pull -> dated .xlsx
-    python extract_demand_details.py --ping      # fast connectivity smoke test
+    python extract_demand_details.py               # full pull -> dated .xlsx
+    python extract_demand_details.py --incremental  # last few weeks + projections,
+                                                    # merged into newest snapshot
+    python extract_demand_details.py --ping         # fast connectivity smoke test
     python extract_demand_details.py --out x.xlsx
 """
 
@@ -50,7 +52,9 @@ import os
 import re
 import sys
 import tempfile
-from datetime import date
+import time
+from datetime import date, timedelta
+from typing import Callable
 
 import pandas as pd
 import pyodbc
@@ -113,6 +117,17 @@ QUERY_TIMEOUT = int(os.environ.get("SQL_QUERY_TIMEOUT", "900"))
 # successful write. Older ones are pruned so the folder (and the dashboard's
 # snapshot dropdown) don't grow without bound. 0 (or less) disables pruning.
 KEEP_SNAPSHOTS = int(os.environ.get("DEMAND_KEEP_SNAPSHOTS", "10"))
+
+# --incremental: how many weeks of recent actuals to re-pull (plus all forward
+# projections, which the SQL window always covers). A few weeks of buffer, not
+# just one, because recent POS/order rows can be restated after the fact; the
+# nightly full pull self-heals anything older.
+INCREMENTAL_WEEKS_BACK = int(os.environ.get("DEMAND_INCREMENTAL_WEEKS_BACK", "3"))
+
+# Marker line in the .sql batch that --incremental replaces with a re-assignment
+# of @StartSunday. On a full pull it's a plain comment, so the batch is
+# unchanged. Matched as a line prefix.
+INCREMENTAL_MARKER = "-- INCREMENTAL_START_OVERRIDE"
 
 _TRUTHY = {"yes", "true", "1", "on"}
 
@@ -300,13 +315,152 @@ def select_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep].rename(columns=SQL_TO_POWERBI_FORMAT)
 
 
-def load_demand_details(path: str = DEFAULT_SQL) -> pd.DataFrame:
-    """Read the .sql file, run it, and return the validated result DataFrame."""
+def load_demand_details(
+    path: str = DEFAULT_SQL,
+    sql_transform: Callable[[str], str] | None = None,
+) -> pd.DataFrame:
+    """Read the .sql file, run it, and return the validated result DataFrame.
+
+    ``sql_transform``, when given, rewrites the batch text before execution —
+    used by ``--incremental`` to narrow the date window. The default (None)
+    runs the file as-is.
+    """
     sql = read_sql_file(path)
+    if sql_transform is not None:
+        sql = sql_transform(sql)
     log.info("Connecting: %s", redacted_connection_string())
     with connect() as conn:
         df = run_query(sql, conn)
     return select_and_rename(df)
+
+
+def incremental_start_sunday(weeks_back: int, today: date | None = None) -> date:
+    """The Sunday that starts the incremental window, ``weeks_back`` weeks ago.
+
+    Snaps backward to a Sunday (the pipeline's week anchor) so the cutoff always
+    falls on a week boundary — every week is either fully re-pulled or fully
+    kept from the previous snapshot, never split.
+    """
+    d = (today or date.today()) - timedelta(weeks=weeks_back)
+    return d - timedelta(days=(d.weekday() + 1) % 7)
+
+
+def build_incremental_sql(sql_text: str, start_sunday: date) -> str:
+    """Rewrite the batch so @StartSunday is ``start_sunday`` instead of 36mo ago.
+
+    Replaces the ``INCREMENTAL_MARKER`` comment line with a re-assignment of
+    @StartSunday via the same pbi.calendar lookup the batch already uses (an
+    identity lookup, since we pass a Sunday). Raises if the marker is missing —
+    e.g. ``--sql`` points at a batch without it — rather than silently running
+    the full 36-month pull.
+    """
+    iso = f"{start_sunday:%Y-%m-%d}"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", iso):  # belt-and-braces: date only
+        raise ValueError(f"Bad incremental start date: {iso!r}")
+    override = (
+        "select @StartSunday = TheStartingSunday "
+        f"from pbi.calendar where TheDate = '{iso}';"
+    )
+    lines = sql_text.splitlines(keepends=True)
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(INCREMENTAL_MARKER):
+            newline = "\n" if line.endswith("\n") else ""
+            lines[i] = override + newline
+            replaced = True
+            break
+    if not replaced:
+        raise ValueError(
+            f"SQL batch has no '{INCREMENTAL_MARKER}' marker line; cannot run "
+            "an incremental pull against it. Use the default "
+            "demand_details_optimized.sql or drop --incremental."
+        )
+    return "".join(lines)
+
+
+def find_previous_snapshot(folder: str) -> str | None:
+    """Newest dated snapshot workbook in ``folder``, or None.
+
+    Same filename-date ordering as ``prune_old_snapshots`` and the dashboard's
+    snapshot dropdown.
+    """
+    dated = []
+    for path in glob.glob(os.path.join(folder, "all_demand_projections_*.xlsx")):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(path))
+        if m:
+            dated.append((m.group(1), path))
+    if not dated:
+        return None
+    return max(dated)[1]
+
+
+def load_previous_snapshot(path: str) -> pd.DataFrame | None:
+    """Read a snapshot workbook for merging, or None if it's unusable.
+
+    Any failure — unreadable file, missing required columns, unparseable
+    WeekDate — returns None (logged) so the caller falls back to a full pull
+    instead of writing a snapshot with a corrupted history half.
+    """
+    required = [SQL_TO_POWERBI_FORMAT[c] for c in REQUIRED_SQL_COLUMNS]
+    try:
+        df = pd.read_excel(path, header=2)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            log.warning(
+                "Previous snapshot %s is missing column(s) %s; ignoring it.",
+                path, missing,
+            )
+            return None
+        df["WeekDate"] = pd.to_datetime(df["WeekDate"])
+    except Exception as exc:
+        log.warning("Could not read previous snapshot %s: %s", path, exc)
+        return None
+    return df
+
+
+def merge_snapshots(
+    previous: pd.DataFrame, fresh: pd.DataFrame, cutoff: date
+) -> pd.DataFrame:
+    """History before ``cutoff`` from ``previous`` + everything from ``fresh``.
+
+    The incremental SQL only returns weeks >= cutoff, so this is a clean
+    partition at a week boundary, not a key-level upsert. ``fresh``'s column
+    set wins: a column added to the SQL appears (NaN for old rows), a column
+    removed disappears.
+    """
+    cutoff_ts = pd.Timestamp(cutoff)
+    previous = previous.copy()
+    fresh = fresh.copy()
+    previous["WeekDate"] = pd.to_datetime(previous["WeekDate"])
+    fresh["WeekDate"] = pd.to_datetime(fresh["WeekDate"])
+
+    below = int((fresh["WeekDate"] < cutoff_ts).sum())
+    if below:
+        log.warning(
+            "Incremental pull returned %d row(s) before the %s cutoff; "
+            "dropping them (the previous snapshot covers those weeks).",
+            below, cutoff_ts.date(),
+        )
+        fresh = fresh[fresh["WeekDate"] >= cutoff_ts]
+
+    stale_cols = [c for c in previous.columns if c not in fresh.columns]
+    if stale_cols:
+        log.info(
+            "Previous snapshot column(s) not in the fresh pull, dropped: %s",
+            stale_cols,
+        )
+    old = previous[previous["WeekDate"] < cutoff_ts].reindex(
+        columns=fresh.columns
+    )
+
+    # NB: no duplicate-key check here. (SKU, Custnmbr, WeekDate) is NOT unique
+    # in the snapshot — the warehouse grain includes the Customer column, which
+    # select_and_rename drops — and the WeekDate partition above already makes
+    # old/fresh overlap impossible.
+    merged = pd.concat([old, fresh], ignore_index=True)
+    return merged.sort_values(
+        ["WeekDate", COL_SKU, COL_CUST], kind="stable"
+    ).reset_index(drop=True)
 
 
 def write_powerbi_xlsx(df: pd.DataFrame, out_path: str, banner: str = FILTER_BANNER) -> None:
@@ -330,12 +484,43 @@ def write_powerbi_xlsx(df: pd.DataFrame, out_path: str, banner: str = FILTER_BAN
         with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Sheet1", index=False, startrow=2)
             writer.sheets["Sheet1"].cell(row=1, column=1, value=banner)
-        os.replace(tmp, out_path)
+        _replace_with_retry(tmp, out_path)
     except BaseException:
         # Never leave a partial temp workbook behind on failure/interrupt.
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+
+
+def _replace_with_retry(
+    src: str, dst: str, attempts: int = 6, delay: float = 3.0
+) -> None:
+    """``os.replace`` that rides out a briefly-locked destination.
+
+    On Windows the replace fails with PermissionError while ANOTHER process has
+    ``dst`` open — e.g. the dashboard mid-``read_excel``, or Excel. Same-day
+    re-pulls overwrite an existing snapshot, so this collision genuinely
+    happens (it killed the 2026-07-13 14:36 refresh). A reader's lock lasts
+    seconds; a workbook left open in Excel doesn't — so retry briefly, then
+    surface a clear error instead of a bare traceback.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise ValueError(
+                    f"Could not overwrite {dst}: the file stayed locked by "
+                    "another program (Excel?) through "
+                    f"{attempts} attempts over ~{int((attempts - 1) * delay)}s. "
+                    "Close it and re-run."
+                ) from None
+            log.warning(
+                "%s is locked (attempt %d/%d); retrying in %.0fs…",
+                os.path.basename(dst), attempt, attempts, delay,
+            )
+            time.sleep(delay)
 
 
 def _default_raw_dir() -> str:
@@ -455,6 +640,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Output .xlsx path (default: dated file in DEMAND_RAW_DIR or here).",
     )
     parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Only pull the last --weeks-back weeks of actuals plus all forward "
+            "projections, and merge into the newest existing snapshot. Falls "
+            "back to a full pull if no usable snapshot exists."
+        ),
+    )
+    parser.add_argument(
+        "--weeks-back",
+        type=int,
+        default=INCREMENTAL_WEEKS_BACK,
+        help=(
+            "Incremental window in weeks (default: %(default)s, or "
+            "DEMAND_INCREMENTAL_WEEKS_BACK)."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
     return parser.parse_args(argv)
@@ -476,8 +679,45 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  pbi.calendar latest row: {tuple(cal) if cal else None}")
             return 0
 
-        df = load_demand_details(args.sql)
-        df = _apply_output_filters(df)
+        previous = None
+        if args.incremental:
+            if args.weeks_back < 0:
+                raise ValueError(
+                    f"--weeks-back must be >= 0, got {args.weeks_back}."
+                )
+            prev_path = find_previous_snapshot(_default_raw_dir())
+            previous = load_previous_snapshot(prev_path) if prev_path else None
+            if previous is None:
+                log.warning(
+                    "No usable previous snapshot in %s; running a FULL pull.",
+                    _default_raw_dir(),
+                )
+
+        if previous is not None:
+            cutoff = incremental_start_sunday(args.weeks_back)
+            log.info(
+                "Incremental pull: weeks >= %s (last %d week(s) + projections), "
+                "merging into %s", cutoff, args.weeks_back,
+                os.path.basename(prev_path),
+            )
+            fresh = load_demand_details(
+                args.sql, sql_transform=lambda s: build_incremental_sql(s, cutoff)
+            )
+            fresh = _apply_output_filters(fresh)
+            if fresh.empty:
+                log.error(
+                    "Incremental pull returned 0 rows; refusing to write a "
+                    "truncated snapshot. Previous file left untouched."
+                )
+                return 1
+            df = merge_snapshots(previous, fresh, cutoff)
+            print(
+                f"Incremental: {len(fresh):,} fresh rows (weeks >= {cutoff}) + "
+                f"{len(df) - len(fresh):,} rows kept from previous snapshot"
+            )
+        else:
+            df = load_demand_details(args.sql)
+            df = _apply_output_filters(df)
 
         out_path = args.out or default_out_path()
         out_dir = os.path.dirname(os.path.abspath(out_path))

@@ -7,6 +7,11 @@
     dashboard discovers snapshots in (raw_inputs/demand_projections). The
     dashboard then serves that pre-computed file instantly — nobody waits 10 min.
 
+    This nightly run deliberately does the FULL 36-month pull (no --incremental
+    flag): it is the self-healing baseline that picks up restated actuals, item
+    renames and customer remaps. The dashboard's refresh button runs the fast
+    incremental pull and merges into the snapshot this job produces.
+
     Register it with Windows Task Scheduler (see the schtasks command in the
     project notes). It logs each run, with timestamps, to
     logs/<yyyy-MM-dd>/logs_refresh.txt next to this script, and exits with the

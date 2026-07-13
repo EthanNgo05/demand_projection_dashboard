@@ -337,7 +337,7 @@ def refresh_in_progress():
     return True, started
 
 
-def start_refresh():
+def start_refresh(incremental: bool = True):
     """Launch extract_demand_details.py in the background. Returns (ok, message).
 
     Reuses THIS interpreter (``sys.executable``) so the pull runs in the same
@@ -345,6 +345,11 @@ def start_refresh():
     connection vars). ``DEMAND_RAW_DIR`` is pinned to the exact folder the
     dashboard reads so the child writes where we look, regardless of CWD. The
     child's output is appended to logs/<date>/logs_refresh.txt for diagnosis.
+
+    ``incremental`` (the default) pulls only the last few weeks of actuals plus
+    all forward projections and merges them into the newest snapshot — minutes
+    instead of the ~20-minute full pull. The nightly scheduled task still runs
+    the full pull as the self-healing baseline.
     """
     running, started = refresh_in_progress()
     if running:
@@ -367,12 +372,14 @@ def start_refresh():
             creationflags = (
                 subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             )
+        mode = "incremental" if incremental else "full"
         logf = open(_refresh_log_path(), "a", encoding="utf-8")
         try:
-            logf.write(f"\n===== DW refresh started {now} =====\n")
+            logf.write(f"\n===== DW refresh ({mode}) started {now} =====\n")
             logf.flush()
             subprocess.Popen(
-                [sys.executable, EXTRACT_SCRIPT],
+                [sys.executable, EXTRACT_SCRIPT]
+                + (["--incremental"] if incremental else []),
                 cwd=HERE,
                 env=env,
                 stdout=logf,
@@ -1166,24 +1173,27 @@ def main():
             st.info("Upload the Demand Planning Details and Plytix files below.")
 
         # ----- Pull fresh data straight from the warehouse -----------------
-        # The ~10-minute SQL pull runs in the background (see start_refresh);
-        # the page keeps serving the current snapshot and switches to the new
-        # one once it lands. A nightly scheduled task refreshes this too, so the
-        # button is only for "I need it fresher than last night".
+        # The SQL pull runs in the background (see start_refresh); the page
+        # keeps serving the current snapshot and switches to the new one once
+        # it lands. The button does a fast INCREMENTAL pull (last few weeks +
+        # projections merged into the newest snapshot); the nightly scheduled
+        # task still does the full 36-month pull as the self-healing baseline.
         if running:
             st.info(
                 f"⏳ Refreshing from the data warehouse… started {started}. "
                 "You can keep working on the current snapshot; it switches to "
-                "the fresh pull automatically when it finishes (~20 min)."
+                "the fresh pull automatically when it finishes (usually a few "
+                "minutes)."
             )
             if st.button("Check for new data", key="check_refresh"):
                 st.rerun()
         elif st.button(
             "🔄 Refresh from data warehouse",
             key="refresh_dw",
-            help="Run the ~10-minute SQL pull now, in the background. The page "
-                 "stays usable and switches to the new snapshot when it's ready. "
-                 "A nightly job also refreshes this automatically.",
+            help="Pull the last few weeks + current projections now, in the "
+                 "background (a few minutes), and merge them into the latest "
+                 "snapshot. The page stays usable and switches to the new "
+                 "snapshot when it's ready. A nightly job does the full pull.",
         ):
             ok, msg = start_refresh()
             if ok:

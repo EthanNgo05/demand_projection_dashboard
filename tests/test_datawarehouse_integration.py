@@ -218,5 +218,23 @@ def test_start_refresh_launches_and_writes_lock(dash, monkeypatch):
     # Launched with THIS interpreter + the extract script...
     assert calls["args"][0] == sys.executable
     assert calls["args"][1] == dashboard.EXTRACT_SCRIPT
+    # ...as the fast incremental pull (the nightly task does the full one)...
+    assert calls["args"][2] == "--incremental"
     # ...and DEMAND_RAW_DIR pinned to the folder the dashboard reads.
     assert calls["kwargs"]["env"]["DEMAND_RAW_DIR"] == folder
+
+
+def test_start_refresh_full_pull_when_incremental_disabled(dash, monkeypatch):
+    dashboard, _ = dash
+    calls = {}
+
+    class _FakePopen:
+        def __init__(self, args, **kwargs):
+            calls["args"] = args
+
+    monkeypatch.setattr(dashboard.subprocess, "Popen", _FakePopen)
+
+    ok, _ = dashboard.start_refresh(incremental=False)
+
+    assert ok is True
+    assert "--incremental" not in calls["args"]
