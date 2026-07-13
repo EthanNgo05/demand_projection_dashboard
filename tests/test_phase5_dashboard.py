@@ -102,6 +102,49 @@ def test_run_agent_button_triggers_graph(monkeypatch):
 
 
 @needs_data
+def test_smoothing_params_survive_model_round_trip():
+    """Selecting Holt autofits tuned α/β/φ; switching model away and back must
+    re-establish them, not silently fall back to the file defaults.
+
+    Regression test for the autofit_tried / autofit_params desync: switching
+    model dropped ``autofit_params`` but left the ``autofit_tried`` marker set,
+    so returning to the smoothing model saw "already tried", skipped the
+    backtest, and computed the forecast with file-default α/β/φ instead of the
+    tuned ones — changing the displayed forecast for an unchanged view/snapshot.
+    """
+    import dashboard
+
+    HOLT = "Holt's Exponential Smoothing"
+    OTHER = "8-Week Moving Average"
+    assert HOLT in dashboard.MODEL_OPTIONS and OTHER in dashboard.MODEL_OPTIONS
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=120).run()
+    assert not at.exception
+
+    # Select Holt -> autofit runs and stores tuned params for this view.
+    at.radio(key="model_choice").set_value(HOLT).run()
+    assert not at.exception
+    assert "autofit_params" in at.session_state, (
+        "autofit did not run on first Holt selection"
+    )
+    assert at.session_state["autofit_params"]["model"] == dashboard.MODEL_OPTIONS[HOLT]
+
+    # Leave to another model, then come back to Holt.
+    at.radio(key="model_choice").set_value(OTHER).run()
+    assert not at.exception
+    at.radio(key="model_choice").set_value(HOLT).run()
+    assert not at.exception
+
+    # Returning to Holt must re-establish autofit params for this view; otherwise
+    # the forecast is silently computed with file defaults -> a different number.
+    assert "autofit_params" in at.session_state, (
+        "autofit params lost after a model round-trip: the forecast falls back "
+        "to file-default alpha/beta/phi and changes for an unchanged view"
+    )
+    assert at.session_state["autofit_params"]["model"] == dashboard.MODEL_OPTIONS[HOLT]
+
+
+@needs_data
 def test_provider_selector_change_does_not_call_llm(monkeypatch):
     """Moving the reasoning-LLM selector (a plain rerun) must not fire the LLM.
     The agent only runs on the button click, so any non-button interaction is a

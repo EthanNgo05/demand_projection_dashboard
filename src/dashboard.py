@@ -1074,7 +1074,15 @@ def main():
             # the new pipeline re-autofits (or falls back to its file defaults).
             # A structural change also recomputes automatically via the compute
             # gate.
+            #
+            # Drop the "autofit_tried" marker too: it and autofit_params are one
+            # logical fact ("we have a backtest result for this model/view/
+            # snapshot"). Clearing only the params leaves the marker asserting we
+            # already tried, so returning to a smoothing model would SKIP the
+            # backtest and silently fall back to file-default α/β/φ — changing
+            # the forecast for an unchanged view. Keep the two in lock-step.
             st.session_state.pop("autofit_params", None)
+            st.session_state.pop("autofit_tried", None)
 
         # After "Run Agent Summary" picks a best model, switch the toggle to it
         # so the screen shows that model. The switch is stashed as a pending key
