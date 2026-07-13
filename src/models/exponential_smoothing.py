@@ -1208,6 +1208,12 @@ if __name__ == "__main__":
         }
     )
     df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
+    # The fixed-width export space-pads SKU/CUSTNMBR; strip before any key-based
+    # lookup so SKUs match the list-price index and CUSTNMBRs fold via
+    # COMBINED_GROUPING. Kept in sync with agent/data_io._clean (shared by the
+    # dashboard + agent), which this __main__ block mirrors.
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
     df = df[~df['CUSTNMBR'].isin(CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
 

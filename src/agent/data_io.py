@@ -135,6 +135,17 @@ def _clean(raw_df, P):
         df["Orders"] = np.nan  # legacy file without an Orders/Sum of Quantity col
 
     df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
+    # The fixed-width warehouse export space-pads its key columns (e.g.
+    # 'BT1028      ', 'AMAZON-DS      '). Strip that surrounding whitespace here —
+    # the single ingestion boundary both the dashboard and agent share — before
+    # any key-based join or lookup runs. SKU padding made every SKU miss the
+    # (stripped) list-price index (blank revenue risk) and the Plytix SKU sets
+    # (active-in / discontinued checks silently ran on nothing). CUSTNMBR padding
+    # made padded customers miss CUSTOMERS_TO_IGNORE and COMBINED_GROUPING, so a
+    # group like AMAZON-DC fragmented across its padded/clean spellings instead of
+    # folding together. Strip CUSTNMBR *before* the ignore filter and grouping map.
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
     df = df[~df["CUSTNMBR"].isin(P.CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
     df["Customer Grouping"] = (
