@@ -63,7 +63,7 @@ log = logging.getLogger("extract_demand_details")
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Repo root (parent of src/) — sql/, raw_inputs/ etc. live there, not under src/.
 REPO_ROOT = os.path.dirname(HERE)
-DEFAULT_SQL = os.path.join(REPO_ROOT, "sql", "demand_details.sql")
+DEFAULT_SQL = os.path.join(REPO_ROOT, "sql", "demand_details_optimized.sql")
 
 # SQL result column -> PowerBI/Excel column the dashboard expects. Only these
 # columns are carried into the output; everything else is dropped (and logged).
