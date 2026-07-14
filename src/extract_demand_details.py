@@ -122,7 +122,7 @@ KEEP_SNAPSHOTS = int(os.environ.get("DEMAND_KEEP_SNAPSHOTS", "10"))
 # projections, which the SQL window always covers). A few weeks of buffer, not
 # just one, because recent POS/order rows can be restated after the fact; the
 # nightly full pull self-heals anything older.
-INCREMENTAL_WEEKS_BACK = int(os.environ.get("DEMAND_INCREMENTAL_WEEKS_BACK", "3"))
+INCREMENTAL_WEEKS_BACK = int(os.environ.get("DEMAND_INCREMENTAL_WEEKS_BACK", "2"))
 
 # Marker line in the .sql batch that --incremental replaces with a re-assignment
 # of @StartSunday. On a full pull it's a plain comment, so the batch is
