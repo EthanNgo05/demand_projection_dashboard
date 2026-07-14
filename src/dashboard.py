@@ -136,7 +136,38 @@ def pipeline_path():
         )
     return MODEL_OPTIONS[choice]
 
-ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
+ALL_CUSTOMERS_VIEW = "All customers (combined)"
+
+# Per-region rollup views: "All Customers - <region label>" combines every
+# customer group in one region into a single forecast (e.g.
+# "All Customers - AU (ACR)" = Web Sales - AU + Others - AU). The region is
+# embedded in the view string so everything keyed on `view` — cache keys,
+# session signatures, headers, filename mangling, the agent's summary path —
+# works unchanged. Mirrored in agent/config.py (must match exactly).
+REGION_ALL_PREFIX = "All Customers - "
+
+
+def region_all_view(region):
+    """The synthetic per-region combined view string for ``region``."""
+    return f"{REGION_ALL_PREFIX}{region}"
+
+
+def region_from_view(view):
+    """Region label if ``view`` is a per-region rollup, else None."""
+    if isinstance(view, str) and view.startswith(REGION_ALL_PREFIX):
+        return view[len(REGION_ALL_PREFIX):]
+    return None
+
+
+def _region_frame(df, P, region):
+    """Rows of ``df`` whose customer group belongs to ``region``.
+
+    str() on region_for_group: a custom pipeline may return non-string labels
+    (see the key=str note in the sidebar), and the view string the region was
+    parsed from was built from the str form.
+    """
+    groups = df["Customer Grouping"].map(lambda g: str(P.region_for_group(g)))
+    return df[groups == region]
 
 # The warehouse regions we check "Active in" against. A SKU should only be
 # projected in a region it is "Active in" (per the Plytix export); a projection
@@ -556,6 +587,15 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
             agg, today_ts, grouping_label=combined_label,
             breakdown_df=df, **kwargs,
         )
+    elif (region_all := region_from_view(view)) is not None:
+        # Per-region rollup: every customer group in the region, combined.
+        # breakdown_df mirrors the ALL CUSTOMERS branch so the summary carries
+        # 'Top Volume Customer Groups' (here: the region's groups).
+        sub = _region_frame(df, P, region_all)
+        agg = P.aggregate_to_sku_week(sub)
+        summary, weekly = P.fit_regression(
+            agg, today_ts, grouping_label=view, breakdown_df=sub, **kwargs
+        )
     else:
         sub = df[df["Customer Grouping"] == view]
         agg = P.aggregate_to_sku_week(sub)
@@ -602,6 +642,8 @@ def run_autofit(df, view, today_ts, model_path, min_weeks=None):
         return None
     if view == ALL_CUSTOMERS_VIEW:
         agg = P.aggregate_to_sku_week(df)
+    elif (region_all := region_from_view(view)) is not None:
+        agg = P.aggregate_to_sku_week(_region_frame(df, P, region_all))
     else:
         agg = P.aggregate_to_sku_week(df[df["Customer Grouping"] == view])
     kwargs = {}
@@ -1361,7 +1403,7 @@ def main():
         st.header("View")
         by_region = list_views(df)
         scope = st.radio(
-            "Scope", [ALL_CUSTOMERS_VIEW, "By customer group"], index=0
+            "Scope", [ALL_CUSTOMERS_VIEW, "By region"], index=0
         )
         if scope == ALL_CUSTOMERS_VIEW:
             view = ALL_CUSTOMERS_VIEW
@@ -1371,7 +1413,15 @@ def main():
             # labels; sorting by their string form keeps the selectbox from
             # crashing on mixed types (see logs.txt, 2026-07-06).
             region = st.selectbox("Region", sorted(by_region.keys(), key=str))
-            view = st.selectbox("Customer group", by_region[region])
+            # First entry is the synthetic per-region rollup ("All Customers"),
+            # every group in this region combined. Its stored value embeds the
+            # region so caches/keys stay unique across regions; format_func
+            # shows the short label the user expects.
+            all_view = region_all_view(region)
+            view = st.selectbox(
+                "Customer group", [all_view] + by_region[region],
+                format_func=lambda v: f"All Customers - {region}" if v == all_view else v,
+            )
 
     # ----- Agent summary (LangGraph pipeline) ------------------------------
     # Button-triggered only: invoking the graph backtests all three models AND
@@ -1543,15 +1593,19 @@ def main():
             )
 
             by_cust = None
-            if view == ALL_CUSTOMERS_VIEW and summary is not None and not summary.empty:
+            region_all = region_from_view(view)
+            is_combined = view == ALL_CUSTOMERS_VIEW or region_all is not None
+            if is_combined and summary is not None and not summary.empty:
                 def _bump(done, total, group):
                     frac = 0.4 + 0.55 * (done / max(total, 1))
                     prog.progress(
                         min(frac, 0.98),
                         text=f"Per-customer forecast… ({done}/{total})",
                     )
+                # A region rollup breaks out only its own region's groups.
+                src = df if region_all is None else _region_frame(df, P, region_all)
                 by_cust = compute_by_customer(
-                    df, today_ts, pipeline_path(),
+                    src, today_ts, pipeline_path(),
                     prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
                 )
             prog.progress(1.0, text="Done")
@@ -1758,7 +1812,7 @@ def main():
     # broken out by customer group. Computed alongside the main forecast in the
     # recompute block above (and cached in session_state) so it stays on the
     # same snapshot / prices / parameters as the SKU table.
-    if view == ALL_CUSTOMERS_VIEW:
+    if view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None:
         st.markdown("### Summary table by SKU and Customer")
         if by_cust is None or by_cust.empty:
             st.info("No per-customer forecasts to show for this snapshot.")
@@ -1795,7 +1849,12 @@ def main():
             st.download_button(
                 "⬇️ Download the summary table by SKU and Customer",
                 data=summary_to_excel(by_cust_table),
-                file_name=f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx",
+                file_name=(
+                    f"{view.replace('/', '-').replace(' ', '_')}"
+                    f"_demand_projections_{today_str}.xlsx"
+                    if view != ALL_CUSTOMERS_VIEW
+                    else f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx"
+                ),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_by_customer",
             )
@@ -1936,10 +1995,16 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
     row_group = missing_df["CUSTNMBR"].map(lambda c: grouping.get(c, c))
 
     # A by-customer-group view shows only that group's rows (not every customer
-    # in the region); ALL CUSTOMERS shows everything.
+    # in the region); a per-region "All Customers" rollup shows every group in
+    # its region; ALL CUSTOMERS shows everything.
     group_scoped = view != ALL_CUSTOMERS_VIEW
+    region_all = region_from_view(view)
     table_df = missing_df
-    if group_scoped:
+    if region_all is not None and P is not None:
+        table_df = missing_df[
+            row_group.map(lambda g: str(P.region_for_group(g))) == region_all
+        ]
+    elif group_scoped:
         table_df = missing_df[row_group == view]
 
     if table_df.empty:

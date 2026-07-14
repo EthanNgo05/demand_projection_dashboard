@@ -33,6 +33,23 @@ MODEL_OPTIONS = {k: v for k, v in MODEL_OPTIONS.items() if os.path.exists(v)}
 # mismatch silently compares/filters the wrong view.
 ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
 
+# MUST match dashboard.py's REGION_ALL_PREFIX exactly — per-region rollup views
+# are "All Customers - <region label>" (e.g. "All Customers - AU (ACR)"):
+# every customer group in one region combined into a single forecast view.
+REGION_ALL_PREFIX = "All Customers - "
+
+
+def region_from_view(view):
+    """Region label if ``view`` is a per-region rollup, else None.
+
+    Mirrors dashboard.region_from_view — both sides must parse the view
+    string identically or the agent filters a different frame than the
+    dashboard forecasts (the parity tests would catch the drift).
+    """
+    if isinstance(view, str) and view.startswith(REGION_ALL_PREFIX):
+        return view[len(REGION_ALL_PREFIX):]
+    return None
+
 # Phase 3 calibration (2026-07-08, all_demand_projections_2026-07-07.xlsx):
 # ran evaluate/select across all 48 real views (ALL + 47 groupings). Winning
 # backtest MAEs (shared 6-week single-holdout, raw actuals): p50=7.7, p80=39.1,

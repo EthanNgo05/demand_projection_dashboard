@@ -88,7 +88,12 @@ def test_run_agent_button_triggers_graph(monkeypatch):
         os.remove(default_path)
 
     try:
-        at = AppTest.from_file(DASHBOARD, default_timeout=60).run()
+        # 300s: on a cold cache the real workbook's load + exclusion checks
+        # alone take ~60s and the first ALL CUSTOMERS compute (incl. the
+        # per-customer breakdown) another ~60s+ (outgrew the old 60s budget,
+        # 2026-07-14). The timeout is a cap, not a wait — a passing run
+        # returns as soon as the script finishes.
+        at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
         assert not at.exception
         at.button(key="run_agent_summary").click().run()
 
@@ -157,7 +162,7 @@ def test_provider_selector_change_does_not_call_llm(monkeypatch):
 
     monkeypatch.setattr("agent.llm.get_llm", _boom)
 
-    at = AppTest.from_file(DASHBOARD, default_timeout=60).run()
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
     assert not at.exception
     at.radio(key="agent_llm_provider").set_value("Local LLM").run()
     assert called["llm"] is False

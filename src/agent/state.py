@@ -23,7 +23,7 @@ class ModelResult(TypedDict, total=False):
 
 
 class AgentState(TypedDict, total=False):
-    view: str  # config.ALL_CUSTOMERS_VIEW or a Customer Grouping
+    view: str  # config.ALL_CUSTOMERS_VIEW, "All Customers - <region>", or a Customer Grouping
     today_ts: pd.Timestamp
     raw_path: str
     price_path: Optional[str]

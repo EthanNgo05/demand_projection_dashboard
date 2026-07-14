@@ -32,9 +32,14 @@ assert ALL_CUSTOMERS_VIEW == dashboard.ALL_CUSTOMERS_VIEW
 
 @pytest.fixture(scope="module")
 def all_views(sample_cleaned_df):
-    """Every view the dashboard exposes: combined + all Customer Groupings."""
+    """Every view the dashboard exposes: combined + all Customer Groupings,
+    plus one per-region "All Customers" rollup (one, not all five, to keep the
+    already-slow matrix from growing another 15 graph invocations)."""
+    by_region = dashboard.list_views(sample_cleaned_df)
     views = [ALL_CUSTOMERS_VIEW]
-    for region_groups in dashboard.list_views(sample_cleaned_df).values():
+    first_region = sorted(by_region.keys(), key=str)[0]
+    views.append(dashboard.region_all_view(first_region))
+    for region_groups in by_region.values():
         views.extend(region_groups)
     # No duplicates, combined first, groupings in a stable order.
     assert len(views) == len(set(views)), views

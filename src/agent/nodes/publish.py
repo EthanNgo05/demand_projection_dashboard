@@ -16,7 +16,8 @@ import json
 import os
 from datetime import datetime
 
-from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS
+from agent.config import MODEL_OPTIONS
+from agent.data_io import view_frame
 from agent.model_loader import load_pipeline
 from agent.state import AgentState
 from log_config import dated_log_path
@@ -57,7 +58,7 @@ def _window_excluded_skus(state: AgentState) -> list[dict]:
     except Exception:  # noqa: BLE001 — a note must never break the terminal node
         return []
 
-    sub = df if view == ALL_CUSTOMERS_VIEW else df[df["Customer Grouping"] == view]
+    sub = view_frame(df, view, P)
     demand = sub[sub["POS"].notna() | sub["Orders"].notna()]
     if demand.empty:
         return []

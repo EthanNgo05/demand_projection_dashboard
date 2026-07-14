@@ -23,7 +23,7 @@ import numpy as np
 import openpyxl
 import pandas as pd
 
-from agent.config import MODEL_OPTIONS
+from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS, region_from_view
 from agent.model_loader import load_pipeline
 
 # Repo root (parent of src/, the folder holding raw_inputs/ + outputs/), so
@@ -47,6 +47,29 @@ def default_pipeline():
 
 def _resolve_pipeline(P):
     return default_pipeline() if P is None else P
+
+
+def view_frame(df, view, P=None):
+    """Rows of ``df`` belonging to ``view``: the full frame (ALL CUSTOMERS),
+    one region's groups (an "All Customers - <region>" rollup), or one
+    customer group. The shared view->frame step for every agent node, kept in
+    exact lockstep with dashboard.compute_view's filtering.
+
+    ``P=None`` falls back to the first configured model — safe because
+    region_for_group is identical across the three model files (see the
+    pipeline contract). str() on its result matches how the view string was
+    built (a custom pipeline may return non-string region labels).
+    """
+    if view == ALL_CUSTOMERS_VIEW:
+        return df
+    region = region_from_view(view)
+    if region is not None:
+        P = _resolve_pipeline(P)
+        groups = df["Customer Grouping"].map(
+            lambda g: str(P.region_for_group(g))
+        )
+        return df[groups == region]
+    return df[df["Customer Grouping"] == view]
 
 
 def _raw_dir(P=None):

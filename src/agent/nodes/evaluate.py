@@ -13,7 +13,8 @@ import inspect
 import numpy as np
 import pandas as pd
 
-from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS
+from agent.config import MODEL_OPTIONS
+from agent.data_io import view_frame
 from agent.logging_util import logger
 from agent.model_loader import load_pipeline
 from agent.state import AgentState
@@ -25,7 +26,7 @@ def evaluate_models(state: AgentState) -> dict:
     df = state["cleaned_df"]
     view = state["view"]
     today_ts = state["today_ts"]
-    sub = df if view == ALL_CUSTOMERS_VIEW else df[df["Customer Grouping"] == view]
+    sub = view_frame(df, view)
 
     results = dict(state["results"])
     errors = list(state.get("errors", []))

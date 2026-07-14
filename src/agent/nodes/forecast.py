@@ -7,7 +7,8 @@ MODEL_OPTIONS label.
 
 import inspect
 
-from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS
+from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS, region_from_view
+from agent.data_io import view_frame
 from agent.model_loader import load_pipeline
 from agent.state import AgentState
 
@@ -25,7 +26,8 @@ def run_all_models(state: AgentState) -> dict:
     view = state["view"]
     today_ts = state["today_ts"]
     is_all = view == ALL_CUSTOMERS_VIEW
-    sub = df if is_all else df[df["Customer Grouping"] == view]
+    is_region_all = region_from_view(view) is not None
+    sub = view_frame(df, view)
 
     results = {}
     errors = list(state.get("errors", []))
@@ -40,9 +42,10 @@ def run_all_models(state: AgentState) -> dict:
                 else {}
             )
             # Mirror dashboard.compute_view exactly: the ALL view uses the
-            # pipeline's own combined label and passes breakdown_df so the
-            # summary carries 'Top Volume Customer Groups'. Skipping either
-            # makes the Phase 2 parity test fail on the combined view.
+            # pipeline's own combined label; both the ALL view and a region
+            # rollup pass breakdown_df so the summary carries 'Top Volume
+            # Customer Groups'. Skipping either makes the Phase 2 parity test
+            # fail on the combined views.
             if is_all:
                 label_for_fit = getattr(
                     P, "ALL_CUSTOMERS_LABEL", getattr(P, "ALL_SKUS_LABEL", view)
@@ -50,6 +53,8 @@ def run_all_models(state: AgentState) -> dict:
                 kwargs["breakdown_df"] = sub
             else:
                 label_for_fit = view
+                if is_region_all:
+                    kwargs["breakdown_df"] = sub
             summary, weekly = P.fit_regression(
                 agg, today_ts, grouping_label=label_for_fit, **kwargs
             )

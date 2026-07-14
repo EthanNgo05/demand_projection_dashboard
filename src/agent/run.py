@@ -20,7 +20,8 @@ from agent.graph import build_graph
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Run the demand-projection agent pipeline.")
     ap.add_argument("--view", default=ALL_CUSTOMERS_VIEW,
-                    help="Customer Grouping to forecast, or the combined view (default).")
+                    help="Customer Grouping to forecast, the combined view (default), "
+                         "or a per-region rollup like 'All Customers - AU (ACR)'.")
     ap.add_argument("--provider", choices=["anthropic", "local"], default=None,
                     help="LLM provider for the reasoning nodes (overrides LLM_PROVIDER).")
     args = ap.parse_args(argv)

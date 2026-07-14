@@ -37,6 +37,17 @@ def test_all_customers_view_matches_dashboard():
     assert f'ALL_CUSTOMERS_VIEW = "{ALL_CUSTOMERS_VIEW}"' in dashboard_src
 
 
+def test_region_all_prefix_matches_dashboard():
+    # Same drift guard for the per-region rollup views ("All Customers - <region>"):
+    # the agent parses the region out of the view string, so both sides must
+    # build/parse it with the identical prefix.
+    from agent.config import REGION_ALL_PREFIX
+
+    with open(os.path.join(SRC_ROOT, "dashboard.py"), encoding="utf-8") as f:
+        dashboard_src = f.read()
+    assert f'REGION_ALL_PREFIX = "{REGION_ALL_PREFIX}"' in dashboard_src
+
+
 def test_no_streamlit_import_required():
     # import agent.state/config in a fresh subprocess and confirm streamlit
     # never gets imported as a side effect

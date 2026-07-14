@@ -40,7 +40,13 @@ def _agent_results(view, sample_raw_path):
     return final_state["results"]
 
 
-@pytest.mark.parametrize("view", [ALL_CUSTOMERS_VIEW, "AMAZON-DC"])
+# Views: the global combined view, one real Customer Grouping, and one
+# per-region rollup (region chosen to match AMAZON-DC's region so the sample
+# data is guaranteed to populate it).
+@pytest.mark.parametrize(
+    "view",
+    [ALL_CUSTOMERS_VIEW, "AMAZON-DC", dashboard.region_all_view("US (LBC+NJ)")],
+)
 def test_parity_all_models(view, sample_raw_path, sample_cleaned_df):
     results = _agent_results(view, sample_raw_path)
     for label, path in MODEL_OPTIONS.items():
