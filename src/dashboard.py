@@ -326,46 +326,62 @@ def _refresh_lock_path():
     return os.path.join(_raw_dir(), ".refresh.lock")
 
 
-def _clear_refresh_lock():
-    """Remove the refresh lock, ignoring the case where it's already gone."""
+def _clear_lock(lock_path):
+    """Remove a refresh lock, ignoring the case where it's already gone."""
     try:
-        os.remove(_refresh_lock_path())
+        os.remove(lock_path)
     except OSError:
         pass
+
+
+def _refresh_state(lock_path, completed_since, label):
+    """Shared lock state-machine: (running, started_str) for a background pull.
+
+    Self-healing, so no process has to clean up after itself:
+      * ``completed_since(lock_mtime)`` says whether the pull's output has
+        landed since the lock appeared — if so, clear the lock and report idle.
+      * If the lock is older than REFRESH_STALE_SECONDS with no output, the
+        pull crashed/was killed — clear the lock so the button re-enables.
+
+    What "output has landed" means differs per pull (the demand snapshot is one
+    atomic workbook; a warehouse snapshot is a five-file set), which is exactly
+    the ``completed_since`` seam.
+    """
+    if not os.path.exists(lock_path):
+        return False, None
+    lock_mtime = os.path.getmtime(lock_path)
+
+    if completed_since(lock_mtime):
+        _clear_lock(lock_path)
+        return False, None
+
+    if time.time() - lock_mtime > REFRESH_STALE_SECONDS:
+        logger.warning("%s refresh lock is stale (>%ds); clearing it.",
+                       label, REFRESH_STALE_SECONDS)
+        _clear_lock(lock_path)
+        return False, None
+
+    try:
+        with open(lock_path, encoding="utf-8") as f:
+            started = f.read().strip()
+    except OSError:
+        started = ""
+    return True, started
 
 
 def refresh_in_progress():
     """(running, started_str): is a background DW pull active, and when it began.
 
-    Self-healing, so no process has to clean up after itself:
-      * If a snapshot has been written *since* the lock appeared, the pull
-        finished — clear the lock and report idle (the new file is now in the
-        dropdown).
-      * If the lock is older than REFRESH_STALE_SECONDS with no new file, the
-        pull crashed/was killed — clear the lock so the button re-enables.
+    Completion = any demand snapshot written since the lock appeared (the
+    extract writes one atomic workbook, so the first newer file IS the result).
     """
-    path = _refresh_lock_path()
-    if not os.path.exists(path):
-        return False, None
-    lock_mtime = os.path.getmtime(path)
+    def _completed(lock_mtime):
+        files = discover_raw_files()
+        return bool(files) and max(
+            os.path.getmtime(p) for _, p in files
+        ) >= lock_mtime
 
-    files = discover_raw_files()
-    if files and max(os.path.getmtime(p) for _, p in files) >= lock_mtime:
-        _clear_refresh_lock()
-        return False, None
-
-    if time.time() - lock_mtime > REFRESH_STALE_SECONDS:
-        logger.warning("DW refresh lock is stale (>%ds); clearing it.",
-                       REFRESH_STALE_SECONDS)
-        _clear_refresh_lock()
-        return False, None
-
-    try:
-        with open(path, encoding="utf-8") as f:
-            started = f.read().strip()
-    except OSError:
-        started = ""
-    return True, started
+    return _refresh_state(_refresh_lock_path(), _completed, "DW")
 
 
 def start_refresh(incremental: bool = True):
@@ -388,14 +404,32 @@ def start_refresh(incremental: bool = True):
 
     raw_dir = _raw_dir()
     os.makedirs(raw_dir, exist_ok=True)
+    mode = "incremental" if incremental else "full"
+    return _launch_refresh(
+        _refresh_lock_path(),
+        EXTRACT_SCRIPT,
+        ["--incremental"] if incremental else [],
+        {"DEMAND_RAW_DIR": raw_dir},
+        f"DW refresh ({mode})",
+    )
 
-    # Write the lock BEFORE launching so a double-click can't spawn two pulls.
+
+def _launch_refresh(lock_path, script, extra_args, env_overrides, header):
+    """Write ``lock_path``, then launch ``script`` detached. Returns (ok, msg).
+
+    The lock is written BEFORE launching so a double-click can't spawn two
+    pulls. The child reuses THIS interpreter (``sys.executable``) so it runs in
+    the same venv the dashboard was started with and inherits the environment
+    (the SQL_* connection vars) plus ``env_overrides`` (the raw-dir pin, so the
+    child writes exactly where the dashboard looks, regardless of CWD). Output
+    is appended to logs/<date>/logs_refresh.txt for diagnosis.
+    """
     now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(_refresh_lock_path(), "w", encoding="utf-8") as f:
+    with open(lock_path, "w", encoding="utf-8") as f:
         f.write(now)
 
     try:
-        env = {**os.environ, "DEMAND_RAW_DIR": raw_dir}
+        env = {**os.environ, **env_overrides}
         # Detach on Windows so the pull outlives this Streamlit run/rerun and
         # isn't tied to the parent's console.
         creationflags = 0
@@ -403,14 +437,12 @@ def start_refresh(incremental: bool = True):
             creationflags = (
                 subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             )
-        mode = "incremental" if incremental else "full"
         logf = open(_refresh_log_path(), "a", encoding="utf-8")
         try:
-            logf.write(f"\n===== DW refresh ({mode}) started {now} =====\n")
+            logf.write(f"\n===== {header} started {now} =====\n")
             logf.flush()
             subprocess.Popen(
-                [sys.executable, EXTRACT_SCRIPT]
-                + (["--incremental"] if incremental else []),
+                [sys.executable, script] + extra_args,
                 cwd=HERE,
                 env=env,
                 stdout=logf,
@@ -424,12 +456,68 @@ def start_refresh(incremental: bool = True):
             # doesn't leak a file handle per click.
             logf.close()
     except Exception as exc:
-        _clear_refresh_lock()
-        logger.exception("Failed to launch DW refresh")
+        _clear_lock(lock_path)
+        logger.exception("Failed to launch %s", header)
         return False, f"Could not start refresh: {exc}"
 
-    logger.info("DW refresh launched (%s); writing to %s", now, raw_dir)
+    logger.info("%s launched (%s)", header, now)
     return True, now
+
+
+# --------------------------------------------------------------------------- #
+# Manual warehouse-projections refresh                                        #
+# --------------------------------------------------------------------------- #
+# Same lock-file coordination as the demand refresh above, with one twist: a
+# warehouse snapshot is FIVE region files written back-to-back, not one atomic
+# workbook. Each file is atomic, but the set is not — so completion means "the
+# newest dated group holds every region, all newer than the lock", not "any
+# newer file exists" (which would clear the lock after the first region lands
+# and briefly serve a partial snapshot).
+WAREHOUSE_EXTRACT_SCRIPT = os.path.join(HERE, "extract_warehouse_projections.py")
+
+
+def _wh_refresh_lock_path():
+    """Lock for an in-flight warehouse pull, in the warehouse snapshot folder
+    (not matched by the ``*.xlsx`` discovery glob)."""
+    return os.path.join(data_io._warehouse_dir(), ".refresh.lock")
+
+
+def _wh_snapshot_complete_since(lock_mtime):
+    """True once a full 5-region snapshot newer than the lock exists."""
+    groups = data_io.discover_warehouse_files()
+    if not groups:
+        return False
+    newest = [
+        p for p in next(iter(groups.values())) if data_io._warehouse_region(p)
+    ]
+    regions = {data_io._warehouse_region(p) for p in newest}
+    if not set(data_io.REGION_PREFIXES) <= regions:
+        return False
+    return all(os.path.getmtime(p) >= lock_mtime for p in newest)
+
+
+def warehouse_refresh_in_progress():
+    """(running, started_str): is a background warehouse pull active."""
+    return _refresh_state(
+        _wh_refresh_lock_path(), _wh_snapshot_complete_since, "Warehouse"
+    )
+
+
+def start_warehouse_refresh():
+    """Launch extract_warehouse_projections.py in the background; (ok, msg)."""
+    running, started = warehouse_refresh_in_progress()
+    if running:
+        return False, f"A warehouse refresh is already running (started {started})."
+
+    wh_dir = data_io._warehouse_dir()
+    os.makedirs(wh_dir, exist_ok=True)
+    return _launch_refresh(
+        _wh_refresh_lock_path(),
+        WAREHOUSE_EXTRACT_SCRIPT,
+        [],
+        {"WAREHOUSE_RAW_DIR": wh_dir},
+        "Warehouse refresh",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1294,13 +1382,63 @@ def main():
 
         # ----- Warehouse projections (drive the "missing projections" table) --
         # A DIFFERENT data source than the demand file above: the warehouse
-        # projection exports are wide grids (one per region: AU/CA/EU/JP/US) that
-        # list every active-in SKU×customer×week, with a blank cell where no
-        # projection exists. That blank is exactly what the "missing future
-        # projections" table finds, so it needs these files, not the demand file.
+        # projection exports (one per region: AU/CA/EU/JP/US) list which
+        # SKU×customer×week cells carry a projection — a missing cell is
+        # exactly what the "missing future projections" table finds, so it
+        # needs these files, not the demand file. The nightly SQL pull (or the
+        # refresh button below) writes them; a manual PowerBI export (wide
+        # matrix or long table layout — the reader sniffs which) still works.
         st.header("Warehouse projections")
         warehouse_df = None
+        wh_running, wh_started = warehouse_refresh_in_progress()
+
+        # If a warehouse refresh we launched just finished and actually wrote a
+        # newer snapshot, jump the snapshot selection to it (before the widget
+        # is instantiated — same dance as the demand snapshot above).
         wh_snapshots = data_io.discover_warehouse_files()
+        _wh_all_paths = [p for ps in wh_snapshots.values() for p in ps]
+        if st.session_state.get("_wh_refresh_active") and not wh_running:
+            st.session_state.pop("_wh_refresh_active", None)
+            baseline = st.session_state.pop("_wh_refresh_baseline", 0.0)
+            newest_mtime = max(
+                (os.path.getmtime(p) for p in _wh_all_paths), default=0.0
+            )
+            if wh_snapshots and newest_mtime > baseline:
+                st.session_state["warehouse_snapshot"] = next(iter(wh_snapshots))
+                st.toast("Fresh warehouse projections loaded from the data warehouse.")
+            else:
+                st.warning(
+                    "The warehouse refresh didn't produce a new snapshot — "
+                    "see logs/<date>/logs_refresh.txt for details."
+                )
+
+        if wh_running:
+            st.info(
+                f"⏳ Refreshing warehouse projections… started {wh_started}. "
+                "You can keep working; the snapshot switches automatically "
+                "when all five regional files have landed."
+            )
+            if st.button("Check for new data", key="check_wh_refresh"):
+                st.rerun()
+        elif st.button(
+            "🔄 Refresh warehouse projections",
+            key="refresh_warehouse",
+            help="Pull the warehouse-allocated projections from the data "
+                 "warehouse now, in the background, and write the five "
+                 "regional snapshot files. The page stays usable and switches "
+                 "to the new snapshot when it's ready. The nightly job does "
+                 "the same pull automatically.",
+        ):
+            ok, msg = start_warehouse_refresh()
+            if ok:
+                st.session_state["_wh_refresh_active"] = True
+                st.session_state["_wh_refresh_baseline"] = max(
+                    (os.path.getmtime(p) for p in _wh_all_paths), default=0.0
+                )
+                st.success(f"Refresh started ({msg}) — running in the background.")
+                st.rerun()
+            else:
+                st.warning(msg)
         with st.expander(
             "Upload warehouse projection files (AU/CA/EU/JP/US)",
             expanded=not wh_snapshots,

@@ -554,35 +554,41 @@ def default_out_path() -> str:
     )
 
 
-def prune_old_snapshots(folder: str, keep: int = KEEP_SNAPSHOTS) -> list[str]:
-    """Delete all but the newest ``keep`` dated snapshot workbooks in ``folder``.
+def prune_old_snapshots(
+    folder: str,
+    keep: int = KEEP_SNAPSHOTS,
+    pattern: str = "all_demand_projections_*.xlsx",
+) -> list[str]:
+    """Delete all but the newest ``keep`` dated snapshots in ``folder``.
 
     Keeps the output folder — and the dashboard's snapshot dropdown — from
-    growing without bound as the nightly pull adds a file per day. "Newest" is by
-    the ``YYYY-MM-DD`` date embedded in the filename (the same ordering the
-    dashboard uses), NOT mtime, so re-running today's pull never evicts an older
-    day. Files whose name carries no date are left untouched — never
+    growing without bound as the nightly pull adds a snapshot per day. "Newest"
+    is by the ``YYYY-MM-DD`` date embedded in the filename (the same ordering
+    the dashboard uses), NOT mtime, so re-running today's pull never evicts an
+    older day. ``keep`` counts distinct *dates*, not files — a warehouse
+    snapshot is five region files sharing one date and lives or dies as a set.
+    Files matching ``pattern`` but carrying no date are left untouched — never
     auto-deleted. ``keep <= 0`` disables pruning entirely. Returns the list of
     removed paths.
     """
     if keep <= 0:
         return []
-    dated = []
-    for path in glob.glob(os.path.join(folder, "all_demand_projections_*.xlsx")):
+    by_date: dict[str, list[str]] = {}
+    for path in glob.glob(os.path.join(folder, pattern)):
         m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(path))
         if m:
-            dated.append((m.group(1), path))
-    dated.sort(reverse=True)  # newest date first
+            by_date.setdefault(m.group(1), []).append(path)
     removed = []
-    for _, path in dated[keep:]:
-        try:
-            os.remove(path)
-            removed.append(path)
-        except OSError as exc:
-            log.warning("Could not prune old snapshot %s: %s", path, exc)
+    for d in sorted(by_date, reverse=True)[keep:]:  # newest dates first
+        for path in by_date[d]:
+            try:
+                os.remove(path)
+                removed.append(path)
+            except OSError as exc:
+                log.warning("Could not prune old snapshot %s: %s", path, exc)
     if removed:
         log.info(
-            "Pruned %d old snapshot(s), keeping newest %d: %s",
+            "Pruned %d old snapshot file(s), keeping the newest %d date(s): %s",
             len(removed), keep, [os.path.basename(p) for p in removed],
         )
     return removed

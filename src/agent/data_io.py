@@ -569,22 +569,117 @@ def _warehouse_region(name):
     return next((p for p in REGION_PREFIXES if base.startswith(p)), None)
 
 
+def _long_export_header_row(source):
+    """Header row index of a long-format export, or None if the file is wide.
+
+    The long PowerBI export ("export data" of the underlying table) carries a
+    literal ``WeekDate`` column header within the first few rows (banner row,
+    blank row, then headers). The legacy wide matrix export never does — its
+    week dates are *column values* on the title row. That makes ``WeekDate``
+    a reliable format discriminator.
+    """
+    probe = pd.read_excel(source, header=None, nrows=6)
+    for i in range(min(len(probe), 4)):
+        row = probe.iloc[i].map(lambda v: str(v).strip())
+        if (row == "WeekDate").any():
+            return i
+    return None
+
+
+def _warehouse_long_export_to_long(source, location, header_row):
+    """Clean one long-format export (PowerBI table export, or the file written
+    by extract_warehouse_projections.py) into the WAREHOUSE_LONG_COLS shape.
+
+    Unlike the wide grid, a long file has no blank cells: a missing projection
+    is an *absent row*. The frame returned here is therefore only the observed
+    values — combine_warehouse_projections reconstructs the full
+    pairs × weeks grid (reintroducing NaN = missing) across the snapshot.
+    Explicit zero rows are kept as real values: a 0 cell in the wide grid
+    rendered as 0, i.e. "has a projection", not "missing".
+
+    Keys are normalized here (whitespace-stripped — GP CHAR columns are
+    space-padded — and trailing '*' display markers dropped) so SKUs line up
+    with the Plytix side, which compute_active_products strips the same way.
+    """
+    df = pd.read_excel(source, header=header_row)
+
+    renames = {}
+    for c in df.columns:
+        s = str(c).strip()
+        if "DisplaySKU" in s or s == "SKU":
+            renames[c] = "SKU"
+        elif s == "CUSTNMBR":
+            renames[c] = "CUSTNMBR"
+        elif s == "WeekDate":
+            renames[c] = "WeekDate"
+        elif "Proj" in s:
+            renames[c] = "Projection"
+    df = df.rename(columns=renames)
+    needed = ["SKU", "CUSTNMBR", "WeekDate", "Projection"]
+    missing_cols = [c for c in needed if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Long-format warehouse export is missing column(s) {missing_cols} "
+            f"(found: {list(df.columns)})"
+        )
+    df = df[needed].copy()
+
+    df["SKU"] = df["SKU"].astype(str).str.strip().str.rstrip("*")
+    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
+    # Timestamps *before* any cross-file week union — a mixed wide/long
+    # snapshot must not end up with string-vs-Timestamp duplicate week keys.
+    df["WeekDate"] = pd.to_datetime(df["WeekDate"], errors="coerce")
+    df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce")
+
+    # Footer notes / stray rows: no usable key -> not data.
+    bad_key = (
+        df["SKU"].isin(["", "nan", "None"])
+        | df["CUSTNMBR"].isin(["", "nan", "None"])
+        | df["WeekDate"].isna()
+    )
+    df = df[~bad_key]
+
+    long_df = df.sort_values(["SKU", "CUSTNMBR", "WeekDate"]).reset_index(drop=True)
+    long_df["Location"] = location
+    long_df = long_df[WAREHOUSE_LONG_COLS]
+    # Tag for combine_warehouse_projections: this frame still needs its
+    # missing cells reconstructed (attrs survive because combine reads the
+    # flag before doing anything to the frame).
+    long_df.attrs["needs_grid_reconstruction"] = True
+    return long_df, location
+
+
 def warehouse_wide_to_long(source, name=None):
-    """Clean one wide warehouse export into a long frame with a Location column.
+    """Clean one warehouse export into a long frame with a Location column.
 
     ``source`` is a filesystem path or a file-like object (e.g. a BytesIO of an
     uploaded workbook); ``name`` supplies the filename used to detect the region
     prefix (defaults to ``source`` when it is a path). Returns (long_df,
     location), or (None, None) if the name has no known region prefix.
 
-    Ported verbatim from active_missing_projections.py: unmerge the SKU column
-    and forward-fill it, cut the footer notes, then melt wide -> long. Blank
-    projection cells are kept as NaN (that is exactly what "missing" means).
+    Despite the name (kept for compatibility), this now sniffs the layout and
+    dispatches: legacy *wide* matrix exports go through the original
+    unmerge-and-melt path below; *long* table exports (what PowerBI's
+    "export data" produces today, and what extract_warehouse_projections.py
+    writes from the data warehouse) go through _warehouse_long_export_to_long.
+    Pointing the wide parser at a long file used to melt the banner row into
+    garbage — silently emptying the missing-projections table.
     """
     name = name if name is not None else source
     location = _warehouse_region(name)
     if location is None:
         return None, None
+
+    # Sniff the layout. ``source`` may be a BytesIO from an upload, which the
+    # probe read consumes — rewind before and after so the real parse (and a
+    # caller retry) starts from the top.
+    if hasattr(source, "seek"):
+        source.seek(0)
+    header_row = _long_export_header_row(source)
+    if hasattr(source, "seek"):
+        source.seek(0)
+    if header_row is not None:
+        return _warehouse_long_export_to_long(source, location, header_row)
 
     # 1) Load with openpyxl so we can unmerge the SKU column and propagate its value
     wb = openpyxl.load_workbook(source, data_only=True)
@@ -636,6 +731,28 @@ def warehouse_wide_to_long(source, name=None):
     return long_df, location
 
 
+def _reconstruct_missing_cells(long_df, weeks):
+    """Rebuild the full pairs × weeks grid for one long-format export.
+
+    A long export only lists observed values, so a missing projection is an
+    absent row. Recreate what the wide matrix showed: every (SKU, CUSTNMBR)
+    pair in the file gets a cell for every week in ``weeks``, NaN where the
+    file had no row — NaN being exactly the "missing" signal downstream.
+    Duplicate keys (e.g. a starred and unstarred variant of the same SKU that
+    normalization collapsed) are summed.
+    """
+    pairs = long_df[["SKU", "CUSTNMBR"]].drop_duplicates()
+    values = (
+        long_df.dropna(subset=["Projection"])
+        .groupby(["SKU", "CUSTNMBR", "WeekDate"], as_index=False)["Projection"]
+        .sum()
+    )
+    grid = pairs.merge(pd.DataFrame({"WeekDate": weeks}), how="cross")
+    grid = grid.merge(values, on=["SKU", "CUSTNMBR", "WeekDate"], how="left")
+    grid["Location"] = long_df["Location"].iloc[0]
+    return grid[WAREHOUSE_LONG_COLS]
+
+
 def combine_warehouse_projections(sources):
     """Clean and concatenate many warehouse exports into one long frame.
 
@@ -643,12 +760,32 @@ def combine_warehouse_projections(sources):
     path or file-like object and ``name`` is the filename (for region
     detection). Files whose name lacks a region prefix are skipped. Returns an
     empty (but correctly-columned) frame when nothing usable is provided.
+
+    Long-format exports get their missing cells reconstructed against the
+    union of week dates across ALL long files in the snapshot — per-file weeks
+    are not enough: a week in which a small region (e.g. JP) has no
+    projections at all vanishes from that region's file entirely, and its
+    missing cells would otherwise never be flagged. The big regions (US/EU)
+    anchor the union. Wide-grid frames already carry their NaN cells and pass
+    through untouched.
     """
-    frames = []
+    frames, to_reconstruct = [], []
     for source, name in sources:
         long_df, _ = warehouse_wide_to_long(source, name)
-        if long_df is not None:
+        if long_df is None:
+            continue
+        if long_df.attrs.get("needs_grid_reconstruction") and not long_df.empty:
+            to_reconstruct.append(long_df)
+        elif not long_df.attrs.get("needs_grid_reconstruction"):
             frames.append(long_df)
+        # empty long-format frame (headers-only region file): nothing to add.
+
+    if to_reconstruct:
+        weeks = sorted(
+            pd.concat([f["WeekDate"] for f in to_reconstruct]).dropna().unique()
+        )
+        frames.extend(_reconstruct_missing_cells(f, weeks) for f in to_reconstruct)
+
     if not frames:
         return pd.DataFrame(columns=WAREHOUSE_LONG_COLS)
     return pd.concat(frames, ignore_index=True)

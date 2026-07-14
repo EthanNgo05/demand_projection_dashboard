@@ -58,6 +58,24 @@ def test_prune_keeps_newest_n_by_date(tmp_path):
     assert len(removed) == 2  # the two oldest dates
 
 
+def test_prune_counts_dates_not_files(tmp_path):
+    # A warehouse snapshot is 5 region files sharing one date; ``keep`` counts
+    # distinct dates so a snapshot lives or dies as a set.
+    for d in ["2026-07-01", "2026-07-02", "2026-07-03"]:
+        for region in ["AU", "CA", "EU", "JP", "US"]:
+            path = tmp_path / f"{region}_warehouse_projections_{d}.xlsx"
+            path.write_text("x", encoding="utf-8")
+
+    removed = extract.prune_old_snapshots(
+        str(tmp_path), keep=2, pattern="*_warehouse_projections_*.xlsx"
+    )
+
+    assert len(removed) == 5  # the whole 2026-07-01 set
+    remaining = {p.name for p in tmp_path.glob("*.xlsx")}
+    assert all("2026-07-01" not in n for n in remaining)
+    assert len(remaining) == 10
+
+
 def test_prune_disabled_when_keep_not_positive(tmp_path):
     for d in ["2026-07-01", "2026-07-02", "2026-07-03"]:
         _make_snapshot(str(tmp_path), d)
@@ -238,3 +256,138 @@ def test_start_refresh_full_pull_when_incremental_disabled(dash, monkeypatch):
 
     assert ok is True
     assert "--incremental" not in calls["args"]
+
+
+# --------------------------------------------------------------------------- #
+# 4. Warehouse refresh lock state-machine                                     #
+# --------------------------------------------------------------------------- #
+# Same self-healing lock as above, except a warehouse snapshot is a FIVE-file
+# set: completion must wait for every region, not just the first new file.
+REGIONS = ["AU", "CA", "EU", "JP", "US"]
+
+
+def _make_wh_files(folder, date_str, regions, mtime=None):
+    paths = []
+    for region in regions:
+        path = os.path.join(
+            folder, f"{region}_warehouse_projections_{date_str}.xlsx"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        paths.append(path)
+    return paths
+
+
+@pytest.fixture
+def wh_dash(monkeypatch, tmp_path):
+    """Import the dashboard with the warehouse folder pointed at a temp dir.
+
+    The warehouse refresh functions reach the filesystem only through
+    ``data_io._warehouse_dir`` (lock path + snapshot discovery), so patching it
+    isolates the lock logic.
+    """
+    import dashboard
+    from agent import data_io
+
+    folder = str(tmp_path)
+    monkeypatch.setattr(data_io, "_warehouse_dir",
+                        lambda warehouse_dir=None: folder)
+    monkeypatch.setattr(dashboard, "_refresh_log_path",
+                        lambda: os.path.join(folder, "logs_refresh.txt"))
+    return dashboard, folder
+
+
+def test_wh_refresh_idle_when_no_lock(wh_dash):
+    dashboard, _ = wh_dash
+    assert dashboard.warehouse_refresh_in_progress() == (False, None)
+
+
+def test_wh_refresh_still_running_on_partial_snapshot(wh_dash):
+    # 3 of 5 region files newer than the lock: the set is incomplete, so the
+    # pull is still "running" — the dashboard must not serve a partial snapshot.
+    dashboard, folder = wh_dash
+    lock = dashboard._wh_refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-07-14 09:00:00")
+    t0 = time.time()  # fresh lock — must not trip the staleness check
+    os.utime(lock, (t0, t0))
+    _make_wh_files(folder, "2026-07-14", ["AU", "CA", "EU"], mtime=t0 + 100)
+
+    running, started = dashboard.warehouse_refresh_in_progress()
+    assert running is True
+    assert started == "2026-07-14 09:00:00"
+    assert os.path.exists(lock)
+
+
+def test_wh_refresh_completes_when_all_regions_land(wh_dash):
+    dashboard, folder = wh_dash
+    lock = dashboard._wh_refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-07-14 09:00:00")
+    t0 = 1_000_000.0
+    os.utime(lock, (t0, t0))
+    _make_wh_files(folder, "2026-07-14", REGIONS, mtime=t0 + 100)
+
+    running, _ = dashboard.warehouse_refresh_in_progress()
+    assert running is False
+    assert not os.path.exists(lock)  # self-healed
+
+
+def test_wh_refresh_ignores_older_snapshot_group(wh_dash):
+    # Yesterday's complete set predates the lock: not a completion.
+    dashboard, folder = wh_dash
+    lock = dashboard._wh_refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-07-14 09:00:00")
+    t0 = time.time()  # fresh lock — must not trip the staleness check
+    os.utime(lock, (t0, t0))
+    _make_wh_files(folder, "2026-07-13", REGIONS, mtime=t0 - 100)
+
+    running, _ = dashboard.warehouse_refresh_in_progress()
+    assert running is True
+
+
+def test_wh_refresh_stale_lock_is_cleared(wh_dash):
+    dashboard, folder = wh_dash
+    lock = dashboard._wh_refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("old run")
+    old = time.time() - (dashboard.REFRESH_STALE_SECONDS + 60)
+    os.utime(lock, (old, old))
+
+    running, _ = dashboard.warehouse_refresh_in_progress()
+    assert running is False
+    assert not os.path.exists(lock)
+
+
+def test_start_warehouse_refresh_launches_and_writes_lock(wh_dash, monkeypatch):
+    dashboard, folder = wh_dash
+    calls = {}
+
+    class _FakePopen:
+        def __init__(self, args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(dashboard.subprocess, "Popen", _FakePopen)
+
+    ok, _ = dashboard.start_warehouse_refresh()
+
+    assert ok is True
+    assert os.path.exists(dashboard._wh_refresh_lock_path())
+    assert calls["args"][0] == sys.executable
+    assert calls["args"][1] == dashboard.WAREHOUSE_EXTRACT_SCRIPT
+    # WAREHOUSE_RAW_DIR pinned to the folder the dashboard reads.
+    assert calls["kwargs"]["env"]["WAREHOUSE_RAW_DIR"] == folder
+
+
+def test_start_warehouse_refresh_blocks_when_already_running(wh_dash):
+    dashboard, _ = wh_dash
+    with open(dashboard._wh_refresh_lock_path(), "w", encoding="utf-8") as f:
+        f.write("2026-07-14 10:00:00")
+
+    ok, msg = dashboard.start_warehouse_refresh()
+    assert ok is False
+    assert "already running" in msg

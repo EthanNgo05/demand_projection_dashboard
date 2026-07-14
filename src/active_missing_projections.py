@@ -2,7 +2,11 @@
 #
 # All the heavy lifting lives in agent/data_io.py (the single source of truth,
 # shared with the dashboard and the agent):
-#   - combine_warehouse_projections : clean the wide warehouse exports -> long
+#   - combine_warehouse_projections : clean the regional warehouse exports ->
+#                                     long (both layouts: the legacy wide grid
+#                                     and the long table that PowerBI exports
+#                                     and extract_warehouse_projections.py
+#                                     writes from the data warehouse)
 #   - compute_missing_projections   : active SKUs missing future projections in
 #                                     regions they ARE 'Active in'
 #

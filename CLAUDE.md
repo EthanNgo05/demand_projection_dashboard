@@ -24,8 +24,9 @@ streamlit run src/dashboard.py
 # Batch forecast (each model file is also a standalone script; writes per-group + combined .xlsx to outputs/)
 python src/models/exponential_smoothing.py   # or regression.py / xgboost.py
 
-# Nightly warehouse pull (~10 min) -> dated all_demand_projections_<date>.xlsx
-python src/extract_demand_details.py          # or the scheduled wrapper: ./refresh_demand_data.ps1
+# Nightly warehouse pulls (or the scheduled wrapper for both: ./refresh_demand_data.ps1)
+python src/extract_demand_details.py          # ~10 min -> dated all_demand_projections_<date>.xlsx
+python src/extract_warehouse_projections.py   # ~2 min  -> 5 regional <REGION>_warehouse_projections_<date>.xlsx
 
 # Tests (fast suite, 14 tests). The agent package lives under src/; pytest.ini puts src/ on sys.path.
 pytest tests/ -v
@@ -64,7 +65,7 @@ The dashboard **introspects `fit_regression`'s signature** to decide which sideb
 ### Data flow & inputs
 
 - `sql/demand_details.sql` is the warehouse query behind the nightly pull. It's **UTF-16 encoded** (opens as garbled/spaced text in some tools — that's expected, per `.gitattributes`). `demand_details_optimized.sql` is a work-in-progress optimized rewrite. Region "Others - <country>" buckets attach at `Custnmbr` grain via `MIN(Customer)` — don't drop them when optimizing.
-- Raw inputs live at the repo root under `raw_inputs/`: `demand_projections/all_demand_projections_<date>.xlsx` (PowerBI export, the main POS/projection snapshot), `list_prices/list_prices_*.xlsx` (Plytix export — drives revenue-risk columns *and* the two data-quality checks below), and `warehouse_projections/<REGION>_*.xlsx`.
+- Raw inputs live at the repo root under `raw_inputs/`: `demand_projections/all_demand_projections_<date>.xlsx` (PowerBI export, the main POS/projection snapshot), `list_prices/list_prices_*.xlsx` (Plytix export — drives revenue-risk columns *and* the two data-quality checks below), and `warehouse_projections/<REGION>_*.xlsx` (normally written by `extract_warehouse_projections.py` from `sql/warehouse_projections.sql`; manual PowerBI exports also work — `data_io.warehouse_wide_to_long` sniffs whether a file is the legacy wide matrix or the long table layout, and for long files reconstructs the missing SKU×customer×week cells that drive the missing-projections table).
 - **Data-quality checks** (dashboard, need the Plytix export): SKUs projected into a region they aren't "Active in", and Discontinued/Inactive SKUs still carrying projections — both flagged, excluded from the forecast, and listed in their own tables.
 - Only Python code lives under `src/`. Data/log/doc folders (`raw_inputs/`, `outputs/`, `logs/`, `sql/`, `docs/`, `notebooks/`) stay at the repo root — `outputs/` and `logs/` are gitignored.
 
