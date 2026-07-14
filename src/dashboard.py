@@ -1318,7 +1318,7 @@ def main():
             if st.button("Check for new data", key="check_refresh"):
                 st.rerun()
         elif st.button(
-            "🔄 Refresh from data warehouse",
+            "🔄 Refresh data",
             key="refresh_dw",
             help="Pull the last few weeks + current projections now, in the "
                  "background (a few minutes), and merge them into the latest "
@@ -1421,7 +1421,7 @@ def main():
             if st.button("Check for new data", key="check_wh_refresh"):
                 st.rerun()
         elif st.button(
-            "🔄 Refresh warehouse projections",
+            "🔄 Refresh data",
             key="refresh_warehouse",
             help="Pull the warehouse-allocated projections from the data "
                  "warehouse now, in the background, and write the five "
