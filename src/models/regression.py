@@ -407,11 +407,11 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
         x = ((src_grp["WeekDate"] - first_week).dt.days / 7).round().values
         slope = np.polyfit(x, y, 1)[0] if n >= 2 and len(set(x)) >= 2 else 0.0
 
-        # Anchor to the mean; nudge by the dampened slope each week out.
-        projected_15 = [
-            max(round(mean_val + slope * TREND_WEIGHT * (k + 1), 1), 0)
-            for k in range(15)
-        ]
+        # Flat forecast: compute the first week's value and hold it across all
+        # 15 weeks (no week-to-week trend drift). The app re-runs weekly and
+        # only the first projection is ever used, so every week repeats it.
+        first = max(round(mean_val + slope * TREND_WEIGHT, 1), 0)
+        projected_15 = [first] * 15
 
         summary_rows.append(
             {

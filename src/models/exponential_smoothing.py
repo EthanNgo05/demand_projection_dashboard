@@ -777,12 +777,13 @@ def autofit_smoothing(df, today, alpha_grid=None, beta_grid=None, phi_grid=None,
 
     ``df`` must be at SKU-week granularity (see ``aggregate_to_sku_week``) --
     the same frame ``fit_exponential_smoothing`` receives. For every SKU with
-    enough history the last ``holdout_weeks`` completed weeks are hidden, the
-    model is fit on the remainder with each parameter combination, and the
-    hidden weeks are forecast and scored (absolute error, in units, on the
-    cleansed series, forecasts floored at zero). ``folds`` rolling origins
-    slide the cut-off back ``fold_step`` weeks at a time so the winner
-    generalises across recent windows rather than fitting one lucky one.
+    enough history the model is fit on all weeks up to a rolling cut-off with
+    each parameter combination, and the single next week is forecast and scored
+    one-step-ahead (absolute error, in units, on the cleansed series, forecast
+    floored at zero). One-step-ahead matches the published forecast, which is
+    flat at the first week's value, so only next-week accuracy is used. ``folds``
+    rolling origins slide the cut-off back ``fold_step`` weeks at a time so the
+    winner generalises across recent windows rather than fitting one lucky one.
 
     A fold only counts when its training slice still has at least
     ``max(min_train_weeks, min_weeks_for_trend)`` weeks -- below
@@ -856,13 +857,15 @@ def autofit_smoothing(df, today, alpha_grid=None, beta_grid=None, phi_grid=None,
                 cut = min_train if (k == 0 and n - min_train >= 1) else None
                 if cut is None:
                     break
-            h = min(int(holdout_weeks), n - cut)
-            if h < 1:
+            # One-step-ahead only: the published forecast is flat at the first
+            # week's value, so tune params on how well they predict the NEXT
+            # week, not a multi-week horizon we no longer use. Each rolling
+            # fold contributes one one-step-ahead sample at a distinct origin.
+            if n - cut < 1:
                 break
-            fc = np.maximum(_holt_grid_forecast(y[:cut], h, A, B, PH), 0.0)
-            actual = y[cut:cut + h]
-            total_err += np.abs(fc - actual[:, None]).sum(axis=0)
-            n_points += h
+            fc = np.maximum(_holt_grid_forecast(y[:cut], 1, A, B, PH), 0.0)  # (1, n_combos)
+            total_err += np.abs(fc[0] - y[cut])
+            n_points += 1
             scored = True
             if cut == min_train:
                 break                    # can't slide the origin back further
@@ -1007,21 +1010,14 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
             min_weeks_for_trend=min_weeks_for_trend,
         )
 
-        # Re-add expected promo lift onto any future promo week in the horizon.
-        # The factor is fixed (PROMO_UPLIFT) or estimated per SKU from its own
-        # historical promo weeks ("auto"); the cleansed baseline stays the basis.
-        if isinstance(PROMO_UPLIFT, str) and PROMO_UPLIFT.lower() == "auto":
-            est = estimate_promo_uplift(y_raw, y, method)
-            factor = est if est is not None else PROMO_UPLIFT_DEFAULT
-        else:
-            factor = float(PROMO_UPLIFT)
-        factor = min(max(factor, 1.0), PROMO_UPLIFT_MAX)
-        mult = promo_week_multipliers(forecast_weeks, factor, promo_set)
-
-        # Floor at zero (demand can't be negative) and round to 1 decimal,
-        # matching the regression pipeline's output convention.
-        projected_15 = [max(round(v * m, 1), 0) for v, m in zip(raw_forecast, mult)]
-        n_uplifted = int((mult > 1.0).sum())
+        # Flat forecast: hold the first week's cleansed baseline across all 15
+        # weeks. The app re-runs weekly and only the first projection is ever
+        # used, so every week repeats it. Promo uplifts are intentionally
+        # dropped (multiplier held at 1.0) so the line is truly flat.
+        mult = np.ones(len(forecast_weeks), dtype="float64")
+        base = max(round(float(raw_forecast[0]), 1), 0)
+        projected_15 = [base] * 15
+        n_uplifted = 0
 
         # Audit record: one row per future week that received a promo uplift.
         if uplift_log is not None and n_uplifted:

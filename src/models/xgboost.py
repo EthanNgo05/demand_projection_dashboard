@@ -904,21 +904,14 @@ def fit_xgboost(df, today, grouping_label, breakdown_df=None,
             min_weeks_for_trend=min_weeks_for_trend,
         )
 
-        # Re-add expected promo lift onto any future promo week in the horizon.
-        # The factor is fixed (PROMO_UPLIFT) or estimated per SKU from its own
-        # historical promo weeks ("auto"); the cleansed baseline stays the basis.
-        if isinstance(PROMO_UPLIFT, str) and PROMO_UPLIFT.lower() == "auto":
-            est = estimate_promo_uplift(y_raw, y, method)
-            factor = est if est is not None else PROMO_UPLIFT_DEFAULT
-        else:
-            factor = float(PROMO_UPLIFT)
-        factor = min(max(factor, 1.0), PROMO_UPLIFT_MAX)
-        mult = promo_week_multipliers(forecast_weeks, factor, promo_set)
-
-        # Floor at zero (demand can't be negative) and round to 1 decimal,
-        # matching the other pipelines' output convention.
-        projected_15 = [max(round(v * m, 1), 0) for v, m in zip(raw_forecast, mult)]
-        n_uplifted = int((mult > 1.0).sum())
+        # Flat forecast: hold the first week's prediction across all 15 weeks.
+        # The app re-runs weekly and only the first projection is ever used, so
+        # every week repeats it. Promo uplifts are intentionally dropped
+        # (multiplier held at 1.0) so the line is truly flat.
+        mult = np.ones(len(forecast_weeks), dtype="float64")
+        base = max(round(float(raw_forecast[0]), 1), 0)
+        projected_15 = [base] * 15
+        n_uplifted = 0
 
         # Audit record: one row per future week that received a promo uplift.
         if uplift_log is not None and n_uplifted:

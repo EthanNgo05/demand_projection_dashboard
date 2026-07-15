@@ -80,7 +80,10 @@ def test_generic_backtest_returns_low_mae_on_flat_series(regression_module):
 
 
 def test_generic_backtest_none_when_no_holdout_data(regression_module):
-    df = _flat_series(weeks=3)  # too short for a 6-week holdout
+    # Walk-forward: every step needs at least one training week BEFORE the week
+    # it scores. With only 2 weeks each step's training window is empty, so no
+    # step is scoreable and the backtest returns None.
+    df = _flat_series(weeks=2)
     mae = _generic_backtest(
         regression_module, df, df["WeekDate"].max(), holdout_weeks=6
     )

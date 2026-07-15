@@ -1,9 +1,12 @@
 """Evaluate node: score every model that ran through one shared backtest.
 
-Every model is scored with the SAME single-holdout backtest against the *raw*
-aggregated actuals so the MAEs are apples-to-apples. `autofit_smoothing` is
-used only to pick ES's alpha/beta/phi — its internal MAE comes from a 3-fold
-rolling-origin backtest on the *cleansed* series and is NOT comparable, so it
+Every model is scored with the SAME walk-forward one-step-ahead backtest
+against the *raw* aggregated actuals so the MAEs are apples-to-apples. Because
+the app re-runs weekly and only ever uses each forecast's first week, the
+backtest steps ``today`` back one week at a time and scores only that first
+week against the actual (see ``_generic_backtest``). `autofit_smoothing` is
+used only to pick ES's alpha/beta/phi — its internal MAE comes from a rolling
+one-step-ahead backtest on the *cleansed* series and is NOT comparable, so it
 is recorded separately as ``autofit_mae`` (audit trail only), never used as
 the comparison score.
 """
@@ -63,21 +66,28 @@ def evaluate_models(state: AgentState) -> dict:
 
 
 def _generic_backtest(P, sub, today_ts, holdout_weeks, fit_kwargs=None):
-    """Single-holdout backtest MAE for pipeline module ``P`` on view frame ``sub``.
+    """Walk-forward one-step-ahead backtest MAE for pipeline ``P`` on view ``sub``.
 
-    Aggregate to SKU-week FIRST, then split. Splitting the raw frame and
-    merging forecasts back onto it would join one forecast row against many
-    CUSTNMBR-level rows per (SKU, WeekDate) and skew the MAE. Scores against
-    the *raw* aggregated actuals (POS, falling back to Orders) — the fair,
-    planner-relevant target — even though ES/XGBoost cleanse promo spikes
-    before fitting.
+    The app re-runs weekly and only ever uses each forecast's FIRST week, so we
+    score exactly that: step ``today`` back one week at a time for the last
+    ``holdout_weeks`` completed weeks, re-fit at each step, and compare the first
+    forecast week against that week's actual. Errors pool across steps and SKUs
+    into one MAE.
+
+    Aggregate to SKU-week FIRST (splitting/merging the raw CUSTNMBR frame fans
+    one forecast row onto many rows per (SKU, WeekDate) and skews the MAE). Each
+    model windows its own training data off the ``today`` argument (trains up to
+    the week before ``first_forecast_week``, forecasts starting at it), so
+    passing the full history and only varying ``today`` leaks no future actuals.
+    Scores against the *raw* aggregated actuals (POS, falling back to Orders) —
+    the fair, planner-relevant target — even though ES/XGBoost cleanse promo
+    spikes before fitting.
     """
-    cutoff = today_ts - pd.Timedelta(weeks=holdout_weeks)
     agg = P.aggregate_to_sku_week(sub)
-    train = agg[agg["WeekDate"] <= cutoff]
-    actual = agg[agg["WeekDate"] > cutoff]
-    if train.empty or actual.empty:
+    if agg.empty:
         return None
+    agg = agg.copy()
+    agg["WeekDate"] = pd.to_datetime(agg["WeekDate"])
 
     # Only pass fit kwargs the pipeline actually accepts (alpha/beta/phi exist
     # on ES's fit_regression but not on regression/xgboost).
@@ -88,23 +98,31 @@ def _generic_backtest(P, sub, today_ts, holdout_weeks, fit_kwargs=None):
     except (TypeError, ValueError):
         fit_kwargs = {}
 
-    summary, weekly = P.fit_regression(
-        train, cutoff, grouping_label="backtest", **fit_kwargs
-    )
-    if weekly is None or len(weekly) == 0:
+    abs_errors = []
+    for step in range(1, int(holdout_weeks) + 1):
+        step_today = today_ts - pd.Timedelta(weeks=step)
+        summary, weekly = P.fit_regression(
+            agg, step_today, grouping_label="backtest", **fit_kwargs
+        )
+        if weekly is None or len(weekly) == 0:
+            continue
+        # weekly_df's WeekDate is a python date and its forecast column is
+        # ``projected_pos`` — normalise before merging.
+        weekly = weekly[["SKU", "WeekDate", "projected_pos"]].copy()
+        weekly["WeekDate"] = pd.to_datetime(weekly["WeekDate"])
+        step_week = weekly["WeekDate"].min()          # the first forecast week
+        fc = weekly[weekly["WeekDate"] == step_week][["SKU", "projected_pos"]]
+        merged = fc.merge(agg[agg["WeekDate"] == step_week], on="SKU", how="inner")
+        if merged.empty:
+            continue
+        target = merged["POS"].fillna(merged["Orders"])
+        mask = target.notna()
+        if not mask.any():
+            continue
+        abs_errors.extend(
+            np.abs(merged.loc[mask, "projected_pos"].to_numpy()
+                   - target[mask].to_numpy())
+        )
+    if not abs_errors:
         return None
-
-    # weekly_df's WeekDate is a python date and its forecast column is
-    # ``projected_pos`` (see models/regression.py fit_regression /
-    # models/xgboost.py fit_xgboost weekly_rows) — normalise before merging.
-    weekly = weekly[["SKU", "WeekDate", "projected_pos"]].copy()
-    weekly["WeekDate"] = pd.to_datetime(weekly["WeekDate"])
-    merged = weekly.merge(actual, on=["SKU", "WeekDate"], how="inner")
-    if merged.empty:
-        return None
-    target = merged["POS"].fillna(merged["Orders"])
-    merged = merged[target.notna()]
-    target = target.dropna()
-    if merged.empty:
-        return None
-    return float(np.abs(merged["projected_pos"] - target).mean())
+    return float(np.mean(abs_errors))
