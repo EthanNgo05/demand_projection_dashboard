@@ -1208,14 +1208,14 @@ if __name__ == "__main__":
     # Groups with no POS in the window (their forecast, if any, used Orders).
     if no_pos:
         no_pos_path = os.path.join(OUTPUT_FOLDER, f"no_pos_{today_str}.txt")
-        with open(no_pos_path, "w") as f:
+        with open(no_pos_path, "w", encoding="utf-8") as f:
             f.write("\n".join(no_pos))
         print(f"No-POS customers saved to: {no_pos_path}")
 
     # Groups with neither POS nor Orders (no forecast produced).
     if no_data:
         no_data_path = os.path.join(OUTPUT_FOLDER, f"no_pos_or_orders_{today_str}.txt")
-        with open(no_data_path, "w") as f:
+        with open(no_data_path, "w", encoding="utf-8") as f:
             f.write("\n".join(no_data))
         print(f"No-POS-or-Orders customers saved to: {no_data_path}")
 
@@ -1223,7 +1223,7 @@ if __name__ == "__main__":
     # PROMO_WEEKS and the automatically MAD-detected ones), for the record.
     cleaned_path = os.path.join(OUTPUT_FOLDER, f"cleaned_outliers_{today_str}.txt")
     promo_weeks_resolved = sorted({str(_week_start(d).date()) for d in PROMO_WEEKS}) or ["(none)"]
-    with open(cleaned_path, "w") as f:
+    with open(cleaned_path, "w", encoding="utf-8") as f:
         f.write(f"Outlier / promo weeks cleaned before fitting (anchor {today_str})\n")
         f.write(
             f"Auto-detect (MAD): {'on' if CLEANSE_OUTLIERS else 'off'} "
@@ -1255,7 +1255,7 @@ if __name__ == "__main__":
         if isinstance(PROMO_UPLIFT, str) and PROMO_UPLIFT.lower() == "auto"
         else f"fixed {PROMO_UPLIFT}x"
     )
-    with open(uplift_path, "w") as f:
+    with open(uplift_path, "w", encoding="utf-8") as f:
         f.write(f"Future promo weeks uplifted in the forecast (anchor {today_str})\n")
         f.write(f"Uplift mode: {uplift_mode}; halo: {PROMO_HALO_WEEKS} week(s) each side\n")
         f.write(f"Manual promo weeks: {', '.join(promo_weeks_resolved)}\n")
