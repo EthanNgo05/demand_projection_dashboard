@@ -910,11 +910,73 @@ def _base_layout(fig, title, forecast_start, y_title="Units (POS / Orders)"):
     return fig
 
 
-def aggregate_chart(agg, summary, weekly, anchors, view):
+def _clip_to_range(df, date_range):
+    """Clip a trace frame to a chart date-range window on WeekDate (Y auto-fits).
+
+    date_range is None (no clipping — current behavior) or a (start, end) pair of
+    Timestamps. Empty frames pass through untouched.
+    """
+    if date_range is None or df.empty:
+        return df
+    s, e = date_range
+    return df[(df["WeekDate"] >= s) & (df["WeekDate"] <= e)]
+
+
+def chart_range_control(agg, weekly, lcw, key):
+    """Compact date-range picker rendered right above a chart.
+
+    Returns a (view_start, view_end) pair of Timestamps used to clip that chart's
+    traces so its Y-axis auto-fits the visible window. Each chart gets its own
+    control (unique `key`) and thus its own independent range.
+
+    Presets trim history only — the forecast horizon always stays visible.
+    "Custom…" reveals a calendar / typeable range picker.
+    """
+    RANGE_PRESETS = {
+        "1 Month":  pd.DateOffset(months=1),
+        "3 Months": pd.DateOffset(months=3),
+        "6 Months": pd.DateOffset(months=6),
+        "9 Months": pd.DateOffset(months=9),
+        "1 Year":   pd.DateOffset(years=1),
+        "2 Years":  pd.DateOffset(years=2),
+        "3 Years":  pd.DateOffset(years=3),
+        "All":      None,
+        "Custom…":  "custom",
+    }
+    data_min = pd.to_datetime(agg["WeekDate"]).min()
+    horizon_end = pd.to_datetime(weekly["WeekDate"]).max()
+
+    preset = st.selectbox(
+        "Date range", list(RANGE_PRESETS),
+        index=list(RANGE_PRESETS).index("6 Months"),
+        key=f"{key}_preset",
+        help="How much history to show. The forecast always stays visible.",
+    )
+    if preset == "Custom…":
+        default_start = max(data_min, horizon_end - pd.DateOffset(months=6))
+        picked = st.date_input(
+            "Custom range",
+            value=(default_start.date(), horizon_end.date()),
+            min_value=data_min.date(), max_value=horizon_end.date(),
+            key=f"{key}_custom",
+            help="Click the calendar or type dates. Pick a start and an end.",
+        )
+        # date_input returns a single date mid-selection; apply once both ends chosen.
+        if isinstance(picked, (tuple, list)) and len(picked) == 2:
+            return pd.Timestamp(picked[0]), pd.Timestamp(picked[1])
+        return data_min, horizon_end
+    if preset == "All":
+        return data_min, horizon_end
+    # Preset controls history start; forecast ALWAYS stays visible.
+    return max(data_min, lcw - RANGE_PRESETS[preset]), horizon_end
+
+
+def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None):
     """Total actual demand (historical window) flowing into total forecast (15 wks).
 
     Historical demand uses each SKU's forecast source (POS or Orders) so the
-    actual total is comparable to the forecast total.
+    actual total is comparable to the forecast total. When date_range is given,
+    the plotted traces are clipped to that window so the Y-axis rescales to fit.
     """
     lb, lcw, ffw = anchors
 
@@ -935,6 +997,12 @@ def aggregate_chart(agg, summary, weekly, anchors, view):
         (agg["WeekDate"] >= lb) & (agg["WeekDate"] <= horizon_end)
     ].dropna(subset=["Projection"])
     sys_tot = sys_proj.groupby("WeekDate")["Projection"].sum().reset_index()
+
+    # Clip every plotted trace to the chosen chart window so the Y-axis auto-fits
+    # the visible weeks (does not affect the summary/forecast math).
+    hist_tot = _clip_to_range(hist_tot, date_range)
+    fc_tot = _clip_to_range(fc_tot, date_range)
+    sys_tot = _clip_to_range(sys_tot, date_range)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -963,8 +1031,12 @@ def aggregate_chart(agg, summary, weekly, anchors, view):
     return _base_layout(fig, f"Total weekly demand — {view}", ffw)
 
 
-def sku_chart(sku, desc, source, agg, weekly, anchors):
-    """Per-SKU: actuals (historical window, from its source) + updated forecast + original proj."""
+def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None):
+    """Per-SKU: actuals (historical window, from its source) + updated forecast + original proj.
+
+    When date_range is given, the plotted traces are clipped to that window so the
+    Y-axis rescales to fit the visible weeks.
+    """
     lb, lcw, ffw = anchors
     col = "Orders" if source == "Orders" else "POS"
 
@@ -981,6 +1053,11 @@ def sku_chart(sku, desc, source, agg, weekly, anchors):
 
     fc = weekly[weekly["SKU"].astype(str) == str(sku)].copy()
     fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
+
+    # Clip every plotted trace to the chosen chart window so the Y-axis auto-fits.
+    hist = _clip_to_range(hist, date_range)
+    fc = _clip_to_range(fc, date_range)
+    sys_proj = _clip_to_range(sys_proj, date_range)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -1891,8 +1968,12 @@ def main():
             )
 
     # ----- Aggregate chart --------------------------------------------------
+    # Per-chart date-range picker (own key => independent from the SKU chart).
+    agg_ctrl, _ = st.columns([1, 2])
+    with agg_ctrl:
+        agg_range = chart_range_control(agg, weekly, lcw, key="range_agg")
     st.plotly_chart(
-        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view),
+        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view, date_range=agg_range),
         width="stretch",
     )
 
@@ -1906,8 +1987,10 @@ def main():
 
     cL, cR = st.columns([3, 1])
     with cL:
+        # Per-chart date-range picker (own key => independent from the aggregate chart).
+        sku_range = chart_range_control(agg, weekly, lcw, key="range_sku")
         st.plotly_chart(
-            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw)),
+            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw), date_range=sku_range),
             width="stretch",
         )
     with cR:
