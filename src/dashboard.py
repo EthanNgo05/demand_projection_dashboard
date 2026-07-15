@@ -106,8 +106,8 @@ REPO_ROOT = os.path.dirname(HERE)
 # env var is set, that file is offered as an extra option and is the default.
 MODEL_OPTIONS = {
     "8-Week Moving Average": os.path.join(HERE, "models/regression.py"),
-    "Holt's Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
-    "Holt-Winters Seasonal": os.path.join(HERE, "models/holt_winters.py"),
+    "Holt's (double) exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "Holt-Winters (triple) exponential smoothing": os.path.join(HERE, "models/holt_winters.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
 }
 _ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")

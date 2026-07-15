@@ -104,7 +104,7 @@ def test_es_score_comes_from_generic_backtest_not_autofit(sample_results_state):
     # from the shared backtest; autofit's own non-comparable MAE is stored
     # separately as "autofit_mae"
     out = evaluate_models(sample_results_state)
-    es = out["results"]["Holt's Exponential Smoothing"]
+    es = out["results"]["Holt's (double) exponential smoothing"]
     assert es.get("mae") is not None
     assert "autofit_mae" in es  # recorded for the audit trail
     assert es["mae"] is not es["autofit_mae"]  # not just copied through

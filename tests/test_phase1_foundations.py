@@ -16,7 +16,7 @@ def test_state_and_config_importable():
     from agent.config import MODEL_OPTIONS
     from agent.state import AgentState  # noqa: F401
 
-    assert "Holt's Exponential Smoothing" in MODEL_OPTIONS
+    assert "Holt's (double) exponential smoothing" in MODEL_OPTIONS
 
 
 def test_model_option_paths_exist():

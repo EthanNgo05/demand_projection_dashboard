@@ -1,9 +1,10 @@
 # Streamlit Demand Forecasting Dashboard
 
-A Streamlit + Plotly dashboard for SKU-level demand forecasting. It can dynamically run any of three models:
+A Streamlit + Plotly dashboard for SKU-level demand forecasting. It can dynamically run any of four models:
 
 - **8-Week Moving Average** (8-week average + a light dampened trend)
-- **Holt's Exponential Smoothing** (damped trend, with outlier cleansing and promo uplift)
+- **Holt's (double) exponential smoothing** (level + damped trend, with outlier cleansing and promo uplift)
+- **Holt-Winters (triple) exponential smoothing** (level + damped trend + additive annual seasonality)
 - **XGBoost** (pooled gradient-boosted trees, with the same cleansing/uplift)
 
 ## Project layout

@@ -60,7 +60,7 @@ The dashboard **introspects `fit_regression`'s signature** to decide which sideb
 
 - **`regression.py`** — 8-week moving average nudged by a dampened linear-regression slope (`TREND_WEIGHT = 0.25`). Labeled "8-Week Moving Average" in the UI.
 - **`exponential_smoothing.py`** — Holt's double exponential smoothing (level + trend, damped by `PHI`). The only model with outlier cleansing, promo uplift, and an `autofit_smoothing` grid search.
-- **`holt_winters.py`** — Holt-Winters triple exponential smoothing: level + damped trend + **additive seasonality** (`SEASONAL_PERIODS = 52`, annual), fit via `statsmodels` (self-tunes α/β/γ/φ, so no smoothing sliders/autofit, like XGBoost). Labeled "Holt-Winters Seasonal". Needs ≥2 full annual cycles (`MIN_WEEKS_FOR_SEASONAL = 104`); short-history SKUs and non-converging fits fall back to non-seasonal damped Holt. Reuses `exponential_smoothing.py`'s cleansing / window / flatten-to-week-1 behaviour.
+- **`holt_winters.py`** — Holt-Winters triple exponential smoothing: level + damped trend + **additive seasonality** (`SEASONAL_PERIODS = 52`, annual), fit via `statsmodels` (self-tunes α/β/γ/φ, so no smoothing sliders/autofit, like XGBoost). Labeled "Holt-Winters (triple) exponential smoothing". Needs ≥2 full annual cycles (`MIN_WEEKS_FOR_SEASONAL = 104`); short-history SKUs and non-converging fits fall back to non-seasonal damped Holt. Reuses `exponential_smoothing.py`'s cleansing / window / flatten-to-week-1 behaviour.
 - **`xgboost.py`** — gradient-boosted trees, **pooled per Customer Grouping** (SKU histories are too short to train per-SKU), each SKU scaled by its own mean, forecast 15 weeks recursively. Falls back to sklearn's `HistGradientBoostingRegressor` if `xgboost` isn't installed.
 
 ### Data flow & inputs

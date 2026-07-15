@@ -119,7 +119,7 @@ def test_smoothing_params_survive_model_round_trip():
     """
     import dashboard
 
-    HOLT = "Holt's Exponential Smoothing"
+    HOLT = "Holt's (double) exponential smoothing"
     OTHER = "8-Week Moving Average"
     assert HOLT in dashboard.MODEL_OPTIONS and OTHER in dashboard.MODEL_OPTIONS
 
