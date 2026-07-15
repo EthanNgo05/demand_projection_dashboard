@@ -1912,10 +1912,19 @@ def main():
     total_updated = summary["Updated Projection Average"].sum()
     total_initial = summary["Initial Projection Average"].sum()
     diff = total_updated - total_initial
+    # Total Projection Value = Σ (list price × updated weekly-avg forecast) over
+    # priced SKUs. Unpriced SKUs map to NaN and are skipped, so this covers the
+    # same population as Revenue Risk. Per-week basis (Updated Projection Average
+    # is already a weekly mean).
+    has_price = PRICE_COL in summary.columns and summary[PRICE_COL].notna().any()
+    proj_value = (
+        (summary[PRICE_COL] * summary["Updated Projection Average"]).sum()
+        if has_price else None
+    )
     n_orders = int((summary.get("Data Source") == "Orders").sum()) \
         if "Data Source" in summary.columns else 0
 
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     k1.metric(
         "SKUs Forecasted", f"{len(summary):,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
@@ -1953,6 +1962,17 @@ def main():
         k6.metric(
             "Revenue Risk (avg/wk)", "—",
             help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
+        )
+    if proj_value is not None:
+        k7.metric(
+            "Projected Revenue (avg/wk)", f"${proj_value:,.0f}",
+            help="Σ (list price × updated weekly-avg forecast) over priced SKUs "
+                 "— the gross value at list price of the forecasted weekly demand.",
+        )
+    else:
+        k7.metric(
+            "Projected Revenue (avg/wk)", "—",
+            help="Load a list_prices_*.xlsx (sidebar) to enable projection value.",
         )
     if n_orders:
         st.caption(
@@ -2025,6 +2045,13 @@ def main():
                 "Revenue Risk (avg/wk)",
                 "—" if pd.isna(rv) else f"${rv:+,.0f}",
                 help="Projection difference × list price.",
+            )
+            prv = pv * row["Updated Projection Average"] if pd.notna(pv) else None
+            st.metric(
+                "Projected Revenue (avg/wk)",
+                "—" if prv is None else f"${prv:,.0f}",
+                help="List price × updated weekly-avg forecast — the gross value "
+                     "at list price of this SKU's forecasted weekly demand.",
             )
         if "Top Volume Customer Groups" in summary.columns:
             st.markdown("**Top Volume Groups**")
