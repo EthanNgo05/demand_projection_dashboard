@@ -116,7 +116,7 @@ QUERY_TIMEOUT = int(os.environ.get("SQL_QUERY_TIMEOUT", "900"))
 # How many dated snapshot workbooks to keep in the output folder after a
 # successful write. Older ones are pruned so the folder (and the dashboard's
 # snapshot dropdown) don't grow without bound. 0 (or less) disables pruning.
-KEEP_SNAPSHOTS = int(os.environ.get("DEMAND_KEEP_SNAPSHOTS", "10"))
+KEEP_SNAPSHOTS = int(os.environ.get("DEMAND_KEEP_SNAPSHOTS", "3"))
 
 # --incremental: how many weeks of recent actuals to re-pull (plus all forward
 # projections, which the SQL window always covers). A few weeks of buffer, not

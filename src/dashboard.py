@@ -1278,10 +1278,69 @@ def main():
         df = None
         today_str = None
 
-        # A background DW pull is coordinated through a lock file, so its state
-        # is known before the snapshot dropdown is drawn (needed to auto-select
-        # the fresh file the instant a pull finishes — see below).
+        # Background pulls are coordinated through lock files, so their state
+        # is known before the snapshot dropdowns are drawn (needed to auto-select
+        # the fresh files the instant a pull finishes — see below).
         running, started = refresh_in_progress()
+        wh_running, wh_started = warehouse_refresh_in_progress()
+
+        # ----- Pull fresh data straight from the warehouse ------------------
+        # One button refreshes everything: the demand snapshot and the five
+        # regional warehouse-projection files are pulled in the background
+        # (see start_refresh / start_warehouse_refresh); the Plytix feed is
+        # re-fetched immediately via a cache-busting nonce. The page keeps
+        # serving the current snapshots and switches to the new ones once
+        # they land. The demand pull is a fast INCREMENTAL one (last few
+        # weeks + projections merged into the newest snapshot); the nightly
+        # scheduled task still does the full 36-month pull as the
+        # self-healing baseline.
+        if running or wh_running:
+            st.info(
+                f"⏳ Refreshing data… started {started or wh_started}. "
+                "You can keep working on the current snapshot; the page "
+                "switches to the fresh data automatically when it finishes "
+                "(usually a few minutes)."
+            )
+            if st.button("Check for new data", key="check_refresh"):
+                st.rerun()
+        elif st.button(
+            "🔄 Refresh data",
+            key="refresh_all",
+            help="Pull the demand snapshot (last few weeks + current "
+                 "projections) and the five regional warehouse-projection "
+                 "files from the data warehouse now, in the background, and "
+                 "re-fetch list prices from the Plytix feed. The page stays "
+                 "usable and switches to the new snapshots when they're "
+                 "ready. A nightly job does the full pull.",
+        ):
+            ok_dw, msg_dw = start_refresh()
+            if ok_dw:
+                # Remember the newest mtime NOW so we can tell, on completion,
+                # whether the pull actually produced a newer file.
+                st.session_state["_refresh_active"] = True
+                st.session_state["_refresh_baseline"] = max(
+                    (os.path.getmtime(p) for _, p in files), default=0.0
+                )
+            _wh_paths_now = [
+                p for ps in data_io.discover_warehouse_files().values() for p in ps
+            ]
+            ok_wh, msg_wh = start_warehouse_refresh()
+            if ok_wh:
+                st.session_state["_wh_refresh_active"] = True
+                st.session_state["_wh_refresh_baseline"] = max(
+                    (os.path.getmtime(p) for p in _wh_paths_now), default=0.0
+                )
+            st.session_state["plytix_nonce"] = (
+                st.session_state.get("plytix_nonce", 0) + 1
+            )
+            if ok_dw or ok_wh:
+                st.success(
+                    f"Refresh started ({msg_dw if ok_dw else msg_wh}) — "
+                    "running in the background."
+                )
+                st.rerun()
+            else:
+                st.warning(msg_dw)
 
         # If a refresh we launched this session just finished AND actually wrote
         # a newer file than existed when it started, jump the snapshot selection
@@ -1311,42 +1370,6 @@ def main():
             df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
         else:
             st.info("Upload the Demand Planning Details and Plytix files below.")
-
-        # ----- Pull fresh data straight from the warehouse -----------------
-        # The SQL pull runs in the background (see start_refresh); the page
-        # keeps serving the current snapshot and switches to the new one once
-        # it lands. The button does a fast INCREMENTAL pull (last few weeks +
-        # projections merged into the newest snapshot); the nightly scheduled
-        # task still does the full 36-month pull as the self-healing baseline.
-        if running:
-            st.info(
-                f"⏳ Refreshing from the data warehouse… started {started}. "
-                "You can keep working on the current snapshot; it switches to "
-                "the fresh pull automatically when it finishes (usually a few "
-                "minutes)."
-            )
-            if st.button("Check for new data", key="check_refresh"):
-                st.rerun()
-        elif st.button(
-            "🔄 Refresh data",
-            key="refresh_dw",
-            help="Pull the last few weeks + current projections now, in the "
-                 "background (a few minutes), and merge them into the latest "
-                 "snapshot. The page stays usable and switches to the new "
-                 "snapshot when it's ready. A nightly job does the full pull.",
-        ):
-            ok, msg = start_refresh()
-            if ok:
-                # Remember the newest mtime NOW so we can tell, on completion,
-                # whether the pull actually produced a newer file.
-                st.session_state["_refresh_active"] = True
-                st.session_state["_refresh_baseline"] = max(
-                    (os.path.getmtime(p) for _, p in files), default=0.0
-                )
-                st.success(f"Refresh started ({msg}) — running in the background.")
-                st.rerun()
-            else:
-                st.warning(msg)
 
         with st.expander("Upload the Demand Planning Details Projections from PowerBI", expanded=not files):
             up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
@@ -1389,9 +1412,6 @@ def main():
                 prices = data_io.prices_from_plytix(plytix_df)
                 if prices is not None:
                     st.success(f"{len(prices):,} list prices (Plytix feed)")
-                if st.button("🔄 Refresh from Plytix", key="refresh_plytix"):
-                    st.session_state["plytix_nonce"] = nonce + 1
-                    st.rerun()
             except Exception as e:  # network/parse failure -> fall back to disk
                 plytix_df = None
                 prices = None
@@ -1421,11 +1441,11 @@ def main():
         # SKU×customer×week cells carry a projection — a missing cell is
         # exactly what the "missing future projections" table finds, so it
         # needs these files, not the demand file. The nightly SQL pull (or the
-        # refresh button below) writes them; a manual PowerBI export (wide
-        # matrix or long table layout — the reader sniffs which) still works.
+        # refresh button under "Data source") writes them; a manual PowerBI
+        # export (wide matrix or long table layout — the reader sniffs which)
+        # still works.
         st.header("Warehouse projections")
         warehouse_df = None
-        wh_running, wh_started = warehouse_refresh_in_progress()
 
         # If a warehouse refresh we launched just finished and actually wrote a
         # newer snapshot, jump the snapshot selection to it (before the widget
@@ -1447,33 +1467,6 @@ def main():
                     "see logs/<date>/logs_refresh.txt for details."
                 )
 
-        if wh_running:
-            st.info(
-                f"⏳ Refreshing warehouse projections… started {wh_started}. "
-                "You can keep working; the snapshot switches automatically "
-                "when all five regional files have landed."
-            )
-            if st.button("Check for new data", key="check_wh_refresh"):
-                st.rerun()
-        elif st.button(
-            "🔄 Refresh data",
-            key="refresh_warehouse",
-            help="Pull the warehouse-allocated projections from the data "
-                 "warehouse now, in the background, and write the five "
-                 "regional snapshot files. The page stays usable and switches "
-                 "to the new snapshot when it's ready. The nightly job does "
-                 "the same pull automatically.",
-        ):
-            ok, msg = start_warehouse_refresh()
-            if ok:
-                st.session_state["_wh_refresh_active"] = True
-                st.session_state["_wh_refresh_baseline"] = max(
-                    (os.path.getmtime(p) for p in _wh_all_paths), default=0.0
-                )
-                st.success(f"Refresh started ({msg}) — running in the background.")
-                st.rerun()
-            else:
-                st.warning(msg)
         with st.expander(
             "Upload warehouse projection files (AU/CA/EU/JP/US)",
             expanded=not wh_snapshots,
