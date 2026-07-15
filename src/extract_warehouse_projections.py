@@ -45,6 +45,7 @@ import argparse
 import logging
 import os
 import sys
+import pandas as pd
 from datetime import date
 
 # Reuse the battle-tested plumbing from the demand-details extract instead of
