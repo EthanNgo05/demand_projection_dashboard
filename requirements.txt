@@ -12,3 +12,5 @@ langchain-openai
 python-dotenv
 pyodbc
 tabulate
+# The Plytix channel feed is fetched with stdlib urllib + pandas.read_csv,
+# so no extra HTTP dependency is required here.

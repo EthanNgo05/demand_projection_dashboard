@@ -541,6 +541,16 @@ def read_plytix_from_bytes(_data, name):
     return data_io.read_plytix(BytesIO(_data))
 
 
+@st.cache_data(show_spinner="Fetching Plytix feed…")
+def fetch_plytix_from_url(url, _nonce):
+    """Fetch the raw Plytix export from the channel feed URL (CSV).
+
+    ``_nonce`` busts the cache when the user clicks "Refresh from Plytix" — a URL
+    has no mtime to key on. Returns the raw Plytix frame; list prices are derived
+    from it cheaply via ``data_io.prices_from_plytix``."""
+    return data_io.read_plytix(url)
+
+
 # Filter logic + constants live in agent/data_io.py (single source of truth);
 # these aliases keep the dashboard's existing call sites unchanged.
 WAREHOUSE_REGIONS = data_io.WAREHOUSE_REGIONS
@@ -1348,37 +1358,62 @@ def main():
         # ----- List prices (drive revenue risk) ---------------------------
         # The Plytix export doubles as the source of each SKU's list price AND
         # its 'Active in' regions (used by the active-in check below), so we read
-        # both from whichever Plytix file is in play — uploaded or on disk.
+        # both from whichever Plytix source is in play. Precedence: a manually
+        # uploaded workbook wins; otherwise pull the public Plytix channel feed
+        # (the default, so no file has to be dragged); otherwise fall back to the
+        # newest local list_prices_*.xlsx on disk.
         st.header("Revenue risk")
         prices = None
         plytix_df = None
         price_file = discover_price_file()
-        with st.expander("Upload Plytix file with list prices", expanded=not files):
+        with st.expander("Override: upload a Plytix list-price file", expanded=False):
             up_price = st.file_uploader(
                 "list_prices_*.xlsx", type=["xlsx"], key="price_upload",
                 help="SKU + List Price USD, plus SKU Status / SKU Type / "
                     "'Active in'. Drives revenue risk (projection difference × "
-                    "list price) and the active-in check.",
+                    "list price) and the active-in check. Overrides the Plytix "
+                    "feed when set.",
             )
-            if up_price is not None:
-                prices = load_prices_from_bytes(
-                    up_price.getvalue(), up_price.name, pipeline_path()
-                )
-                plytix_df = read_plytix_from_bytes(up_price.getvalue(), up_price.name)
+
+        if up_price is not None:
+            prices = load_prices_from_bytes(
+                up_price.getvalue(), up_price.name, pipeline_path()
+            )
+            plytix_df = read_plytix_from_bytes(up_price.getvalue(), up_price.name)
+            if prices is not None:
+                st.success(f"{len(prices):,} list prices (uploaded)")
+        elif data_io.PLYTIX_FEED_URL:
+            nonce = st.session_state.setdefault("plytix_nonce", 0)
+            try:
+                plytix_df = fetch_plytix_from_url(data_io.PLYTIX_FEED_URL, nonce)
+                prices = data_io.prices_from_plytix(plytix_df)
                 if prices is not None:
-                    st.success(f"{len(prices):,} list prices (uploaded)")
-            elif price_file is not None:
-                prices = load_prices_from_path(
-                    price_file, os.path.getmtime(price_file), pipeline_path()
+                    st.success(f"{len(prices):,} list prices (Plytix feed)")
+                if st.button("🔄 Refresh from Plytix", key="refresh_plytix"):
+                    st.session_state["plytix_nonce"] = nonce + 1
+                    st.rerun()
+            except Exception as e:  # network/parse failure -> fall back to disk
+                plytix_df = None
+                prices = None
+                st.warning(
+                    f"Couldn't fetch the Plytix feed ({e}); "
+                    "falling back to the newest local list-price file."
                 )
-                plytix_df = read_plytix_from_path(
-                    price_file, os.path.getmtime(price_file)
+
+        # Fall back to the newest local xlsx when neither an upload nor the feed
+        # produced prices (feed disabled/unreachable and nothing uploaded).
+        if prices is None and up_price is None and price_file is not None:
+            prices = load_prices_from_path(
+                price_file, os.path.getmtime(price_file), pipeline_path()
+            )
+            plytix_df = read_plytix_from_path(
+                price_file, os.path.getmtime(price_file)
+            )
+            if prices is not None:
+                st.success(
+                    f"{len(prices):,} list prices "
+                    f"({os.path.basename(price_file)})"
                 )
-                if prices is not None:
-                    st.success(
-                        f"{len(prices):,} list prices "
-                        f"({os.path.basename(price_file)})"
-                    )
 
         # ----- Warehouse projections (drive the "missing projections" table) --
         # A DIFFERENT data source than the demand file above: the warehouse

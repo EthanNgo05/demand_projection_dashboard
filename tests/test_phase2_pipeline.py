@@ -19,11 +19,14 @@ def test_ingest_no_files_returns_error(monkeypatch):
 
 
 def test_ingest_missing_price_file_is_non_fatal(monkeypatch, sample_raw_path):
-    # discover_price_file() returning None must not raise — prices come back
-    # None and downstream nodes simply skip the list-price columns.
+    # With no price source at all — the Plytix feed disabled AND no local file —
+    # ingest must not raise: prices come back None and downstream nodes simply
+    # skip the list-price columns. Disabling the feed also keeps this unit test
+    # hermetic (no network call to the default feed URL).
     monkeypatch.setattr(
         "agent.data_io.discover_raw_files", lambda: [("2026-07-01", sample_raw_path)]
     )
+    monkeypatch.setattr("agent.data_io.PLYTIX_FEED_URL", "")
     monkeypatch.setattr("agent.data_io.discover_price_file", lambda: None)
     result = ingest({})
     assert result["prices"] is None

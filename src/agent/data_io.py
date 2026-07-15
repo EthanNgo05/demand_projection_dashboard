@@ -17,6 +17,8 @@ Must never import streamlit (directly or transitively).
 import glob
 import os
 import re
+import urllib.request
+from io import BytesIO
 from typing import NamedTuple
 
 import numpy as np
@@ -31,6 +33,16 @@ from agent.model_loader import load_pipeline
 # src/agent/data_io.py, so climb three levels: agent -> src -> repo root.
 HERE = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+# Public Plytix channel feed that publishes the same product data as the
+# list_prices_*.xlsx export (SKU, List Price USD, SKU Status, SKU Type,
+# "Active in"). Used as the default price/Plytix source so no one has to drag a
+# file. Overridable via the PLYTIX_FEED_URL env var (blank disables the feed and
+# falls back to the local xlsx). See read_plytix / prices_from_plytix below.
+PLYTIX_FEED_URL = os.getenv(
+    "PLYTIX_FEED_URL",
+    "https://pim.plytix.com/channels/6a56637a49b9e8566d5f2d4f/feed",
 )
 
 
@@ -215,13 +227,54 @@ DISCONTINUED_COLS = [
 ]
 
 
-def read_plytix(path):
+def _read_csv_url(url, timeout=30):
+    """Fetch a CSV feed over HTTP(S) into a DataFrame, with a timeout.
+
+    Uses stdlib urllib (no extra dependency) so a hung endpoint can't stall the
+    dashboard/agent indefinitely."""
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        raw = resp.read()
+    return pd.read_csv(BytesIO(raw))
+
+
+def read_plytix(src):
     """Read the raw Plytix export (for the 'Active in' / discontinued checks).
 
-    ``path`` may be a filesystem path or a file-like object (e.g. a BytesIO of
-    an uploaded workbook), so both the dashboard's on-disk and upload paths and
-    the agent's ingest node share this one reader."""
-    return pd.read_excel(path)
+    ``src`` may be:
+      - an ``http(s)`` URL to the Plytix channel feed (CSV) — fetched with a
+        timeout and parsed as CSV;
+      - a ``.csv`` filesystem path — read as CSV;
+      - a filesystem path or file-like object (e.g. a BytesIO of an uploaded
+        workbook) — read as an Excel workbook, as before.
+
+    Column names are stripped so the feed's trailing-space headers don't break
+    the exact-name column checks downstream. Shared by the dashboard's on-disk,
+    upload, and feed paths and the agent's ingest node."""
+    if isinstance(src, str) and src.lower().startswith("http"):
+        df = _read_csv_url(src)
+    elif isinstance(src, str) and src.lower().endswith(".csv"):
+        df = pd.read_csv(src)
+    else:
+        df = pd.read_excel(src)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def prices_from_plytix(plytix_df):
+    """SKU -> List Price (USD) Series from an already-read Plytix frame.
+
+    Mirrors the tail of each model's ``load_list_prices`` so the CSV/feed path
+    yields the exact same lookup without re-reading through ``pd.read_excel``.
+    SKUs with a blank price are dropped so they map to NaN downstream (an
+    unknown price is left blank rather than treated as $0). Returns None if the
+    frame lacks the required columns."""
+    if plytix_df is None or not {"SKU", "List Price USD"}.issubset(plytix_df.columns):
+        return None
+    prices = plytix_df[["SKU", "List Price USD"]].dropna(subset=["SKU"]).copy()
+    prices["SKU"] = prices["SKU"].astype(str).str.strip()
+    prices["List Price USD"] = pd.to_numeric(prices["List Price USD"], errors="coerce")
+    prices = prices.dropna(subset=["List Price USD"]).drop_duplicates("SKU", keep="last")
+    return prices.set_index("SKU")["List Price USD"]
 
 
 def _this_week_start():
