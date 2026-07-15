@@ -292,7 +292,7 @@ DISPLAY_NAMES = {
     "updated_projection_avg": "Updated Projection Average",
     "projection_difference": "Projection Difference",
     "list_price_usd": "List Price (USD)",
-    "revenue_risk_usd": "Revenue Risk (USD)",
+    "revenue_risk_usd": "Revenue Risk (avg/wk)",
 }
 
 # Final column order for every summary sheet
@@ -309,7 +309,7 @@ SUMMARY_COLUMNS = [
     "Updated Projection Average",
     "Projection Difference",
     "List Price (USD)",
-    "Revenue Risk (USD)",
+    "Revenue Risk (avg/wk)",
 ]
 
 
@@ -766,7 +766,7 @@ def fit_xgboost(df, today, grouping_label, breakdown_df=None,
     If ``breakdown_df`` (rows that still carry "Customer Grouping") is provided,
     a "Top Volume Customer Groups" column is appended.
     If ``list_prices`` (a SKU -> List Price USD Series) is provided, "List Price
-    (USD)" and "Revenue Risk (USD)" = projection_difference * list price are
+    (USD)" and "Revenue Risk (avg/wk)" = projection_difference * list price are
     added. SKUs without a known price are left blank.
     If ``cleansing_log`` / ``uplift_log`` (lists) are supplied, audit rows are
     appended to them; the dashboard omits them, so the return signature is

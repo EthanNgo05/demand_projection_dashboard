@@ -179,7 +179,7 @@ WAREHOUSE_REGIONS = ["AU", "CA", "EU", "JP", "US"]
 # supplied (see DISPLAY_NAMES in the pipeline). Kept here so the dashboard can
 # format / sort on them.
 PRICE_COL = "List Price (USD)"
-RISK_COL = "Revenue Risk (USD)"
+RISK_COL = "Revenue Risk (avg/wk)"
 
 # Chart palette -- actuals are the anchor (solid), the two projections are
 # de-emphasised dashed/dotted lines so the eye reads "history -> forecast".
@@ -662,7 +662,7 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
     projection). For ALL CUSTOMERS the breakdown is included so the summary
     carries 'Top Volume Customer Groups'. When ``prices`` (a SKU -> price Series)
     is supplied and the pipeline supports it, the summary also carries
-    'List Price (USD)' and 'Revenue Risk (USD)'. ``alpha`` / ``beta`` / ``phi``,
+    'List Price (USD)' and 'Revenue Risk (avg/wk)'. ``alpha`` / ``beta`` / ``phi``,
     when given, override the pipeline's smoothing constants for this call, and
     ``min_weeks`` overrides MIN_WEEKS_FOR_TREND (all are part of the cache key, so
     moving a slider recomputes the forecast). ``model_path`` selects the
@@ -1945,13 +1945,13 @@ def main():
     if has_risk:
         net_risk = summary[RISK_COL].sum()
         k6.metric(
-            "Revenue Risk (net)", f"${net_risk:+,.0f}",
+            "Revenue Risk (avg/wk)", f"${net_risk:+,.0f}",
             help="Σ (projection difference × list price) over priced SKUs. "
                  "Negative = forecast fell below the original projection.",
         )
     else:
         k6.metric(
-            "Revenue Risk (net)", "—",
+            "Revenue Risk (avg/wk)", "—",
             help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
         )
     if n_orders:
@@ -2022,7 +2022,7 @@ def main():
             rv = row.get(RISK_COL)
             st.metric("List Price", "—" if pd.isna(pv) else f"${pv:,.2f}")
             st.metric(
-                "Revenue Risk",
+                "Revenue Risk (avg/wk)",
                 "—" if pd.isna(rv) else f"${rv:+,.0f}",
                 help="Projection difference × list price.",
             )

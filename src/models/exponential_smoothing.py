@@ -319,7 +319,7 @@ DISPLAY_NAMES = {
     "updated_projection_avg": "Updated Projection Average",
     "projection_difference": "Projection Difference",
     "list_price_usd": "List Price (USD)",
-    "revenue_risk_usd": "Revenue Risk (USD)",
+    "revenue_risk_usd": "Revenue Risk (avg/wk)",
 }
 
 # Final column order for every summary sheet
@@ -336,7 +336,7 @@ SUMMARY_COLUMNS = [
     "Updated Projection Average",
     "Projection Difference",
     "List Price (USD)",
-    "Revenue Risk (USD)",
+    "Revenue Risk (avg/wk)",
 ]
 
 
