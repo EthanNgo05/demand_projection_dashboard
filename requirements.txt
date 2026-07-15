@@ -5,6 +5,7 @@ plotly
 openpyxl
 scikit-learn
 xgboost
+statsmodels
 langgraph
 langchain-core
 langchain-anthropic

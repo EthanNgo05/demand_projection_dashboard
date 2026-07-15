@@ -51,8 +51,8 @@ def default_pipeline():
     if not MODEL_OPTIONS:
         raise FileNotFoundError(
             "No forecasting pipeline found — expected "
-            "models/exponential_smoothing.py, models/xgboost.py or "
-            "models/regression.py next to dashboard.py."
+            "models/exponential_smoothing.py, models/holt_winters.py, "
+            "models/xgboost.py or models/regression.py next to dashboard.py."
         )
     return load_pipeline(next(iter(MODEL_OPTIONS.values())))
 

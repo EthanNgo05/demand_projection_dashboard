@@ -90,9 +90,11 @@ def test_generic_backtest_none_when_no_holdout_data(regression_module):
     assert mae is None
 
 
-def test_evaluate_models_populates_mae_for_all_three(sample_results_state):
+def test_evaluate_models_populates_mae_for_all_models(sample_results_state):
     out = evaluate_models(sample_results_state)
-    assert len(out["results"]) == 3, f"expected 3 models, errors: {out['errors']}"
+    assert len(out["results"]) == len(MODEL_OPTIONS), (
+        f"expected every model in MODEL_OPTIONS to run, errors: {out['errors']}"
+    )
     for label, r in out["results"].items():
         assert r.get("mae") is not None, f"{label} missing an mae after evaluate_models"
 

@@ -107,6 +107,7 @@ REPO_ROOT = os.path.dirname(HERE)
 MODEL_OPTIONS = {
     "8-Week Moving Average": os.path.join(HERE, "models/regression.py"),
     "Holt's Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "Holt-Winters Seasonal": os.path.join(HERE, "models/holt_winters.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
 }
 _ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")
@@ -130,8 +131,8 @@ def pipeline_path():
     if choice is None:
         raise FileNotFoundError(
             "No forecasting pipeline found — expected "
-            "models/exponential_smoothing.py, models/xgboost.py or "
-            "models/regression.py next to dashboard.py "
+            "models/exponential_smoothing.py, models/holt_winters.py, "
+            "models/xgboost.py or models/regression.py next to dashboard.py "
             "(or set the DEMAND_PIPELINE env var)."
         )
     return MODEL_OPTIONS[choice]
@@ -1299,8 +1300,8 @@ def main():
         if not MODEL_OPTIONS:
             st.error(
                 "No forecasting pipeline found — expected "
-                "models/exponential_smoothing.py, models/xgboost.py or "
-                "models/regression.py next to dashboard.py "
+                "models/exponential_smoothing.py, models/holt_winters.py, "
+                "models/xgboost.py or models/regression.py next to dashboard.py "
                 "(or set DEMAND_PIPELINE)."
             )
             st.stop()

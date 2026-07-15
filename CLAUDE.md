@@ -22,7 +22,7 @@ pip install -r requirements.txt
 streamlit run src/dashboard.py
 
 # Batch forecast (each model file is also a standalone script; writes per-group + combined .xlsx to outputs/)
-python src/models/exponential_smoothing.py   # or regression.py / xgboost.py
+python src/models/exponential_smoothing.py   # or regression.py / holt_winters.py / xgboost.py
 
 # Nightly warehouse pulls (or the scheduled wrapper for both: ./refresh_demand_data.ps1)
 python src/extract_demand_details.py          # ~10 min -> dated all_demand_projections_<date>.xlsx
@@ -54,12 +54,13 @@ Each model file in `src/models/` is **deliberately standalone and self-contained
 
 The dashboard **introspects `fit_regression`'s signature** to decide which sidebar controls to show: `alpha`/`beta`/`phi` args → smoothing sliders; `min_weeks_for_trend` → min-weeks slider; `list_prices` → revenue-risk columns; an `autofit_smoothing` function → the Autofit button. This is why XGBoost's sliders hide automatically — its signature carries no smoothing params.
 
-**⚠️ If you change the customer groupings or ignore lists, edit all three model files identically** (`regression.py`, `exponential_smoothing.py`, `xgboost.py`). `src/agent/data_io.py`'s `_clean` is the shared cleaning step and must stay in sync too (see the sync comment in `regression.py`'s `__main__`).
+**⚠️ If you change the customer groupings or ignore lists, edit all four model files identically** (`regression.py`, `exponential_smoothing.py`, `holt_winters.py`, `xgboost.py`). `src/agent/data_io.py`'s `_clean` is the shared cleaning step and must stay in sync too (see the sync comment in `regression.py`'s `__main__`).
 
-### The three models (`src/models/`)
+### The four models (`src/models/`)
 
 - **`regression.py`** — 8-week moving average nudged by a dampened linear-regression slope (`TREND_WEIGHT = 0.25`). Labeled "8-Week Moving Average" in the UI.
 - **`exponential_smoothing.py`** — Holt's double exponential smoothing (level + trend, damped by `PHI`). The only model with outlier cleansing, promo uplift, and an `autofit_smoothing` grid search.
+- **`holt_winters.py`** — Holt-Winters triple exponential smoothing: level + damped trend + **additive seasonality** (`SEASONAL_PERIODS = 52`, annual), fit via `statsmodels` (self-tunes α/β/γ/φ, so no smoothing sliders/autofit, like XGBoost). Labeled "Holt-Winters Seasonal". Needs ≥2 full annual cycles (`MIN_WEEKS_FOR_SEASONAL = 104`); short-history SKUs and non-converging fits fall back to non-seasonal damped Holt. Reuses `exponential_smoothing.py`'s cleansing / window / flatten-to-week-1 behaviour.
 - **`xgboost.py`** — gradient-boosted trees, **pooled per Customer Grouping** (SKU histories are too short to train per-SKU), each SKU scaled by its own mean, forecast 15 weeks recursively. Falls back to sklearn's `HistGradientBoostingRegressor` if `xgboost` isn't installed.
 
 ### Data flow & inputs

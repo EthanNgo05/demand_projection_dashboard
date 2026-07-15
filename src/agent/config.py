@@ -21,6 +21,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_OPTIONS = {
     "8-Week Moving Average": os.path.join(HERE, "models/regression.py"),
     "Holt's Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "Holt-Winters Seasonal": os.path.join(HERE, "models/holt_winters.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
 }
 # dashboard.py also supports an optional DEMAND_PIPELINE env override and

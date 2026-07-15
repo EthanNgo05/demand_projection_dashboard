@@ -47,7 +47,7 @@ raw file and writes per-group + combined Excel forecasts under `outputs/`. Run
 these from the repo root so the `raw_inputs/` / `outputs/` paths resolve:
 
 ```
-python src/models/exponential_smoothing.py     # or regression.py / xgboost.py
+python src/models/exponential_smoothing.py     # or regression.py / holt_winters.py / xgboost.py
 ```
 
 ## The pipeline contract
@@ -65,7 +65,7 @@ The dashboard inspects `fit_regression`'s signature to decide which sidebar
 controls to show: `alpha`/`beta`/`phi` args → smoothing sliders,
 `min_weeks_for_trend` → min-weeks slider, `list_prices` → revenue-risk columns,
 and an `autofit_smoothing` function → the Autofit button. **If you edit the
-groupings or ignore lists, change all three model files identically.**
+groupings or ignore lists, change all four model files identically.**
 
 Environment overrides: `DEMAND_PIPELINE` (path to an extra/custom model file,
 offered as the default) and `DEMAND_RAW_DIR` (raw-data folder).
@@ -112,6 +112,40 @@ cleanses promo spikes/stockout dips before fitting (`CLEANSE_OUTLIERS`,
 `PROMO_WEEKS`), re-adds promo uplift onto future promo weeks (`PROMO_UPLIFT`),
 and can grid-search α/β/φ by backtesting (`autofit_smoothing`, the dashboard's
 Autofit button).
+
+### `models/holt_winters.py`
+
+Holt-Winters (triple exponential smoothing): the level + damped trend of the
+Holt model **plus an additive seasonal component**, so a recurring annual pattern
+(the Q4 holiday peak, summer lulls) is modelled explicitly rather than averaged
+away. Only viable now that ~3 years of weekly history has accumulated — a seasonal
+fit needs at least two full annual cycles.
+
+$$
+\text{projected position}(h) = \text{level}_T +(\phi+\phi^2+\cdots+\phi^h)\,\text{trend}_T + \text{season}_{T+h}, \qquad h=1,\ldots,15
+$$
+
+The fit is delegated to `statsmodels.tsa.holtwinters.ExponentialSmoothing`
+(`seasonal="add"`, `seasonal_periods=52`, damped trend), which **optimises its own**
+`α`/`β`/`γ`/`φ` by maximum likelihood — so there are **no smoothing sliders and no
+Autofit button** for this model (its `fit_regression` carries no α/β/φ args and it
+defines no `autofit_smoothing`, so the dashboard hides those controls, as it does
+for XGBoost).
+
+| Constant | Default | Role |
+|----------|---------|------|
+| `SEASONAL_PERIODS` | 52 | Length of one seasonal cycle in weeks (annual) |
+| `MIN_WEEKS_FOR_SEASONAL` | 104 | Minimum history (2 full cycles) before a seasonal fit is attempted |
+
+Additive (not multiplicative) seasonality is used deliberately — demand has many
+zero / near-zero weeks, on which a multiplicative season degenerates. SKUs with
+less than `MIN_WEEKS_FOR_SEASONAL` weeks of history (new/short-lived items), or
+whose statsmodels fit fails to converge, **fall back** to the non-seasonal
+damped-Holt forecast, so one awkward series never sinks a run. Like the Holt
+model, the published forecast is flattened to the upcoming week's value (the app
+re-runs weekly and only that value is used); seasonality adjusts it via that
+week's seasonal index. Shares the Holt model's history window, gap zero-filling,
+and promo/outlier cleansing.
 
 ### `models/xgboost.py`
 
