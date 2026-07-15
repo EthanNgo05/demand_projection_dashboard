@@ -410,7 +410,8 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
         # Flat forecast: compute the first week's value and hold it across all
         # 15 weeks (no week-to-week trend drift). The app re-runs weekly and
         # only the first projection is ever used, so every week repeats it.
-        first = max(round(mean_val + slope * TREND_WEIGHT, 1), 0)
+        # Rounded to a whole number: projections are unit counts, not decimals.
+        first = max(int(round(mean_val + slope * TREND_WEIGHT)), 0)
         projected_15 = [first] * 15
 
         summary_rows.append(

@@ -1014,8 +1014,9 @@ def fit_exponential_smoothing(df, today, grouping_label, breakdown_df=None,
         # weeks. The app re-runs weekly and only the first projection is ever
         # used, so every week repeats it. Promo uplifts are intentionally
         # dropped (multiplier held at 1.0) so the line is truly flat.
+        # Rounded to a whole number: projections are unit counts, not decimals.
         mult = np.ones(len(forecast_weeks), dtype="float64")
-        base = max(round(float(raw_forecast[0]), 1), 0)
+        base = max(int(round(float(raw_forecast[0]))), 0)
         projected_15 = [base] * 15
         n_uplifted = 0
 

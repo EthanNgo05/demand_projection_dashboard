@@ -181,6 +181,18 @@ WAREHOUSE_REGIONS = ["AU", "CA", "EU", "JP", "US"]
 PRICE_COL = "List Price (USD)"
 RISK_COL = "Revenue Risk (avg/wk)"
 
+
+def fmt_dollar(v, decimals=0, signed=False):
+    """Format a dollar amount with the sign OUTSIDE the $ (e.g. -$500, +$500).
+
+    Python's ``{:+,.0f}`` puts the sign after the ``$`` (``$-500``); this keeps
+    it in front so negatives read like ``-$500``.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    sign = "-" if v < 0 else ("+" if signed else "")
+    return f"{sign}${abs(v):,.{decimals}f}"
+
 # Chart palette -- actuals are the anchor (solid), the two projections are
 # de-emphasised dashed/dotted lines so the eye reads "history -> forecast".
 C_ACTUAL = "#2563eb"   # blue   - historical actual demand (POS or Orders)
@@ -1103,9 +1115,9 @@ def style_summary(summary_df):
     if avg_col in df.columns:
         fmt[avg_col] = "{:,.1f}"
     if PRICE_COL in df.columns:
-        fmt[PRICE_COL] = "${:,.2f}"
+        fmt[PRICE_COL] = lambda v: fmt_dollar(v, decimals=2)
     if RISK_COL in df.columns:
-        fmt[RISK_COL] = "${:,.0f}"
+        fmt[RISK_COL] = lambda v: fmt_dollar(v, decimals=0)
 
     def colour_diff(v):
         if pd.isna(v):
@@ -1954,7 +1966,7 @@ def main():
     if has_risk:
         net_risk = summary[RISK_COL].sum()
         k6.metric(
-            "Revenue Risk (avg/wk)", f"${net_risk:+,.0f}",
+            "Revenue Risk (avg/wk)", fmt_dollar(net_risk, signed=True),
             help="Σ (projection difference × list price) over priced SKUs. "
                  "Negative = forecast fell below the original projection.",
         )
@@ -1965,7 +1977,7 @@ def main():
         )
     if proj_value is not None:
         k7.metric(
-            "Projected Revenue (avg/wk)", f"${proj_value:,.0f}",
+            "Projected Revenue (avg/wk)", fmt_dollar(proj_value),
             help="Σ (list price × updated weekly-avg forecast) over priced SKUs "
                  "— the gross value at list price of the forecasted weekly demand.",
         )
@@ -2040,16 +2052,16 @@ def main():
         if RISK_COL in summary.columns:
             pv = row.get(PRICE_COL)
             rv = row.get(RISK_COL)
-            st.metric("List Price", "—" if pd.isna(pv) else f"${pv:,.2f}")
+            st.metric("List Price", fmt_dollar(pv, decimals=2))
             st.metric(
                 "Revenue Risk (avg/wk)",
-                "—" if pd.isna(rv) else f"${rv:+,.0f}",
+                fmt_dollar(rv, signed=True),
                 help="Projection difference × list price.",
             )
             prv = pv * row["Updated Projection Average"] if pd.notna(pv) else None
             st.metric(
                 "Projected Revenue (avg/wk)",
-                "—" if prv is None else f"${prv:,.0f}",
+                fmt_dollar(prv),
                 help="List price × updated weekly-avg forecast — the gross value "
                      "at list price of this SKU's forecasted weekly demand.",
             )
