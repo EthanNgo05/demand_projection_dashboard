@@ -1,6 +1,6 @@
 """CLI entry point for the agent pipeline.
 
-    python -m agent.run --view "ALL CUSTOMERS (combined)"
+    python -m agent.run --view "All customers (combined)"
     python -m agent.run --view "AMAZON-DC" --provider local
 
 --provider switches the Phase 4 reasoning nodes between the Claude API

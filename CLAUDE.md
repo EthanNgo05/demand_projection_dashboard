@@ -34,7 +34,7 @@ pytest tests/test_phase3_select.py::test_name   # single test
 pytest --runslow                                # include the slow full-matrix parity suites
 
 # Agent end-to-end for one view (run from src/ so `python -m agent.run` resolves the package)
-cd src && python -m agent.run --view "ALL CUSTOMERS (combined)"
+cd src && python -m agent.run --view "All customers (combined)"
 cd src && python -m agent.run --view "AMAZON-DC"
 ```
 

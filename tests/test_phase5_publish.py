@@ -64,7 +64,7 @@ def test_window_excluded_absent_state_is_safe():
 def test_publish_writes_expected_json(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.nodes.publish.OUTPUT_DIR", str(tmp_path))
     state = {
-        "view": "ALL CUSTOMERS (combined)",
+        "view": "All customers (combined)",
         "best_model": "XGBoost",
         "results": {"XGBoost": {"mae": 22.1}, "8-Week Moving Average": {"mae": 30.0}},
         "narrative": "Demand is flat.",
@@ -74,7 +74,7 @@ def test_publish_writes_expected_json(tmp_path, monkeypatch):
     }
     publish(state)
 
-    out_path = tmp_path / "agent_summary_ALL_CUSTOMERS_(combined).json"
+    out_path = tmp_path / "agent_summary_All_customers_(combined).json"
     assert out_path.exists()
     payload = json.loads(out_path.read_text())
     assert payload["best_model"] == "XGBoost"
@@ -105,7 +105,7 @@ def test_publish_appends_to_logs_not_overwrites(tmp_path, monkeypatch):
         f.write("existing line\n")
     monkeypatch.setattr("agent.nodes.publish.OUTPUT_DIR", str(tmp_path / "outputs"))
     os.makedirs(tmp_path / "outputs")
-    publish({"view": "ALL CUSTOMERS (combined)", "best_model": "XGBoost",
+    publish({"view": "All customers (combined)", "best_model": "XGBoost",
              "results": {"XGBoost": {"mae": 22.1}}, "narrative": "", "anomalies": []})
     with open(log_path, encoding="utf-8") as f:
         contents = f.read()

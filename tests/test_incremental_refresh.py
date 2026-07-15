@@ -282,7 +282,7 @@ def _fake_loader(monkeypatch, result):
 
 
 def test_main_incremental_merges_and_overwrites_same_day_file(raw_dir, monkeypatch):
-    cutoff = extract.incremental_start_sunday(3)
+    cutoff = extract.incremental_start_sunday(extract.INCREMENTAL_WEEKS_BACK)
     before, after = cutoff - timedelta(days=7), cutoff + timedelta(days=7)
     # Previous file is TODAY's snapshot -> out path == previous path (the
     # same-day overwrite case: read fully first, then atomic-replace).

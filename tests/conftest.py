@@ -135,4 +135,4 @@ def sample_state_with_summary():
 @pytest.fixture
 def large_summary_state():
     """ALL CUSTOMERS-sized state: 400+ SKU rows to prove the prompt is capped."""
-    return _state(420, view="ALL CUSTOMERS (combined)")
+    return _state(420, view="All customers (combined)")

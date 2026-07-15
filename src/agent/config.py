@@ -31,7 +31,7 @@ MODEL_OPTIONS = {k: v for k, v in MODEL_OPTIONS.items() if os.path.exists(v)}
 # MUST match dashboard.py's ALL_CUSTOMERS_VIEW exactly (dashboard.py:122) —
 # every node and parity test keys the combined view off this string, and a
 # mismatch silently compares/filters the wrong view.
-ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
+ALL_CUSTOMERS_VIEW = "All customers (combined)"
 
 # MUST match dashboard.py's REGION_ALL_PREFIX exactly — per-region rollup views
 # are "All Customers - <region label>" (e.g. "All Customers - AU (ACR)"):

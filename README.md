@@ -163,7 +163,7 @@ repo root automatically):
 
 ```
 cd src
-python -m agent.run --view "ALL CUSTOMERS (combined)"
+python -m agent.run --view "All customers (combined)"
 python -m agent.run --view "AMAZON-DC"
 python -m agent.run --view "ANOTHER-CUSTOMER-GROUP"
 ```
