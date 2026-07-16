@@ -61,16 +61,16 @@ def region_all_view(region):
     """
     return f"{REGION_ALL_PREFIX}{region}"
 
-# Phase 3 calibration (2026-07-08, all_demand_projections_2026-07-07.xlsx):
-# ran evaluate/select across all 48 real views (ALL + 47 groupings). Winning
-# backtest MAEs (shared 6-week single-holdout, raw actuals): p50=7.7, p80=39.1,
-# p90=70.9, max=1208 (one huge-volume view; MAE is unit-scaled, so the largest
-# views dominate the tail). Threshold set at the ~80th percentile per the
-# Phase 3 plan -- flags the worst ~20% of views (incl. the combined view when
-# it backtests poorly) without drowning Phase 4 in false alarms. 7 tiny views
-# produced no backtestable holdout at all; they get flagged via best_model=None
-# regardless of this value. Revisit once MAE is normalised per-view (e.g. MASE).
-MAE_CONFIDENCE_THRESHOLD = 40
+# The comparison score is a pooled MASE: the winning model's pooled backtest
+# MAE divided by the pooled MAE of a plain 8-week moving average of each SKU's
+# actuals over the same points (see evaluate._generic_backtest). Scale-free
+# across views, so one threshold fits the huge combined view and the tiny
+# groupings alike. 1.0 = "no better than the 8-week average of actuals".
+# Interim value pending recalibration -- after the MASE migration lands, run
+# `python -m agent.batch --no-llm`, harvest the winning-MASE distribution from
+# outputs/agent_summary_*.json, and rewrite this block with the observed
+# percentiles (mirroring the old Phase 3 MAE calibration note).
+MASE_CONFIDENCE_THRESHOLD = 1.0
 
 # --- Phase 4: LLM provider selection ---------------------------------------
 # "anthropic" = Claude API (needs ANTHROPIC_API_KEY in .env)

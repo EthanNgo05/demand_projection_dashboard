@@ -12,6 +12,7 @@ import os
 import numpy as np
 import pandas as pd
 
+from agent import config
 from agent.llm import safe_invoke
 from agent.logging_util import logger
 from agent.state import AgentState
@@ -21,7 +22,7 @@ def _skip_llm() -> bool:
     """True when LLM narrative/anomaly nodes should be skipped.
 
     Set ``AGENT_SKIP_LLM=1`` (the batch runner's ``--no-llm``) for a pure
-    numeric refresh — every view still gets its best model + backtest MAEs, just
+    numeric refresh — every view still gets its best model + backtest MASEs, just
     no generated prose, avoiding one LLM call per view (~57× on a full batch)."""
     return bool(os.environ.get("AGENT_SKIP_LLM"))
 
@@ -43,15 +44,17 @@ normal variation.
 Return a short bullet list (max 6 bullets). If nothing stands out, say so in one line."""
 
 LOW_CONFIDENCE_PROMPT = """The demand forecast for "{view}" did not clear the
-backtest accuracy threshold (best model: {best_model}, MAE {mae:.1f} vs a
-threshold of {threshold}). Likely causes to check: short SKU history, a recent
-promo/outlier week, or genuinely volatile demand. Write 2-3 sentences a
-planner can act on — do not just restate the numbers."""
+backtest accuracy threshold (best model: {best_model}, MASE {mase:.2f} vs a
+threshold of {threshold}; MASE < 1 beats a plain 8-week moving-average
+forecast). Likely causes to check: short SKU history, a recent promo/outlier
+week, or genuinely volatile demand. Write 2-3 sentences a planner can act on —
+do not just restate the numbers."""
 
 SUMMARY_PROMPT = """Write a 3-4 sentence executive summary of the demand
-forecast for "{view}" using {best_model} (backtest MAE {mae:.1f}). Mention the
-overall direction (growing/flat/declining), and call out the anomalies below
-if any are notable. Plain language, no bullet points.
+forecast for "{view}" using {best_model} (backtest MASE {mase:.2f}, vs a plain
+8-week moving average; < 1 beats that baseline). Mention the overall direction
+(growing/flat/declining), and call out the anomalies below if any are notable.
+Plain language, no bullet points.
 
 Anomalies flagged:
 {anomalies}"""
@@ -121,7 +124,7 @@ def flag_low_confidence(state: AgentState) -> dict:
     best = state.get("best_model")
     if best is None:
         # Phase 3's select routes here with best_model=None when NO model
-        # produced a scoreable backtest (thin history). There's no MAE to
+        # produced a scoreable backtest (thin history). There's no MASE to
         # explain — don't call the LLM, just say so deterministically.
         return {
             "narrative": (
@@ -131,12 +134,15 @@ def flag_low_confidence(state: AgentState) -> dict:
         }
     if _skip_llm():
         return {"narrative": None}
+    threshold = state.get("mase_confidence_threshold")
+    if threshold is None:
+        threshold = config.MASE_CONFIDENCE_THRESHOLD  # same fallback as select
     text, err = safe_invoke(
         LOW_CONFIDENCE_PROMPT.format(
             view=state["view"],
             best_model=best,
-            mae=state["results"][best]["mae"],
-            threshold=state.get("mae_confidence_threshold", 50),
+            mase=state["results"][best]["mase"],
+            threshold=threshold,
         ),
         view=state["view"],
     )
@@ -154,7 +160,7 @@ def summarize(state: AgentState) -> dict:
         SUMMARY_PROMPT.format(
             view=state["view"],
             best_model=best,
-            mae=state["results"][best]["mae"],
+            mase=state["results"][best]["mase"],
             anomalies="\n".join(state.get("anomalies", [])) or "None",
         ),
         view=state["view"],

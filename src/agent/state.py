@@ -33,7 +33,7 @@ class ModelResult(TypedDict, total=False):
     summary_df: pd.DataFrame
     weekly_df: pd.DataFrame
     agg: pd.DataFrame
-    mae: float  # comparison score from the shared _generic_backtest
+    mase: float  # comparison score from the shared _generic_backtest (pooled MASE vs an 8-week-average baseline)
     autofit_mae: float  # ES autofit internal MAE (audit only, NOT comparable)
     baseline_mae: float
     params: dict  # alpha/beta/phi if applicable
@@ -48,7 +48,7 @@ class AgentState(TypedDict, total=False):
     prices: Optional[pd.Series]
     results: dict[str, ModelResult]  # keyed by MODEL_OPTIONS label
     best_model: Optional[str]
-    mae_confidence_threshold: Optional[float]  # per-run override; select falls back to config
+    mase_confidence_threshold: Optional[float]  # per-run override; select falls back to config
     confidence_flag: bool
     anomalies: list[str]
     narrative: Optional[str]

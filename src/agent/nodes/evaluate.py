@@ -1,14 +1,20 @@
 """Evaluate node: score every model that ran through one shared backtest.
 
 Every model is scored with the SAME walk-forward one-step-ahead backtest
-against the *raw* aggregated actuals so the MAEs are apples-to-apples. Because
-the app re-runs weekly and only ever uses each forecast's first week, the
-backtest steps ``today`` back one week at a time and scores only that first
-week against the actual (see ``_generic_backtest``). `autofit_smoothing` is
-used only to pick ES's alpha/beta/phi — its internal MAE comes from a rolling
-one-step-ahead backtest on the *cleansed* series and is NOT comparable, so it
-is recorded separately as ``autofit_mae`` (audit trail only), never used as
-the comparison score.
+against the *raw* aggregated actuals, then scaled by a common baseline so the
+scores are apples-to-apples ACROSS VIEWS as well as across models: the score
+is a pooled MASE — the model's pooled MAE divided by the pooled MAE of a
+plain 8-week moving average of each SKU's actuals over the same points.
+MASE < 1 beats the 8-week average; a flat-zero forecast on a normal-volume
+view scores >> 1 instead of a deceptively "small" raw MAE (which is what let
+near-zero forecasts win on intermittent series). Because the app re-runs
+weekly and only ever uses each forecast's first week, the backtest steps
+``today`` back one week at a time and scores only that first week against the
+actual (see ``_generic_backtest``). `autofit_smoothing` is used only to pick
+ES's alpha/beta/phi — its internal MAE comes from a rolling one-step-ahead
+backtest on the *cleansed* series and is NOT comparable, so it is recorded
+separately as ``autofit_mae`` (audit trail only), never used as the
+comparison score.
 """
 
 import inspect
@@ -59,30 +65,44 @@ def evaluate_models(state: AgentState, config=None) -> dict:
                         "alpha": fit["alpha"], "beta": fit["beta"], "phi": fit["phi"]
                     }
                     fit_kwargs = dict(results[label]["params"])
-            # every model is scored through the SAME backtest so MAEs compare
-            results[label]["mae"] = _generic_backtest(
+            # every model is scored through the SAME backtest so MASEs compare
+            results[label]["mase"] = _generic_backtest(
                 P, sub, today_ts, HOLDOUT_WEEKS, fit_kwargs
             )
         except Exception as e:  # one model failing must not sink the others
-            results[label]["mae"] = None
+            results[label]["mase"] = None
             errors.append(f"evaluate {label} failed: {e}")
             logger.warning("Evaluate [%s]: %s backtest failed: %s", view, label, e)
     return {"results": results, "errors": errors}
 
 
 def _generic_backtest(P, sub, today_ts, holdout_weeks, fit_kwargs=None):
-    """Walk-forward one-step-ahead backtest MAE for pipeline ``P`` on view ``sub``.
+    """Walk-forward one-step-ahead backtest MASE for pipeline ``P`` on view ``sub``.
 
     The app re-runs weekly and only ever uses each forecast's FIRST week, so we
     score exactly that: step ``today`` back one week at a time for the last
     ``holdout_weeks`` completed weeks, re-fit at each step, and compare the first
-    forecast week against that week's actual. Errors pool across steps and SKUs
-    into one MAE.
+    forecast week against that week's actual. Absolute errors pool across steps
+    and SKUs; the score is that pool's mean divided by the pooled mean absolute
+    error of a *baseline* forecast over the SAME points — a plain 8-week moving
+    average of each SKU's actuals over the 8 weeks before the scored week
+    (NaN/absent weeks simply drop out of the mean; ``agg`` is not densified).
+    Scaling by the baseline makes the score comparable across views of very
+    different volume: < 1 beats the 8-week average, and a near-zero forecast on
+    a real-volume view scores >> 1 instead of a deceptively small raw MAE.
+
+    Pool alignment: a point whose baseline is unavailable (no observed actuals
+    in that SKU's prior 8 weeks — e.g. the SKU's first recorded week falls in
+    the holdout) is dropped from BOTH pools, so numerator and denominator always
+    cover identical points. Zero denominator: 0/0 -> 0.0 (the model matched a
+    perfectly baseline-predictable series); x/0 -> None, never ``inf`` (invalid
+    strict JSON in agent_summary files; None already means "unscoreable" and
+    sorts last everywhere).
 
     Aggregate to SKU-week FIRST (splitting/merging the raw CUSTNMBR frame fans
-    one forecast row onto many rows per (SKU, WeekDate) and skews the MAE). Each
-    model windows its own training data off the ``today`` argument (trains up to
-    the week before ``first_forecast_week``, forecasts starting at it), so
+    one forecast row onto many rows per (SKU, WeekDate) and skews the score).
+    Each model windows its own training data off the ``today`` argument (trains
+    up to the week before ``first_forecast_week``, forecasts starting at it), so
     passing the full history and only varying ``today`` leaks no future actuals.
     Scores against the *raw* aggregated actuals (POS, falling back to Orders) —
     the fair, planner-relevant target — even though ES/XGBoost cleanse promo
@@ -103,7 +123,8 @@ def _generic_backtest(P, sub, today_ts, holdout_weeks, fit_kwargs=None):
     except (TypeError, ValueError):
         fit_kwargs = {}
 
-    abs_errors = []
+    model_abs = []     # |model forecast - actual| per (SKU, step)
+    baseline_abs = []  # |8-week-average baseline - actual| over the SAME points
     for step in range(1, int(holdout_weeks) + 1):
         step_today = today_ts - pd.Timedelta(weeks=step)
         summary, weekly = P.fit_regression(
@@ -120,14 +141,35 @@ def _generic_backtest(P, sub, today_ts, holdout_weeks, fit_kwargs=None):
         merged = fc.merge(agg[agg["WeekDate"] == step_week], on="SKU", how="inner")
         if merged.empty:
             continue
+        # Baseline: each SKU's plain mean of observed actuals over the 8 weeks
+        # before step_week. Precomputed as a single ``baseline`` column (never
+        # merge prior-week POS/Orders — suffix collisions), left-merged so a
+        # SKU with no observed actuals in the window surfaces as NaN and the
+        # point drops from BOTH pools via the shared mask below.
+        win = agg[
+            (agg["WeekDate"] >= step_week - pd.Timedelta(weeks=8))
+            & (agg["WeekDate"] < step_week)
+        ]
+        baseline = (
+            win["POS"].fillna(win["Orders"])
+            .groupby(win["SKU"]).mean()      # NaN actuals drop out of the mean
+            .rename("baseline").reset_index()
+        )
+        merged = merged.merge(baseline, on="SKU", how="left")
         target = merged["POS"].fillna(merged["Orders"])
-        mask = target.notna()
+        mask = target.notna() & merged["baseline"].notna()
         if not mask.any():
             continue
-        abs_errors.extend(
-            np.abs(merged.loc[mask, "projected_pos"].to_numpy()
-                   - target[mask].to_numpy())
-        )
-    if not abs_errors:
+        t = target[mask].to_numpy()
+        model_abs.extend(np.abs(merged.loc[mask, "projected_pos"].to_numpy() - t))
+        baseline_abs.extend(np.abs(merged.loc[mask, "baseline"].to_numpy() - t))
+    if not model_abs:
         return None
-    return float(np.mean(abs_errors))
+    num = float(np.mean(model_abs))
+    denom = float(np.mean(baseline_abs))
+    if denom == 0.0:
+        # Perfectly baseline-predictable series: a perfect model scores 0.0;
+        # anything else is unbacktestable (None — never inf, which json.dump
+        # would write as invalid ``Infinity``).
+        return 0.0 if num == 0.0 else None
+    return num / denom

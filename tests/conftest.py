@@ -120,7 +120,7 @@ def _state(n_rows, view="TEST GROUP"):
     return {
         "view": view,
         "best_model": "8-Week Moving Average",
-        "results": {"8-Week Moving Average": {"summary_df": _summary_df(n_rows), "mae": 12.3}},
+        "results": {"8-Week Moving Average": {"summary_df": _summary_df(n_rows), "mase": 1.23}},
         "confidence_flag": False,
         "errors": [],
     }
