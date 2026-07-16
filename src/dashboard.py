@@ -110,6 +110,7 @@ MODEL_OPTIONS = {
     "Holt's (double) exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "Holt-Winters (triple) exponential smoothing": os.path.join(HERE, "models/holt_winters.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
+    "TSB (intermittent demand)": os.path.join(HERE, "models/tsb.py"),
 }
 _ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")
 if _ENV_PIPELINE:
@@ -133,8 +134,8 @@ def pipeline_path():
         raise FileNotFoundError(
             "No forecasting pipeline found — expected "
             "models/exponential_smoothing.py, models/holt_winters.py, "
-            "models/xgboost.py or models/regression.py next to dashboard.py "
-            "(or set the DEMAND_PIPELINE env var)."
+            "models/xgboost.py, models/tsb.py or models/regression.py next to "
+            "dashboard.py (or set the DEMAND_PIPELINE env var)."
         )
     return MODEL_OPTIONS[choice]
 
@@ -1446,8 +1447,8 @@ def main():
             st.error(
                 "No forecasting pipeline found — expected "
                 "models/exponential_smoothing.py, models/holt_winters.py, "
-                "models/xgboost.py or models/regression.py next to dashboard.py "
-                "(or set DEMAND_PIPELINE)."
+                "models/xgboost.py, models/tsb.py or models/regression.py next "
+                "to dashboard.py (or set DEMAND_PIPELINE)."
             )
             st.stop()
 

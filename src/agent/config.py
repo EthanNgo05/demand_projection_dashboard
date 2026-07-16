@@ -23,6 +23,7 @@ MODEL_OPTIONS = {
     "Holt's (double) exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "Holt-Winters (triple) exponential smoothing": os.path.join(HERE, "models/holt_winters.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
+    "TSB (intermittent demand)": os.path.join(HERE, "models/tsb.py"),
 }
 # dashboard.py also supports an optional DEMAND_PIPELINE env override and
 # filters out non-existent paths (dashboard.py:90-101) — mirror the existence
