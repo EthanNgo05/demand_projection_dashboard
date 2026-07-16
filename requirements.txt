@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.37   # st.fragment(run_every=...) — non-blocking agent progress panel
 pandas
 numpy
 plotly

@@ -10,7 +10,7 @@ import inspect
 from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS, region_from_view
 from agent.data_io import view_frame
 from agent.model_loader import load_pipeline
-from agent.state import AgentState
+from agent.state import AgentState, report_progress
 
 
 def _params(fn):
@@ -21,7 +21,7 @@ def _params(fn):
         return {}
 
 
-def run_all_models(state: AgentState) -> dict:
+def run_all_models(state: AgentState, config=None) -> dict:
     df = state["cleaned_df"]
     view = state["view"]
     today_ts = state["today_ts"]
@@ -36,7 +36,9 @@ def run_all_models(state: AgentState) -> dict:
     # ACROSS views instead (agent/batch.py runs a process per view).
     results = {}
     errors = list(state.get("errors", []))
-    for label, path in MODEL_OPTIONS.items():
+    total = len(MODEL_OPTIONS)
+    for idx, (label, path) in enumerate(MODEL_OPTIONS.items(), start=1):
+        report_progress(config, "fit", label, idx, total)
         try:
             P = load_pipeline(path)
             agg = P.aggregate_to_sku_week(sub)

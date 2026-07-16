@@ -10,6 +10,23 @@ from typing import Optional, TypedDict
 import pandas as pd
 
 
+def report_progress(config, phase, model, done, total):
+    """Best-effort progress ping to a UI callback passed via RunnableConfig.
+
+    The dashboard runs the graph on a background thread and passes a callback as
+    ``config={"configurable": {"progress_cb": fn}}`` so it can show which model
+    is being fit/backtested (e.g. "Fitting XGBoost (3/4)"). The CLI and batch
+    runner pass no config, so ``cb`` is None and this is a no-op. Any callback
+    error is swallowed — progress reporting must never break the pipeline.
+    """
+    try:
+        cb = (config or {}).get("configurable", {}).get("progress_cb")
+        if cb:
+            cb(phase, model, done, total)
+    except Exception:
+        pass
+
+
 class ModelResult(TypedDict, total=False):
     """Output bundle for one forecasting model run (keyed by MODEL_OPTIONS label)."""
 

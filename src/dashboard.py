@@ -45,6 +45,7 @@ import json
 import inspect
 import logging
 import tempfile
+import threading
 import subprocess
 import traceback
 import importlib.util
@@ -1199,6 +1200,95 @@ def _load_agent_summary(view):
         return None
 
 
+# Progress markers for the agent run. Keys are LangGraph node names (see
+# agent/graph.py); each maps to (fraction_complete, user-facing label). graph
+# .stream() yields one update per node as it finishes, so we bump the bar to the
+# node's fraction when its update arrives. evaluate_models is the long pole (4
+# models x 6 walk-forward re-fits), hence the big jump to 0.75.
+_AGENT_NODE_PROGRESS = {
+    "ingest": (0.15, "Loading & cleaning data…"),
+    "run_all_models": (0.40, "Fitting the forecast models…"),
+    "evaluate_models": (0.75, "Backtesting models (walk-forward) to compare accuracy…"),
+    "select_best_model": (0.80, "Selecting the best model…"),
+    "flag_anomalies": (0.88, "Flagging anomalies…"),
+    "summarize": (0.95, "Writing the summary…"),
+    "flag_low_confidence": (0.95, "Writing the low-confidence note…"),
+    "publish": (1.0, "Publishing results…"),
+}
+
+
+def _run_agent_job(view, today_ts, shared):
+    """Run the agent pipeline on a background thread, streaming progress.
+
+    Runs OFF the main Streamlit script thread so the UI stays interactive. It
+    must NOT touch any ``st.*`` API — it only mutates the plain ``shared`` dict
+    (created on the main thread, polled by the progress fragment). LLM_PROVIDER
+    is read from the env at call time by agent/llm.py, so the caller sets it
+    before starting this thread.
+    """
+    # Per-model progress from inside the fit/backtest node loops. The nodes call
+    # this via RunnableConfig (see agent/state.report_progress); it maps each
+    # phase to its slice of the bar so the user sees e.g. "Fitting XGBoost (3/4)".
+    def _cb(phase, model, done, total):
+        total = max(int(total), 1)
+        if phase == "fit":  # fit loop occupies 0.15 -> 0.40 of the bar
+            shared["progress"] = 0.15 + 0.25 * (done / total)
+            shared["step"] = f"Fitting {model} ({done}/{total})"
+        elif phase == "backtest":  # backtest loop occupies 0.40 -> 0.75
+            shared["progress"] = 0.40 + 0.35 * (done / total)
+            shared["step"] = f"Backtesting {model} ({done}/{total})"
+
+    try:
+        # Import here, not at module top: keeps langgraph off the hot import
+        # path for every rerun and matches the "only touched on click" rule.
+        from agent.graph import build_graph
+
+        graph = build_graph()
+        # stream_mode="updates" (the default) yields {node_name: state_delta}
+        # after each node finishes; accumulate the deltas so best_model/errors
+        # are available when the run ends. The progress_cb (passed via config)
+        # supplies finer per-model updates from inside the fit/backtest nodes.
+        config = {"configurable": {"progress_cb": _cb}}
+        for update in graph.stream({"view": view, "today_ts": today_ts}, config=config):
+            for node_name, delta in update.items():
+                frac, label = _AGENT_NODE_PROGRESS.get(
+                    node_name, (shared.get("progress", 0.0), "Working…")
+                )
+                shared["progress"] = frac
+                shared["step"] = label
+                if isinstance(delta, dict):
+                    shared["result"].update(delta)
+        shared["status"] = "done"
+    except Exception as exc:  # surface any failure to the UI instead of a dead spinner
+        shared["error"] = f"{type(exc).__name__}: {exc}"
+        shared["status"] = "error"
+
+
+@st.fragment(run_every=0.5)
+def _agent_progress_fragment():
+    """Poll the background agent job and render its progress bar.
+
+    Only THIS fragment reruns on the 0.5s timer — the rest of the page stays
+    interactive while the pipeline runs on its background thread. When the job
+    finishes, trigger one full app rerun so main() can finalize (toast, switch
+    the model toggle, render the summary).
+    """
+    job = st.session_state.get("agent_job") or {}
+    started = job.get("started_at")
+    elapsed_txt = ""
+    if started:
+        secs = int(time.time() - started)
+        elapsed_txt = f"  ·  {secs // 60}:{secs % 60:02d} elapsed"
+    st.progress(
+        min(float(job.get("progress", 0.0)), 1.0),
+        text=f"Running agent — {job.get('step', 'Working…')}{elapsed_txt}",
+    )
+    if started:
+        st.caption(f"Started at {time.strftime('%H:%M:%S', time.localtime(started))}")
+    if job.get("status") in ("done", "error"):
+        st.rerun(scope="app")
+
+
 def _render_agent_summary(view):
     """Render the cached agent summary for `view` in the main body, if any."""
     payload = _load_agent_summary(view)
@@ -1222,6 +1312,33 @@ def _render_agent_summary(view):
                 st.warning(label + "  —  ⚠️ low confidence")
             else:
                 st.success(label)
+
+        # All models' backtest MAEs side by side, so the user can see how close
+        # the call was. mae_by_model comes straight from publish.py; a model
+        # whose backtest failed has MAE None -> shown as "n/a", sorted last.
+        mae_by_model = payload.get("mae_by_model") or {}
+        if mae_by_model:
+            rows = [
+                {
+                    "Model": name,
+                    "Backtest MAE": ("n/a" if mae is None else round(float(mae), 1)),
+                    "Best": "✓" if name == best else "",
+                    "_sort": (float("inf") if mae is None else float(mae)),
+                }
+                for name, mae in mae_by_model.items()
+            ]
+            mae_df = (
+                pd.DataFrame(rows)
+                .sort_values("_sort")
+                .drop(columns="_sort")
+                .reset_index(drop=True)
+            )
+            st.markdown("**Model comparison:**")
+            st.dataframe(mae_df, hide_index=True)
+            st.caption(
+                "Backtest MAE from walk-forward (one-step-ahead) validation — "
+                "lower = closer fit; winner chosen by lowest MAE."
+            )
 
         if payload.get("narrative"):
             st.write(payload["narrative"])
@@ -1712,30 +1829,57 @@ def main():
         )
 
     if run_agent:
-        os.environ["LLM_PROVIDER"] = LLM_PROVIDERS[provider_label]
+        # Kick off the pipeline on a background thread and rerun immediately, so
+        # the (minutes-long) run never blocks the script. Progress is polled by
+        # _agent_progress_fragment; completion is finalized further below.
+        os.environ["LLM_PROVIDER"] = LLM_PROVIDERS[provider_label]  # llm.py reads env at call time
         # Remember that the agent was run for this view this session, so the
         # summary expander below appears only after an explicit click — never a
         # stale persisted summary surfacing on page load.
         st.session_state.setdefault("agent_ran_views", set()).add(view)
-        with st.spinner(f"Running agentic pipeline ({provider_label})…"):
-            # Import here, not at module top: keeps langgraph off the hot import
-            # path for every rerun and matches the "only touched on click" rule.
-            from agent.graph import build_graph
+        shared = {
+            "status": "running",
+            "progress": 0.0,
+            "step": "Starting…",
+            "view": view,
+            "started_at": time.time(),  # so the progress panel can show elapsed time
+            "result": {},
+            "error": None,
+        }
+        thread = threading.Thread(
+            target=_run_agent_job, args=(view, today_ts, shared), daemon=True
+        )
+        st.session_state["agent_job"] = shared
+        st.session_state["agent_job_thread"] = thread
+        thread.start()
+        st.rerun()
 
-            graph = build_graph()
-            final_state = graph.invoke({"view": view, "today_ts": today_ts})
-        if final_state.get("errors"):
-            st.error("\n".join(final_state["errors"]))
-        else:
-            best = final_state.get("best_model")
-            st.toast(f"Agent finished: {best or 'n/a'}")
-            # Switch the model toggle to the agent's winner so the screen shows
-            # the best model. Stash it as a pending key and rerun: the toggle
-            # widget already rendered above this run, so it can't be written
-            # here — the pending value is applied before the widget next build.
-            if best in MODEL_OPTIONS and best != st.session_state.get("model_choice"):
-                st.session_state["_pending_model_choice"] = best
-                st.rerun()
+    job = st.session_state.get("agent_job")
+    if job is not None and job.get("view") == view:
+        status = job.get("status")
+        if status == "running":
+            # Live, non-blocking progress. Only the fragment reruns on its timer;
+            # everything else on the page stays interactive.
+            _agent_progress_fragment()
+        elif status in ("done", "error"):
+            # A full rerun (fired by the fragment) lands here once the run ends.
+            result = job.get("result") or {}
+            if status == "error" or result.get("errors"):
+                st.error(job.get("error") or "\n".join(result.get("errors", [])) or "Agent run failed.")
+                job["status"] = "shown"  # consume so the error isn't re-raised on later reruns
+            else:
+                best = result.get("best_model") or (_load_agent_summary(view) or {}).get("best_model")
+                started = job.get("started_at")
+                dur = f" in {int(time.time() - started)}s" if started else ""
+                st.toast(f"Agent finished{dur}: {best or 'n/a'}")
+                job["status"] = "shown"  # consume before any rerun below
+                # Switch the model toggle to the agent's winner so the screen
+                # shows the best model. Stash it as a pending key and rerun: the
+                # toggle widget already rendered above, so it can't be written
+                # here — the pending value is applied before the widget rebuilds.
+                if best in MODEL_OPTIONS and best != st.session_state.get("model_choice"):
+                    st.session_state["_pending_model_choice"] = best
+                    st.rerun()
 
     # Show the cached run (from the JSON publish wrote) only for views the user
     # has run the agent on this session — clicking is what reveals it.

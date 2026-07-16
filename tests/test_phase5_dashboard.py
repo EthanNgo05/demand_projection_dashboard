@@ -1,8 +1,8 @@
 """Phase 5: Streamlit integration via the headless AppTest harness.
 
 Two things must hold:
-  1. Clicking "Run Agent Summary" actually invokes the graph and the result is
-     rendered in the UI.
+  1. Clicking "Run Agent Summary" runs the graph (on a background thread so the
+     UI doesn't freeze) and the result is rendered in the UI.
   2. A plain rerun (changing any other widget) does NOT invoke the LLM — the
      agent is button-triggered only. This is the load-bearing test: it enforces
      the "never on rerun" rule rather than trusting it by inspection.
@@ -39,15 +39,18 @@ needs_data = pytest.mark.skipif(
 
 
 class _FakeGraph:
-    """Stands in for the compiled LangGraph graph. Its invoke() writes the same
-    summary JSON publish would (so the dashboard's cached-render path shows it)
-    and records that it was called."""
+    """Stands in for the compiled LangGraph graph. Its stream() writes the same
+    summary JSON publish would (so the dashboard's cached-render path shows it),
+    records that it was called, and yields one {node: delta} update per node the
+    way LangGraph's stream(stream_mode="updates") does, so the dashboard's
+    progress bar advances."""
 
     def __init__(self, recorder):
         self._recorder = recorder
 
-    def invoke(self, state):
+    def stream(self, state, config=None):
         self._recorder["called_with"] = state
+        self._recorder["config"] = config
         import dashboard  # the module under test
 
         view = state["view"]
@@ -69,8 +72,13 @@ class _FakeGraph:
                 },
                 f,
             )
-        return {"view": view, "best_model": "XGBoost", "narrative": "Demand is flat.",
-                "anomalies": ["- SKU-1 spiked"], "errors": []}
+        yield {"ingest": {}}
+        yield {"run_all_models": {}}
+        yield {"evaluate_models": {}}
+        yield {"select_best_model": {"best_model": "XGBoost", "confidence_flag": False}}
+        yield {"flag_anomalies": {"anomalies": ["- SKU-1 spiked"]}}
+        yield {"summarize": {"narrative": "Demand is flat."}}
+        yield {"publish": {"window_excluded_skus": []}}
 
 
 @needs_data
@@ -95,9 +103,20 @@ def test_run_agent_button_triggers_graph(monkeypatch):
         # returns as soon as the script finishes.
         at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
         assert not at.exception
+        # The click starts the pipeline on a background thread (non-blocking)
+        # and reruns; wait for that thread before asserting on the summary.
         at.button(key="run_agent_summary").click().run()
+        assert "agent_job_thread" in at.session_state, (
+            "background agent thread was not started"
+        )
+        thread = at.session_state["agent_job_thread"]
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "agent thread did not finish in time"
+        # Re-run so the finished job is finalized and its summary rendered.
+        at.run()
+        assert not at.exception
 
-        assert recorder.get("called_with"), "graph.invoke was never called"
+        assert recorder.get("called_with"), "graph.stream was never called"
         assert recorder["called_with"]["view"] == dashboard.ALL_CUSTOMERS_VIEW
         # The rendered summary reports the best model from the written JSON.
         assert "XGBoost" in " ".join(m.value for m in at.success)

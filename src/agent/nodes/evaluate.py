@@ -20,12 +20,12 @@ from agent.config import MODEL_OPTIONS
 from agent.data_io import view_frame
 from agent.logging_util import logger
 from agent.model_loader import load_pipeline
-from agent.state import AgentState
+from agent.state import AgentState, report_progress
 
 HOLDOUT_WEEKS = 6  # matches AUTOFIT_HOLDOUT_WEEKS in exponential_smoothing.py
 
 
-def evaluate_models(state: AgentState) -> dict:
+def evaluate_models(state: AgentState, config=None) -> dict:
     df = state["cleaned_df"]
     view = state["view"]
     today_ts = state["today_ts"]
@@ -37,9 +37,10 @@ def evaluate_models(state: AgentState) -> dict:
     # agent/batch.py instead.
     results = dict(state["results"])
     errors = list(state.get("errors", []))
-    for label, path in MODEL_OPTIONS.items():
-        if label not in results:
-            continue
+    to_score = [(label, path) for label, path in MODEL_OPTIONS.items() if label in results]
+    total = len(to_score)
+    for idx, (label, path) in enumerate(to_score, start=1):
+        report_progress(config, "backtest", label, idx, total)
         try:
             P = load_pipeline(path)
             fit_kwargs = {}
