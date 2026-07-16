@@ -87,7 +87,7 @@ def publish(state: AgentState) -> dict:
         "view": view,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "best_model": best,
-        "mae_by_model": {k: v.get("mae") for k, v in results.items()},
+        "mase_by_model": {k: v.get("mase") for k, v in results.items()},
         "narrative": state.get("narrative"),
         "anomalies": state.get("anomalies", []),
         # SKUs the winning model omits for having no demand inside its window
@@ -111,7 +111,7 @@ def publish(state: AgentState) -> dict:
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             f"{datetime.now():%Y-%m-%d %H:%M:%S}  AGENT     [{view}] "
-            f"best={best} mae={payload['mae_by_model'].get(best)} -> {path}\n"
+            f"best={best} mase={payload['mase_by_model'].get(best)} -> {path}\n"
         )
 
     return {"window_excluded_skus": window_excluded}

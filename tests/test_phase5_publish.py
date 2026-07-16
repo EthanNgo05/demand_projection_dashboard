@@ -66,7 +66,7 @@ def test_publish_writes_expected_json(tmp_path, monkeypatch):
     state = {
         "view": "All customers (combined)",
         "best_model": "XGBoost",
-        "results": {"XGBoost": {"mae": 22.1}, "8-Week Moving Average": {"mae": 30.0}},
+        "results": {"XGBoost": {"mase": 0.85}, "8-Week Moving Average": {"mase": 1.10}},
         "narrative": "Demand is flat.",
         "anomalies": ["- SKU-1 spiked"],
         "confidence_flag": False,
@@ -78,8 +78,8 @@ def test_publish_writes_expected_json(tmp_path, monkeypatch):
     assert out_path.exists()
     payload = json.loads(out_path.read_text())
     assert payload["best_model"] == "XGBoost"
-    assert payload["mae_by_model"]["XGBoost"] == 22.1
-    assert payload["mae_by_model"]["8-Week Moving Average"] == 30.0
+    assert payload["mase_by_model"]["XGBoost"] == 0.85
+    assert payload["mase_by_model"]["8-Week Moving Average"] == 1.10
     assert payload["narrative"] == "Demand is flat."
     assert payload["anomalies"] == ["- SKU-1 spiked"]
     assert payload["confidence_flag"] is False
@@ -92,7 +92,7 @@ def test_publish_mangles_view_into_filename(tmp_path, monkeypatch):
     matches dashboard._agent_summary_path's mangling exactly."""
     monkeypatch.setattr("agent.nodes.publish.OUTPUT_DIR", str(tmp_path))
     publish({"view": "AMAZON US/DC", "best_model": "XGBoost",
-             "results": {"XGBoost": {"mae": 1.0}}})
+             "results": {"XGBoost": {"mase": 1.0}}})
     assert (tmp_path / "agent_summary_AMAZON_US-DC.json").exists()
 
 
@@ -106,12 +106,13 @@ def test_publish_appends_to_logs_not_overwrites(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.nodes.publish.OUTPUT_DIR", str(tmp_path / "outputs"))
     os.makedirs(tmp_path / "outputs")
     publish({"view": "All customers (combined)", "best_model": "XGBoost",
-             "results": {"XGBoost": {"mae": 22.1}}, "narrative": "", "anomalies": []})
+             "results": {"XGBoost": {"mase": 0.85}}, "narrative": "", "anomalies": []})
     with open(log_path, encoding="utf-8") as f:
         contents = f.read()
     assert "existing line" in contents  # not clobbered
     assert "AGENT" in contents          # our line appended
     assert "best=XGBoost" in contents
+    assert "mase=" in contents
 
 
 def test_publish_handles_low_confidence_none_best(tmp_path, monkeypatch):
@@ -123,7 +124,7 @@ def test_publish_handles_low_confidence_none_best(tmp_path, monkeypatch):
              "confidence_flag": True, "errors": []})
     payload = json.loads((tmp_path / "agent_summary_TINY_VIEW.json").read_text())
     assert payload["best_model"] is None
-    assert payload["mae_by_model"] == {}
+    assert payload["mase_by_model"] == {}
     assert payload["confidence_flag"] is True
 
 
@@ -133,7 +134,7 @@ def test_publish_creates_output_dir_if_missing(tmp_path, monkeypatch):
     os.makedirs(nested.parent.parent)  # leave the last two levels for publish
     # publish should makedirs(OUTPUT_DIR) itself.
     publish({"view": "V", "best_model": "XGBoost",
-             "results": {"XGBoost": {"mae": 1.0}}})
+             "results": {"XGBoost": {"mase": 1.0}}})
     assert (nested / "agent_summary_V.json").exists()
 
 

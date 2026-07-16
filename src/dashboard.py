@@ -1200,6 +1200,18 @@ def _load_agent_summary(view):
         return None
 
 
+def _agent_scores(payload):
+    """(scores_dict, is_mase) for an agent summary payload.
+
+    Prefers the current ``mase_by_model`` key; falls back to the legacy
+    ``mae_by_model`` written before the MASE migration so a stale JSON still
+    renders (with the old MAE wording) until the nightly batch regenerates it.
+    """
+    if payload.get("mase_by_model") is not None:
+        return payload["mase_by_model"], True
+    return payload.get("mae_by_model") or {}, False
+
+
 # Progress markers for the agent run. Keys are LangGraph node names (see
 # agent/graph.py); each maps to (fraction_complete, user-facing label). graph
 # .stream() yields one update per node as it finishes, so we bump the bar to the
@@ -1302,43 +1314,59 @@ def _render_agent_summary(view):
         if payload.get("errors"):
             st.error("\n".join(payload["errors"]))
 
+        scores, is_mase = _agent_scores(payload)
+
         best = payload.get("best_model")
         if best:
-            mae = (payload.get("mae_by_model") or {}).get(best)
+            score = scores.get(best)
             label = f"Best model: {best}"
-            if mae is not None:
-                label += f"  (backtest MAE {mae:.1f})"
+            if score is not None:
+                label += (
+                    f"  (backtest MASE {score:.2f})" if is_mase
+                    else f"  (backtest MAE {score:.1f})"
+                )
             if payload.get("confidence_flag"):
                 st.warning(label + "  —  ⚠️ low confidence")
             else:
                 st.success(label)
 
-        # All models' backtest MAEs side by side, so the user can see how close
-        # the call was. mae_by_model comes straight from publish.py; a model
-        # whose backtest failed has MAE None -> shown as "n/a", sorted last.
-        mae_by_model = payload.get("mae_by_model") or {}
-        if mae_by_model:
+        # All models' backtest scores side by side, so the user can see how
+        # close the call was. Scores come straight from publish.py; a model
+        # whose backtest failed has None -> shown as "n/a", sorted last.
+        if scores:
+            col = "Backtest MASE (vs 8-wk avg)" if is_mase else "Backtest MAE"
             rows = [
                 {
                     "Model": name,
-                    "Backtest MAE": ("n/a" if mae is None else round(float(mae), 1)),
+                    col: (
+                        "n/a" if score is None
+                        else round(float(score), 2 if is_mase else 1)
+                    ),
                     "Best": "✓" if name == best else "",
-                    "_sort": (float("inf") if mae is None else float(mae)),
+                    "_sort": (float("inf") if score is None else float(score)),
                 }
-                for name, mae in mae_by_model.items()
+                for name, score in scores.items()
             ]
-            mae_df = (
+            score_df = (
                 pd.DataFrame(rows)
                 .sort_values("_sort")
                 .drop(columns="_sort")
                 .reset_index(drop=True)
             )
             st.markdown("**Model comparison:**")
-            st.dataframe(mae_df, hide_index=True)
-            st.caption(
-                "Backtest MAE from walk-forward (one-step-ahead) validation — "
-                "lower = closer fit; winner chosen by lowest MAE."
-            )
+            st.dataframe(score_df, hide_index=True)
+            if is_mase:
+                st.caption(
+                    "Backtest MASE from walk-forward (one-step-ahead) validation: "
+                    "model error ÷ a plain 8-week moving average's error on the "
+                    "same weeks. < 1 beats the 8-week average; lower = better; "
+                    "winner chosen by lowest MASE."
+                )
+            else:
+                st.caption(
+                    "Backtest MAE from walk-forward (one-step-ahead) validation — "
+                    "lower = closer fit; winner chosen by lowest MAE."
+                )
 
         if payload.get("narrative"):
             st.write(payload["narrative"])

@@ -64,7 +64,7 @@ class _FakeGraph:
                     "view": view,
                     "generated_at": "2026-07-08T12:00:00",
                     "best_model": "XGBoost",
-                    "mae_by_model": {"XGBoost": 22.1},
+                    "mase_by_model": {"XGBoost": 0.85},
                     "narrative": "Demand is flat.",
                     "anomalies": ["- SKU-1 spiked"],
                     "confidence_flag": False,
@@ -186,3 +186,18 @@ def test_provider_selector_change_does_not_call_llm(monkeypatch):
     at.radio(key="agent_llm_provider").set_value("Local LLM").run()
     assert called["llm"] is False
     assert not at.exception
+
+
+def test_agent_scores_prefers_mase_and_falls_back():
+    """_agent_scores reads the current mase_by_model key, falls back to the
+    legacy mae_by_model for stale pre-MASE JSONs, and degrades to empty."""
+    import dashboard
+
+    assert dashboard._agent_scores({"mase_by_model": {"A": 0.9}}) == ({"A": 0.9}, True)
+    assert dashboard._agent_scores({"mae_by_model": {"A": 22.1}}) == ({"A": 22.1}, False)
+    # Both present -> mase wins (a regenerated file never carries both, but
+    # prefer-current is the documented contract).
+    assert dashboard._agent_scores(
+        {"mase_by_model": {"A": 0.9}, "mae_by_model": {"A": 22.1}}
+    ) == ({"A": 0.9}, True)
+    assert dashboard._agent_scores({}) == ({}, False)
