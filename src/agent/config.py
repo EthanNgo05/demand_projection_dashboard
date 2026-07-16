@@ -51,6 +51,16 @@ def region_from_view(view):
         return view[len(REGION_ALL_PREFIX):]
     return None
 
+
+def region_all_view(region):
+    """The synthetic per-region combined view string for ``region``.
+
+    Streamlit-free mirror of dashboard.region_all_view, so the headless batch
+    runner can enumerate the same per-region rollup views the dashboard offers
+    without importing streamlit. Inverse of ``region_from_view``.
+    """
+    return f"{REGION_ALL_PREFIX}{region}"
+
 # Phase 3 calibration (2026-07-08, all_demand_projections_2026-07-07.xlsx):
 # ran evaluate/select across all 48 real views (ALL + 47 groupings). Winning
 # backtest MAEs (shared 6-week single-holdout, raw actuals): p50=7.7, p80=39.1,

@@ -29,6 +29,11 @@ def run_all_models(state: AgentState) -> dict:
     is_region_all = region_from_view(view) is not None
     sub = view_frame(df, view)
 
+    # Models are run serially here on purpose: a single model (Holt-Winters via
+    # statsmodels) dominates a view's runtime, so fanning the four models out
+    # across threads/processes measured ~1x (threads even regress on the GIL —
+    # much of the per-SKU model code is pure-Python pandas). Parallelism lives
+    # ACROSS views instead (agent/batch.py runs a process per view).
     results = {}
     errors = list(state.get("errors", []))
     for label, path in MODEL_OPTIONS.items():

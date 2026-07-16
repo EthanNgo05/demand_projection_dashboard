@@ -189,14 +189,68 @@ def _clean(raw_df, P):
     return df
 
 
+def _parquet_sidecar_path(xlsx_path):
+    """The ``.parquet`` sidecar path for a snapshot ``.xlsx`` (same basename)."""
+    root, _ = os.path.splitext(xlsx_path)
+    return root + ".parquet"
+
+
+def read_raw_frame(path):
+    """Read a raw demand snapshot into the pre-``_clean`` frame, fast path first.
+
+    The nightly extract writes a ``.parquet`` sidecar next to each
+    ``all_demand_projections_<date>.xlsx`` (see
+    ``extract_demand_details.write_parquet_sidecar``). Parquet preserves dtypes
+    and carries no banner rows, so it loads far faster than re-parsing the
+    workbook with openpyxl. This helper prefers that sidecar and falls back to
+    the ``.xlsx`` (``header=2`` for the two-row PowerBI banner):
+
+      1. sidecar exists and is at least as new as the ``.xlsx`` -> read Parquet;
+      2. otherwise read the ``.xlsx`` and **lazily backfill** the sidecar for
+         next time (best-effort — swallowed on read-only hosts / missing engine),
+         so pre-existing snapshots and manual PowerBI exports get the fast path
+         on their second load.
+
+    Returns the raw frame with the PowerBI column names ``_clean`` expects
+    (``'Demand'[DisplaySKU]``, ``Custnmbr``, ``WeekDate``, ``POS``,
+    ``Projection``, optionally ``Sum of Quantity``). Discovery stays keyed on the
+    ``.xlsx`` (see ``discover_raw_files``); only the physical read is swapped.
+    """
+    sidecar = _parquet_sidecar_path(path)
+    try:
+        if os.path.exists(sidecar) and (
+            not os.path.exists(path)
+            or os.path.getmtime(sidecar) >= os.path.getmtime(path)
+        ):
+            return pd.read_parquet(sidecar)
+    except Exception:  # corrupt/unreadable sidecar or engine missing -> xlsx
+        pass
+
+    raw = pd.read_excel(path, header=2)
+    # Lazy backfill so the next load hits the fast path. Never let a failed
+    # sidecar write break the read.
+    try:
+        tmp = sidecar + ".tmp"
+        raw.to_parquet(tmp, index=False)
+        os.replace(tmp, sidecar)
+    except Exception:
+        try:
+            if os.path.exists(sidecar + ".tmp"):
+                os.remove(sidecar + ".tmp")
+        except OSError:
+            pass
+    return raw
+
+
 def load_raw(path, P=None):
     """Read + clean a raw demand workbook from disk.
 
-    ``header=2`` matches the PowerBI export layout (two banner rows above the
-    header) — the same read dashboard.py's ``load_raw_from_path`` does.
+    Reads via ``read_raw_frame`` (Parquet sidecar when available, else the
+    ``header=2`` PowerBI workbook), then applies the shared ``_clean`` — the
+    same result dashboard.py's ``load_raw_from_path`` produces.
     """
     P = _resolve_pipeline(P)
-    raw = pd.read_excel(path, header=2)
+    raw = read_raw_frame(path)
     return _clean(raw, P)
 
 

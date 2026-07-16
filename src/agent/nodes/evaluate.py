@@ -31,6 +31,10 @@ def evaluate_models(state: AgentState) -> dict:
     today_ts = state["today_ts"]
     sub = view_frame(df, view)
 
+    # Serial by design — see the note in forecast.run_all_models. The backtest
+    # is the runtime long pole, but it is dominated by one model, so per-model
+    # parallelism does not help; views are parallelized across processes in
+    # agent/batch.py instead.
     results = dict(state["results"])
     errors = list(state.get("errors", []))
     for label, path in MODEL_OPTIONS.items():

@@ -4,8 +4,6 @@ Calls through the ``data_io`` module object (not ``from ... import name``) so
 tests can monkeypatch ``agent.data_io.discover_raw_files`` / ``discover_price_file``.
 """
 
-import pandas as pd
-
 from agent import data_io
 from agent.config import MODEL_OPTIONS
 from agent.logging_util import logger
@@ -14,6 +12,14 @@ from agent.state import AgentState
 
 
 def ingest(state: AgentState) -> dict:
+    # Batch fast path: the batch runner (agent/batch.py) ingests once in the
+    # parent and pre-seeds every per-view state with the cleaned frame + prices,
+    # so skip the read/clean/exclusions and the Plytix fetch entirely — doing
+    # them per view would re-read the snapshot and re-hit the feed ~57×. Normal
+    # single-view runs never set cleaned_df, so this branch is inert for them.
+    if state.get("cleaned_df") is not None:
+        return {}
+
     # Honour a pre-set raw_path (parity tests / reruns pin the input file);
     # otherwise take the newest discovered file, mirroring resolve_input_file().
     raw_path = state.get("raw_path")
@@ -38,7 +44,7 @@ def ingest(state: AgentState) -> dict:
     # Any model file works to drive _clean's schema (CUSTOMERS_TO_IGNORE /
     # COMBINED_GROUPING are identical across the three model modules today).
     P = load_pipeline(next(iter(MODEL_OPTIONS.values())))
-    raw = pd.read_excel(raw_path, header=2)  # header=2 matches dashboard load_raw_from_path
+    raw = data_io.read_raw_frame(raw_path)  # Parquet sidecar when present, else xlsx
     cleaned = data_io._clean(raw, P)
 
     # Apply the exact same pre-forecast exclusions the dashboard does, so the

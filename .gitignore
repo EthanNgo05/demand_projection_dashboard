@@ -13,6 +13,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Parquet fast-load sidecars are a regenerable read cache written next to each
+# .xlsx snapshot (raw_inputs is already ignored; this covers the test fixtures,
+# which read_raw_frame backfills on first read).
+tests/fixtures/*.parquet
+
 # Secrets
 .env
 

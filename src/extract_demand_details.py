@@ -492,6 +492,44 @@ def write_powerbi_xlsx(df: pd.DataFrame, out_path: str, banner: str = FILTER_BAN
         raise
 
 
+def parquet_sidecar_path(xlsx_path: str) -> str:
+    """The ``.parquet`` sidecar path for a snapshot ``.xlsx`` (same basename).
+
+    Read back by the app's fast-load path (``agent.data_io.read_raw_frame``):
+    Parquet preserves dtypes and carries no banner rows, so it loads far faster
+    than re-parsing the workbook and feeds ``_clean`` directly.
+    """
+    root, _ = os.path.splitext(xlsx_path)
+    return root + ".parquet"
+
+
+def write_parquet_sidecar(df: pd.DataFrame, xlsx_path: str) -> str | None:
+    """Write ``df`` as a ``.parquet`` sidecar next to ``xlsx_path``, atomically.
+
+    Best-effort: a missing Parquet engine (pyarrow) or a write failure is logged
+    and swallowed — the ``.xlsx`` is the source of truth and the app falls back
+    to it. Same temp-file + atomic-replace dance as ``write_powerbi_xlsx`` so a
+    reader never sees a half-written sidecar. Returns the path written, or None.
+    """
+    out_path = parquet_sidecar_path(xlsx_path)
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".parquet", dir=out_dir)
+    os.close(fd)
+    try:
+        df.to_parquet(tmp, index=False)
+        _replace_with_retry(tmp, out_path)
+        return out_path
+    except Exception as exc:  # engine missing / write error — xlsx still stands
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        log.warning("Could not write Parquet sidecar %s: %s", out_path, exc)
+        return None
+
+
 def _replace_with_retry(
     src: str, dst: str, attempts: int = 6, delay: float = 3.0
 ) -> None:
@@ -586,6 +624,14 @@ def prune_old_snapshots(
                 removed.append(path)
             except OSError as exc:
                 log.warning("Could not prune old snapshot %s: %s", path, exc)
+            # Drop the Parquet sidecar for the same snapshot, if one exists.
+            sidecar = parquet_sidecar_path(path)
+            if os.path.exists(sidecar):
+                try:
+                    os.remove(sidecar)
+                    removed.append(sidecar)
+                except OSError as exc:
+                    log.warning("Could not prune sidecar %s: %s", sidecar, exc)
     if removed:
         log.info(
             "Pruned %d old snapshot file(s), keeping the newest %d date(s): %s",
@@ -729,11 +775,16 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = os.path.dirname(os.path.abspath(out_path))
         os.makedirs(out_dir, exist_ok=True)
         write_powerbi_xlsx(df, out_path)
+        # Fast-load sidecar for the dashboard/agent (best-effort; xlsx is source
+        # of truth). Written after the xlsx so the two share the snapshot's date.
+        sidecar = write_parquet_sidecar(df, out_path)
         # Prune only after the new file is safely written, so a failed/partial
         # pull never deletes good history.
         prune_old_snapshots(out_dir)
 
         print(f"Pulled {len(df):,} rows x {len(df.columns)} columns")
+        if sidecar:
+            print(f"Wrote Parquet sidecar {sidecar}")
         print("Columns:", list(df.columns))
         print(df.head(10).to_string())
         print(f"Wrote {out_path}")

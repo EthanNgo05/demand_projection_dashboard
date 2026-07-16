@@ -7,12 +7,23 @@ which is provider-agnostic (Claude API or a local OpenAI-compatible server)
 and never raises: failures degrade into state["errors"].
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 
 from agent.llm import safe_invoke
 from agent.logging_util import logger
 from agent.state import AgentState
+
+
+def _skip_llm() -> bool:
+    """True when LLM narrative/anomaly nodes should be skipped.
+
+    Set ``AGENT_SKIP_LLM=1`` (the batch runner's ``--no-llm``) for a pure
+    numeric refresh — every view still gets its best model + backtest MAEs, just
+    no generated prose, avoiding one LLM call per view (~57× on a full batch)."""
+    return bool(os.environ.get("AGENT_SKIP_LLM"))
 
 # Cap the anomaly-prompt table. ALL CUSTOMERS summaries can run to hundreds of
 # SKU rows; we pre-filter in pandas to the largest absolute % swings instead of
@@ -87,6 +98,8 @@ def _anomaly_table(summary_df: pd.DataFrame, max_rows: int = MAX_ANOMALY_ROWS) -
 
 
 def flag_anomalies(state: AgentState) -> dict:
+    if _skip_llm():
+        return {"anomalies": []}
     best = state["best_model"]
     summary = state["results"][best]["summary_df"]
     table = _anomaly_table(summary)
@@ -116,6 +129,8 @@ def flag_low_confidence(state: AgentState) -> dict:
                 "history is too short for a holdout. Review this view manually."
             )
         }
+    if _skip_llm():
+        return {"narrative": None}
     text, err = safe_invoke(
         LOW_CONFIDENCE_PROMPT.format(
             view=state["view"],
@@ -132,6 +147,8 @@ def flag_low_confidence(state: AgentState) -> dict:
 
 
 def summarize(state: AgentState) -> dict:
+    if _skip_llm():
+        return {"narrative": None}
     best = state["best_model"]
     text, err = safe_invoke(
         SUMMARY_PROMPT.format(

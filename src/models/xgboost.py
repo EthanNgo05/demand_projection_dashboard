@@ -79,7 +79,10 @@ XGB_PARAMS = dict(
     reg_lambda=1.0,          # L2 regularisation
     objective="reg:squarederror",
     random_state=42,
-    n_jobs=-1,
+    # -1 = all cores (default, standalone/interactive). The batch runner sets
+    # XGB_N_JOBS=1 so each single-threaded worker process avoids oversubscribing
+    # the machine when many views train XGBoost in parallel.
+    n_jobs=int(os.environ.get("XGB_N_JOBS", "-1")),
     verbosity=0,
 )
 

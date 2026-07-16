@@ -75,5 +75,26 @@ $warehouseCode = $LASTEXITCODE
 $Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 Add-Content -Path $Log -Value "===== scheduled warehouse refresh finished $Stamp (exit $warehouseCode) ====="
 
-# Worst exit code wins, so Task Scheduler flags a failure in either pull.
-exit ([Math]::Max([int]$demandCode, [int]$warehouseCode))
+# Precompute every view's agent summary in parallel, off the request path, so
+# the dashboard serves agent results (best model + backtest + narrative)
+# instantly instead of running the slow multi-model backtest live. Reads the
+# fresh snapshot the demand pull just wrote (fast, via its Parquet sidecar).
+# Run as a module from src/ so `agent.batch` resolves; only if the demand pull
+# succeeded (a failed pull leaves no fresh data worth summarizing).
+$agentCode = 0
+if ($demandCode -eq 0) {
+    $Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -Path $Log -Value "`n===== scheduled agent precompute started $Stamp ====="
+    Push-Location (Join-Path $Root 'src')
+    try {
+        & $Python -m agent.batch *>&1 | Tee-Object -FilePath $Log -Append
+        $agentCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    $Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -Path $Log -Value "===== scheduled agent precompute finished $Stamp (exit $agentCode) ====="
+}
+
+# Worst exit code wins, so Task Scheduler flags a failure in any pull/step.
+exit ([Math]::Max([Math]::Max([int]$demandCode, [int]$warehouseCode), [int]$agentCode))

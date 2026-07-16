@@ -593,7 +593,7 @@ def load_raw_from_path(path, _mtime, model_path):
     owns its own cleaning rules.
     """
     P = load_pipeline(model_path)
-    raw = pd.read_excel(path, header=2)
+    raw = data_io.read_raw_frame(path)  # Parquet sidecar when present, else xlsx
     return _clean(raw, P)
 
 
