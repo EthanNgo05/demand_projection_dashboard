@@ -13,7 +13,7 @@ Scale of the data (per the latest warehouse snapshot):
 
 ## Common commands
 
-Run everything **from the repo root** so the `raw_inputs/` / `outputs/` relative paths resolve.
+Run everything **from the repo root** so the `raw_inputs/` / `outputs/` relative paths resolve (the agent CLIs are the exception — run those from `src/`).
 
 ```bash
 pip install -r requirements.txt
@@ -24,26 +24,32 @@ streamlit run src/dashboard.py
 # Batch forecast (each model file is also a standalone script; writes per-group + combined .xlsx to outputs/)
 python src/models/exponential_smoothing.py   # or regression.py / holt_winters.py / xgboost.py
 
-# Nightly warehouse pulls (or the scheduled wrapper for both: ./refresh_demand_data.ps1)
-python src/extract_demand_details.py          # ~10 min -> dated all_demand_projections_<date>.xlsx
-python src/extract_warehouse_projections.py   # ~2 min  -> 5 regional <REGION>_warehouse_projections_<date>.xlsx
+# Warehouse pulls (or the scheduled wrapper for all three nightly steps: ./refresh_demand_data.ps1)
+python src/extract_demand_details.py          # ~10 min full 36-month pull -> dated all_demand_projections_<date>.xlsx + .parquet sidecar
+python src/extract_demand_details.py --incremental   # fast: recent weeks + forward projections, merged into the latest snapshot
+python src/extract_warehouse_projections.py   # ~2 min -> 5 regional <REGION>_warehouse_projections_<date>.xlsx
 
-# Tests (fast suite, 14 tests). The agent package lives under src/; pytest.ini puts src/ on sys.path.
+# Tests (~120 fast tests). The agent package lives under src/; pytest.ini puts src/ on sys.path.
 pytest tests/ -v
 pytest tests/test_phase3_select.py::test_name   # single test
-pytest --runslow                                # include the slow full-matrix parity suites
+pytest --runslow                                # include the 7 slow full-matrix parity tests
 
 # Agent end-to-end for one view (run from src/ so `python -m agent.run` resolves the package)
 cd src && python -m agent.run --view "All customers (combined)"
 cd src && python -m agent.run --view "AMAZON-DC"
+
+# Precompute every view's agent summary in parallel (what the nightly job runs)
+cd src && python -m agent.batch               # flags: --workers N, --no-llm (skip narrative prose)
 ```
 
 ## Architecture
 
 Two front-ends run over one shared forecasting core:
 
-1. **`src/dashboard.py`** — Streamlit + Plotly UI. Loads the selected model **by file path** via `importlib` (chosen through the `DEMAND_PIPELINE` env var) and runs it live per Customer Grouping.
-2. **`src/agent/`** — a LangGraph pipeline (`ingest → run_all_models → evaluate_models → select_best_model →` conditional `→ flag_anomalies/summarize` or `flag_low_confidence` `→ publish`) that runs all three models, backtests to pick the best per view, uses an LLM to flag anomalies and write a narrative, and publishes to `outputs/` + logs. See `docs/agentic_workflow/` for the phased design (state schema in `00-overview.md`).
+1. **`src/dashboard.py`** — Streamlit + Plotly UI. Loads the selected model **by file path** via `importlib` (chosen through the `DEMAND_PIPELINE` env var) and runs it live per Customer Grouping. Its "🔄 Refresh data" button spawns the extract scripts on demand (incremental demand pull + warehouse pull); its agent section reads the precomputed `outputs/agent_summary_<view>.json` files and can also run one view live.
+2. **`src/agent/`** — a LangGraph pipeline (`ingest → run_all_models → evaluate_models → select_best_model →` conditional `→ flag_anomalies/summarize` or `flag_low_confidence` `→ publish`) that runs all the models, backtests to pick the best per view, uses an LLM to flag anomalies and write a narrative, and publishes `outputs/agent_summary_<view>.json` + logs. See `docs/agentic_workflow/` for the phased design (state schema in `00-overview.md`). `agent/config.py` mirrors `dashboard.py`'s `MODEL_OPTIONS` and `ALL_CUSTOMERS_VIEW` and must stay in sync with them.
+
+Views offered by both front-ends: `All customers (combined)`, one `All Customers - <region>` rollup per region, and every individual Customer Grouping (`agent/batch.py`'s `enumerate_views` mirrors `dashboard.list_views` without importing streamlit).
 
 ### The pipeline contract (most important thing to understand)
 
@@ -60,13 +66,19 @@ The dashboard **introspects `fit_regression`'s signature** to decide which sideb
 
 - **`regression.py`** — 8-week moving average nudged by a dampened linear-regression slope (`TREND_WEIGHT = 0.25`). Labeled "8-Week Moving Average" in the UI.
 - **`exponential_smoothing.py`** — Holt's double exponential smoothing (level + trend, damped by `PHI`). The only model with outlier cleansing, promo uplift, and an `autofit_smoothing` grid search.
-- **`holt_winters.py`** — Holt-Winters triple exponential smoothing: level + damped trend + **additive seasonality** (`SEASONAL_PERIODS = 52`, annual), fit via `statsmodels` (self-tunes α/β/γ/φ, so no smoothing sliders/autofit, like XGBoost). Labeled "Holt-Winters (triple) exponential smoothing". Needs ≥2 full annual cycles (`MIN_WEEKS_FOR_SEASONAL = 104`); short-history SKUs and non-converging fits fall back to non-seasonal damped Holt. Reuses `exponential_smoothing.py`'s cleansing / window / flatten-to-week-1 behaviour.
+- **`holt_winters.py`** — Holt-Winters triple exponential smoothing: level + damped trend + **additive seasonality** (`SEASONAL_PERIODS = 52`, annual), fit via `statsmodels` (self-tunes α/β/γ/φ, so no smoothing sliders/autofit, like XGBoost). Labeled "Holt-Winters (triple) exponential smoothing". Needs ≥2 full annual cycles (`MIN_WEEKS_FOR_SEASONAL = 104`); short-history SKUs and non-converging fits fall back to non-seasonal damped Holt. Reuses `exponential_smoothing.py`'s cleansing / window / flatten-to-week-1 behaviour. By far the slowest model — this shapes the parallelism design below.
 - **`xgboost.py`** — gradient-boosted trees, **pooled per Customer Grouping** (SKU histories are too short to train per-SKU), each SKU scaled by its own mean, forecast 15 weeks recursively. Falls back to sklearn's `HistGradientBoostingRegressor` if `xgboost` isn't installed.
+
+### Parallelism model (`src/agent/batch.py`)
+
+Within one view the models fit **serially** — Holt-Winters dominates the runtime, so per-model parallelism doesn't pay. Instead `agent.batch` fans the ~60 views across a `ProcessPoolExecutor` of **single-threaded** workers: thread-cap env vars (`OMP_NUM_THREADS` etc., `XGB_N_JOBS=1`) are set in the parent *before* the pool spawns, so workers import NumPy/XGBoost single-threaded and N workers use N cores without contention. The parent ingests once (snapshot read + Plytix fetch) and hands every worker the cleaned frame via one temp Parquet file — `ingest` short-circuits when the state already carries `cleaned_df`, so no worker re-reads or re-fetches.
 
 ### Data flow & inputs
 
-- `sql/demand_details.sql` is the warehouse query behind the nightly pull. It's **UTF-16 encoded** (opens as garbled/spaced text in some tools — that's expected, per `.gitattributes`). `demand_details_optimized.sql` is a work-in-progress optimized rewrite. Region "Others - <country>" buckets attach at `Custnmbr` grain via `MIN(Customer)` — don't drop them when optimizing.
-- Raw inputs live at the repo root under `raw_inputs/`: `demand_projections/all_demand_projections_<date>.xlsx` (PowerBI export, the main POS/projection snapshot), `list_prices/list_prices_*.xlsx` (Plytix export — drives revenue-risk columns *and* the two data-quality checks below), and `warehouse_projections/<REGION>_*.xlsx` (normally written by `extract_warehouse_projections.py` from `sql/warehouse_projections.sql`; manual PowerBI exports also work — `data_io.warehouse_wide_to_long` sniffs whether a file is the legacy wide matrix or the long table layout, and for long files reconstructs the missing SKU×customer×week cells that drive the missing-projections table).
+- **Nightly job** (`refresh_demand_data.ps1`, registered with Windows Task Scheduler): full demand pull → warehouse pull (independent — runs even if the demand pull failed) → `agent.batch` precompute (only if the demand pull succeeded). The nightly demand pull is deliberately the **full 36-month pull** — the self-healing baseline that picks up restated actuals, item renames, and customer remaps; the dashboard's refresh button runs the fast `--incremental` pull instead. Worst exit code wins so Task Scheduler flags a failure in any step. Logs to `logs/<date>/logs_refresh.txt`.
+- `sql/demand_details_optimized.sql` is the **default** query behind the demand extract (`DEFAULT_SQL` in `extract_demand_details.py`); `--incremental` only works against it (it rewrites a marker line in the batch to narrow the date window). The legacy `sql/demand_details.sql` is **UTF-16 encoded** (opens as garbled/spaced text in some tools — that's expected, per `.gitattributes`). Region "Others - <country>" buckets attach at `Custnmbr` grain via `MIN(Customer)` — don't drop them when touching the SQL.
+- **Parquet sidecars**: the demand extract writes a `.parquet` sidecar next to each snapshot `.xlsx` (same basename). The `.xlsx` stays the source of truth; `data_io.read_raw_frame` prefers the sidecar when it's at least as new, else reads the xlsx and backfills the sidecar. Sidecar writes are best-effort (no pyarrow → logged and skipped). Snapshot pruning keeps the newest `KEEP_SNAPSHOTS` files (default 3, `DEMAND_KEEP_SNAPSHOTS` env var) and deletes each pruned snapshot's sidecar with it.
+- Raw inputs live at the repo root under `raw_inputs/`: `demand_projections/all_demand_projections_<date>.xlsx` (written by the extract; PowerBI exports also work), `list_prices/list_prices_*.xlsx` (Plytix export — drives revenue-risk columns *and* the two data-quality checks below), and `warehouse_projections/<REGION>_*.xlsx` (normally written by `extract_warehouse_projections.py` from `sql/warehouse_projections.sql`; manual PowerBI exports also work — `data_io.warehouse_wide_to_long` sniffs whether a file is the legacy wide matrix or the long table layout, and for long files reconstructs the missing SKU×customer×week cells that drive the missing-projections table).
 - **Data-quality checks** (dashboard, need the Plytix export): SKUs projected into a region they aren't "Active in", and Discontinued/Inactive SKUs still carrying projections — both flagged, excluded from the forecast, and listed in their own tables.
 - Only Python code lives under `src/`. Data/log/doc folders (`raw_inputs/`, `outputs/`, `logs/`, `sql/`, `docs/`, `notebooks/`) stay at the repo root — `outputs/` and `logs/` are gitignored.
 
@@ -74,10 +86,12 @@ The dashboard **introspects `fit_regression`'s signature** to decide which sideb
 
 - `LLM_PROVIDER` = `anthropic` (needs `ANTHROPIC_API_KEY`, default model `claude-sonnet-5`) or `local` (Google Gemma Model). Only the agent's reasoning nodes call an LLM; forecasting math is fully deterministic and needs no key.
 - SQL Server connection for the extract: `SQL_SERVER` and `SQL_DATABASE` are **required** (no hardcoded defaults). Blank `SQL_USER` → Windows trusted auth.
-- `DEMAND_PIPELINE` (path to the model file to load) and `DEMAND_RAW_DIR` (raw-data folder) override the dashboard/extract defaults.
+- `DEMAND_PIPELINE` (path to the model file to load) and `DEMAND_RAW_DIR` (raw-data folder) override the dashboard/extract defaults. `DEMAND_PYTHON` points the nightly `.ps1` at a specific interpreter/venv.
 
 ## Testing notes
 
 - `pytest.ini` puts `src/` on `sys.path` so `import dashboard`, `from agent ...` resolve.
 - Phases 1–3 are deterministic; parity tests (`test_phase2_parity`, `test_phase6_full_parity`) diff the agent's numbers against `dashboard.compute_view` with **exact-match** assertions (both call the same `fit_regression`). These are marked `slow` and skipped unless you pass `--runslow`.
 - Phase 4 (LLM) tests mock the model; one API-key-gated live smoke test exists for manual use.
+- Beyond the phase suites: `test_warehouse_extract` / `test_warehouse_reader` cover the regional pull and wide/long layout sniffing, `test_incremental_refresh` covers the `--incremental` SQL rewrite and snapshot merge, `test_region_all_view` covers the per-region rollup views, and `test_datawarehouse_integration` covers the demand extract end-to-end.
+- Dashboard tests use Streamlit's `AppTest`; its `session_state` is a proxy without `.get()` — use `in` checks / subscripting.
