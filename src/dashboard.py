@@ -1002,33 +1002,35 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
     match what the single-group view shows, groups whose best model supports
     autofit are tuned per group via ``run_autofit`` before forecasting.
 
-    Requires every group to have a published summary (the "Agent Summary (all
-    views)" batch). If any group is missing one, returns the sentinel
-    ``("MISSING", [group, ...])`` so the caller can prompt the user to run the
-    batch rather than silently falling back to some other model.
+    A group is only included if it has a resolvable best model. Groups with no
+    published summary, or whose summary has no backtest winner (``best_model`` is
+    null — history too short to score any model), are left OUT of the table and
+    returned separately so the caller can list them.
 
-    Returns a DataFrame (SUMMARY_COLUMNS + MODEL_USED_COL), the MISSING sentinel,
-    or None if no group produced any rows.
+    Returns ``(table, excluded)`` where ``table`` is a DataFrame (SUMMARY_COLUMNS
+    + MODEL_USED_COL) or None when no group resolved / produced rows, and
+    ``excluded`` is the sorted list of group names with no best model.
     """
     groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
 
-    # First pass: every group must have a resolvable best model.
+    # First pass: split into groups with a resolvable best model vs. those without
+    # (no summary file, or a summary whose best_model is null).
     resolved = {}
-    missing = []
+    excluded = []
     for group in groups:
         best = _best_model_for_group(group)
         if best is None:
-            missing.append(group)
+            excluded.append(group)
         else:
             resolved[group] = best
-    if missing:
-        return ("MISSING", missing)
+    if not resolved:
+        return None, excluded
 
-    # Second pass: forecast each group with its own model (autofit when supported).
+    # Second pass: forecast each resolved group with its own model (autofit when
+    # supported).
     frames = []
-    n_groups = len(groups)
-    for i, group in enumerate(groups):
-        label, path = resolved[group]
+    n = len(resolved)
+    for i, (group, (label, path)) in enumerate(resolved.items()):
         sub = df[df["Customer Grouping"] == group]
         alpha = beta = phi = None
         P = load_pipeline(path)
@@ -1044,10 +1046,10 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
             summary[MODEL_USED_COL] = label
             frames.append(summary)
         if progress_cb is not None:
-            progress_cb(i + 1, n_groups, group)
+            progress_cb(i + 1, n, group)
 
     if not frames:
-        return None
+        return None, excluded
     combined = pd.concat(frames, ignore_index=True)
     # Surface the model used right after the customer group for readability.
     if "Customer Grouping" in combined.columns:
@@ -1055,17 +1057,18 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         pos = cols.index("Customer Grouping") + 1
         cols.insert(pos, MODEL_USED_COL)
         combined = combined[cols]
-    return combined
+    return combined, excluded
 
 
 def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows):
     """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
 
     Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
-    handles the "run the batch first" case, and renders the table + a model-usage
-    line + a download. Called from main() in place of the single-model page body.
-    The page title is already rendered by main() before this branch, so we start
-    at the section subheader to avoid showing it twice.
+    renders the winners table + a model-usage line + a download, and lists any
+    groups that had no best model (no summary, or too little history to backtest)
+    in a dropdown. Called from main() in place of the single-model page body. The
+    page title is already rendered by main() before this branch, so we start at the
+    section subheader to avoid showing it twice.
     """
     st.subheader("Combined — best model per customer group")
     st.caption(
@@ -1102,41 +1105,48 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     else:
         result = st.session_state.get("bestmix_result")
 
-    # Missing summaries → require the batch first (no silent fallback).
-    if isinstance(result, tuple) and result and result[0] == "MISSING":
-        missing = result[1]
-        st.warning(
-            f"{len(missing)} customer group(s) have no agent summary yet, so a "
-            "best model can't be chosen for them. Click **Agent Summary (all "
-            "views)** in the sidebar (or run `python -m agent.batch`), then "
-            "reopen this view."
-        )
-        with st.expander(f"Groups missing a summary ({len(missing)})"):
-            st.write(", ".join(missing))
-        return
+    combined, excluded = result if result is not None else (None, [])
 
-    if result is None or getattr(result, "empty", True):
-        st.info("No per-group forecasts to show for this snapshot.")
+    def _render_excluded(title):
+        """Dropdown listing groups left out (bullet-pointed, one per line)."""
+        if not excluded:
+            return
+        with st.expander(f"{title} ({len(excluded)})"):
+            st.caption(
+                "These groups had no published summary, or too little history "
+                "for any model to be backtested, so no best model could be "
+                "chosen — they're left out of the table."
+            )
+            st.markdown("\n".join(f"- {g}" for g in excluded))
+
+    # No group had a resolvable best model → prompt to run the batch.
+    if combined is None or getattr(combined, "empty", True):
+        st.warning(
+            "No customer group has a backtest-winning model yet. Click **Agent "
+            "Summary (all views)** in the sidebar (or run `python -m "
+            "agent.batch`), then reopen this view."
+        )
+        _render_excluded("Groups without a best model")
         return
 
     # Model-usage summary: how many groups each model won.
     counts = (
-        result.drop_duplicates("Customer Grouping")[MODEL_USED_COL].value_counts()
+        combined.drop_duplicates("Customer Grouping")[MODEL_USED_COL].value_counts()
     )
     parts = ", ".join(f"{m} ×{c}" for m, c in counts.items())
     st.caption(f"{int(counts.sum())} groups — {parts}")
 
     # Keep each SKU's rows together; largest revenue risk first when present.
-    if RISK_COL in result.columns and result[RISK_COL].notna().any():
+    if RISK_COL in combined.columns and combined[RISK_COL].notna().any():
         table = (
-            result.assign(_abs=result[RISK_COL].abs())
+            combined.assign(_abs=combined[RISK_COL].abs())
             .sort_values(["SKU", "_abs"], ascending=[True, False], na_position="last")
             .drop(columns="_abs").reset_index(drop=True)
         )
         st.caption("Each SKU broken out by customer group; within a SKU, "
                    "largest revenue risk first (by magnitude).")
     else:
-        table = result.sort_values(["SKU", "Customer Grouping"]).reset_index(drop=True)
+        table = combined.sort_values(["SKU", "Customer Grouping"]).reset_index(drop=True)
         st.caption("Each SKU broken out by customer group.")
 
     st.dataframe(
@@ -1150,6 +1160,8 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="dl_best_mix",
     )
+
+    _render_excluded("Groups excluded — no backtest-winning model")
 
 
 # --------------------------------------------------------------------------- #
