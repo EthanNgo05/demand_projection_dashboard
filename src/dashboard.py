@@ -1566,18 +1566,48 @@ def main():
                 "switches to the fresh data automatically when it finishes "
                 "(usually a few minutes)."
             )
-            if st.button("Check for new data", key="check_refresh"):
-                st.rerun()
-        elif st.button(
-            "🔄 Refresh data",
-            key="refresh_all",
-            help="Pull the demand snapshot (last few weeks + current "
-                 "projections) and the five regional warehouse-projection "
-                 "files from the data warehouse now, in the background, and "
-                 "re-fetch list prices from the Plytix feed. The page stays "
-                 "usable and switches to the new snapshots when they're "
-                 "ready. A nightly job does the full pull.",
-        ):
+
+        # The refresh button and the "manually override" toggle sit side by
+        # side. When the toggle is off (default) every file picker below is
+        # hidden and the app just loads the newest files / Plytix feed; flip
+        # it on to reveal the snapshot selectboxes and upload boxes.
+        col_btn, col_toggle = st.columns([1, 1])
+        with col_toggle:
+            override = st.toggle(
+                "Manually override data",
+                value=False,
+                key="data_override",
+                help="Off: always load the newest snapshot, Plytix feed, and "
+                     "warehouse files. On: pick specific files or upload your "
+                     "own in the boxes that appear below.",
+            )
+        with col_btn:
+            do_refresh = False
+            if running or wh_running:
+                if st.button("Check for new data", key="check_refresh"):
+                    st.rerun()
+            else:
+                do_refresh = st.button(
+                    "🔄 Refresh data",
+                    key="refresh_all",
+                    help="Pull the demand snapshot (last few weeks + current "
+                         "projections) and the five regional warehouse-projection "
+                         "files from the data warehouse now, in the background, and "
+                         "re-fetch list prices from the Plytix feed. The page stays "
+                         "usable and switches to the new snapshots when they're "
+                         "ready. A nightly job does the full pull.",
+                )
+
+        # A compact timestamp of the last data-warehouse pull, so users know how
+        # fresh the auto-loaded data is without opening the manual pickers.
+        if files:
+            _d0, _p0 = files[0]
+            st.caption(
+                f"Latest snapshot: {_d0} — pulled "
+                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(_p0)))}"
+            )
+
+        if do_refresh:
             ok_dw, msg_dw = start_refresh()
             if ok_dw:
                 # Remember the newest mtime NOW so we can tell, on completion,
@@ -1628,20 +1658,28 @@ def main():
 
         if files:
             labels = {f"{d}  ({os.path.basename(p)})": (d, p) for d, p in files}
-            choice = st.selectbox(
-                "Snapshot (raw file)", list(labels.keys()), key="snapshot_choice"
-            )
+            if override:
+                choice = st.selectbox(
+                    "Snapshot (raw file)", list(labels.keys()), key="snapshot_choice"
+                )
+            else:
+                # Toggle off: always the newest snapshot (== the refresh
+                # auto-select target), no widget shown.
+                choice = list(labels.keys())[0]
             today_str, path = labels[choice]
             df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
-        else:
+        elif override:
             st.info("Upload the Demand Planning Details and Plytix files below.")
 
-        with st.expander("Upload the Demand Planning Details Projections from PowerBI", expanded=not files):
-            up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
-            if up is not None:
-                data = up.getvalue()
-                df = load_raw_from_bytes(data, up.name, pipeline_path())
-                today_str = _date_from_name(up.name)
+        # Show the upload box when overriding, and always when there's no
+        # on-disk snapshot yet (otherwise a first-time user can't get started).
+        if override or not files:
+            with st.expander("Upload the Demand Planning Details Projections from PowerBI", expanded=not files):
+                up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
+                if up is not None:
+                    data = up.getvalue()
+                    df = load_raw_from_bytes(data, up.name, pipeline_path())
+                    today_str = _date_from_name(up.name)
 
         # ----- List prices (drive revenue risk) ---------------------------
         # The Plytix export doubles as the source of each SKU's list price AND
@@ -1650,40 +1688,44 @@ def main():
         # uploaded workbook wins; otherwise pull the public Plytix channel feed
         # (the default, so no file has to be dragged); otherwise fall back to the
         # newest local list_prices_*.xlsx on disk.
-        st.header("Revenue risk")
+        if override:
+            st.header("Revenue risk")
         prices = None
         plytix_df = None
+        up_price = None
         price_file = discover_price_file()
-        with st.expander("Override: upload a Plytix list-price file", expanded=False):
-            up_price = st.file_uploader(
-                "list_prices_*.xlsx", type=["xlsx"], key="price_upload",
-                help="SKU + List Price USD, plus SKU Status / SKU Type / "
-                    "'Active in'. Drives revenue risk (projection difference × "
-                    "list price) and the active-in check. Overrides the Plytix "
-                    "feed when set.",
-            )
+        if override:
+            with st.expander("Override: upload a Plytix list-price file", expanded=False):
+                up_price = st.file_uploader(
+                    "list_prices_*.xlsx", type=["xlsx"], key="price_upload",
+                    help="SKU + List Price USD, plus SKU Status / SKU Type / "
+                        "'Active in'. Drives revenue risk (projection difference × "
+                        "list price) and the active-in check. Overrides the Plytix "
+                        "feed when set.",
+                )
 
         if up_price is not None:
             prices = load_prices_from_bytes(
                 up_price.getvalue(), up_price.name, pipeline_path()
             )
             plytix_df = read_plytix_from_bytes(up_price.getvalue(), up_price.name)
-            if prices is not None:
+            if prices is not None and override:
                 st.success(f"{len(prices):,} list prices (uploaded)")
         elif data_io.PLYTIX_FEED_URL:
             nonce = st.session_state.setdefault("plytix_nonce", 0)
             try:
                 plytix_df = fetch_plytix_from_url(data_io.PLYTIX_FEED_URL, nonce)
                 prices = data_io.prices_from_plytix(plytix_df)
-                if prices is not None:
+                if prices is not None and override:
                     st.success(f"{len(prices):,} list prices (Plytix feed)")
             except Exception as e:  # network/parse failure -> fall back to disk
                 plytix_df = None
                 prices = None
-                st.warning(
-                    f"Couldn't fetch the Plytix feed ({e}); "
-                    "falling back to the newest local list-price file."
-                )
+                if override:
+                    st.warning(
+                        f"Couldn't fetch the Plytix feed ({e}); "
+                        "falling back to the newest local list-price file."
+                    )
 
         # Fall back to the newest local xlsx when neither an upload nor the feed
         # produced prices (feed disabled/unreachable and nothing uploaded).
@@ -1694,7 +1736,7 @@ def main():
             plytix_df = read_plytix_from_path(
                 price_file, os.path.getmtime(price_file)
             )
-            if prices is not None:
+            if prices is not None and override:
                 st.success(
                     f"{len(prices):,} list prices "
                     f"({os.path.basename(price_file)})"
@@ -1709,7 +1751,8 @@ def main():
         # refresh button under "Data source") writes them; a manual PowerBI
         # export (wide matrix or long table layout — the reader sniffs which)
         # still works.
-        st.header("Warehouse projections")
+        if override:
+            st.header("Warehouse projections")
         warehouse_df = None
 
         # If a warehouse refresh we launched just finished and actually wrote a
@@ -1732,39 +1775,48 @@ def main():
                     "see logs/<date>/logs_refresh.txt for details."
                 )
 
-        with st.expander(
-            "Upload warehouse projection files (AU/CA/EU/JP/US)",
-            expanded=not wh_snapshots,
-        ):
-            if wh_snapshots:
-                wh_choice = st.selectbox(
-                    "Warehouse snapshot",
-                    list(wh_snapshots.keys()),
-                    key="warehouse_snapshot",
-                    help="Each snapshot is the set of regional warehouse exports "
-                         "sharing that date.",
+        if override:
+            with st.expander(
+                "Upload warehouse projection files (AU/CA/EU/JP/US)",
+                expanded=not wh_snapshots,
+            ):
+                if wh_snapshots:
+                    wh_choice = st.selectbox(
+                        "Warehouse snapshot",
+                        list(wh_snapshots.keys()),
+                        key="warehouse_snapshot",
+                        help="Each snapshot is the set of regional warehouse exports "
+                             "sharing that date.",
+                    )
+                    wh_paths = tuple(wh_snapshots[wh_choice])
+                    warehouse_df = load_warehouse_from_paths(
+                        wh_paths, tuple(os.path.getmtime(p) for p in wh_paths)
+                    )
+                    st.caption(
+                        f"{len(wh_paths)} file(s): "
+                        + ", ".join(os.path.basename(p) for p in wh_paths)
+                    )
+                up_wh = st.file_uploader(
+                    "AU/CA/EU/JP/US_warehouse_projections_*.xlsx",
+                    type=["xlsx"], accept_multiple_files=True, key="warehouse_upload",
+                    help="One wide export per region. The region is read from the "
+                         "filename prefix (AU/CA/EU/JP/US).",
                 )
-                wh_paths = tuple(wh_snapshots[wh_choice])
-                warehouse_df = load_warehouse_from_paths(
-                    wh_paths, tuple(os.path.getmtime(p) for p in wh_paths)
-                )
-                st.caption(
-                    f"{len(wh_paths)} file(s): "
-                    + ", ".join(os.path.basename(p) for p in wh_paths)
-                )
-            up_wh = st.file_uploader(
-                "AU/CA/EU/JP/US_warehouse_projections_*.xlsx",
-                type=["xlsx"], accept_multiple_files=True, key="warehouse_upload",
-                help="One wide export per region. The region is read from the "
-                     "filename prefix (AU/CA/EU/JP/US).",
+                if up_wh:
+                    warehouse_df = load_warehouse_from_uploads(
+                        tuple((f.name, f.getvalue()) for f in up_wh)
+                    )
+                if warehouse_df is not None and not warehouse_df.empty:
+                    locs = ", ".join(sorted(warehouse_df["Location"].unique()))
+                    st.success(f"{len(warehouse_df):,} projection rows ({locs})")
+        elif wh_snapshots:
+            # Toggle off: silently load the newest warehouse snapshot so the
+            # missing-projections table still works without the picker showing.
+            wh_choice = next(iter(wh_snapshots))
+            wh_paths = tuple(wh_snapshots[wh_choice])
+            warehouse_df = load_warehouse_from_paths(
+                wh_paths, tuple(os.path.getmtime(p) for p in wh_paths)
             )
-            if up_wh:
-                warehouse_df = load_warehouse_from_uploads(
-                    tuple((f.name, f.getvalue()) for f in up_wh)
-                )
-            if warehouse_df is not None and not warehouse_df.empty:
-                locs = ", ".join(sorted(warehouse_df["Location"].unique()))
-                st.success(f"{len(warehouse_df):,} projection rows ({locs})")
 
     if df is None:
         st.warning("Upload the Demand Planning Details Projections file to get started.")
