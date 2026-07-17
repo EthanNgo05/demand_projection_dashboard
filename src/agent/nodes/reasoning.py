@@ -73,7 +73,11 @@ notable. Plain language, no bullet points."""
 # surfaces as a real observation rather than being rationalised after the fact.
 MODEL_FIT_BLOCK = """
 --- MODEL FIT ---
-Demand pattern for this view (computed from history, not guessed):
+Demand pattern for this view (computed from history, not guessed). These are
+PER-SKU statistics pooled across the view's SKUs, NOT properties of the combined
+demand line — forecasts are made per SKU and then summed, so per-SKU behaviour is
+what determines model fit. A high pooled zero-week % means the typical SKU is
+intermittent; it does NOT mean the aggregated view has zero-demand weeks.
 {profile}
 
 Backtest MASE by model (lower is better; < 1 beats a plain 8-week moving average;
@@ -111,15 +115,18 @@ def _format_profile(prof: dict) -> str:
     def fmt(v, suffix=""):
         return "n/a" if v is None else f"{v}{suffix}"
 
+    n_skus = prof.get("sku_count", 0)
     return (
-        f"- pattern: {prof.get('pattern', 'unknown')}\n"
-        f"- SKUs: {prof.get('sku_count', 0)}; weeks of history: "
+        f"- pattern (Syntetos-Boylan, of the median SKU): "
+        f"{prof.get('pattern', 'unknown')}\n"
+        f"- SKUs: {n_skus}; weeks of history: "
         f"{prof.get('weeks_of_history', 0)}; total volume: {fmt(prof.get('total_volume'))}\n"
-        f"- zero-demand weeks: {fmt(prof.get('pct_zero_weeks'), '%')}\n"
-        f"- avg demand interval (ADI): {fmt(prof.get('avg_demand_interval'))} "
-        f"(>= 1.32 = intermittent)\n"
-        f"- demand-size lumpiness (CV²): {fmt(prof.get('cv2_demand_size'))} "
-        f"(>= 0.49 = lumpy)"
+        f"- per-SKU zero-demand weeks (pooled across all {n_skus} SKUs, NOT the "
+        f"combined line): {fmt(prof.get('pct_zero_weeks'), '%')}\n"
+        f"- avg demand interval (ADI, median SKU): "
+        f"{fmt(prof.get('avg_demand_interval'))} (>= 1.32 = intermittent)\n"
+        f"- demand-size lumpiness (CV², median SKU): "
+        f"{fmt(prof.get('cv2_demand_size'))} (>= 0.49 = lumpy)"
     )
 
 
