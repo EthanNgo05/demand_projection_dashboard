@@ -67,10 +67,14 @@ def region_all_view(region):
 # actuals over the same points (see evaluate._generic_backtest). Scale-free
 # across views, so one threshold fits the huge combined view and the tiny
 # groupings alike. 1.0 = "no better than the 8-week average of actuals".
-# Interim value pending recalibration -- after the MASE migration lands, run
-# `python -m agent.batch --no-llm`, harvest the winning-MASE distribution from
-# outputs/agent_summary_*.json, and rewrite this block with the observed
-# percentiles (mirroring the old Phase 3 MAE calibration note).
+# MASE calibration (2026-07-16, all_demand_projections_2026-07-16.xlsx, 5
+# models incl. TSB): agent.batch --no-llm across all 70 views. Winning MASEs
+# over the 43 backtestable views: p50=0.91, p80=1.00, p90=1.11, max=5.50 --
+# so the semantic anchor (worse than the 8-week average) IS the ~80th
+# percentile, flagging 9/43 (~20%) of views, the same flag rate the old
+# unit-scaled MAE threshold (40) was tuned for. 27 tiny views produced no
+# backtestable holdout at all; they get flagged via best_model=None
+# regardless of this value.
 MASE_CONFIDENCE_THRESHOLD = 1.0
 
 # --- Phase 4: LLM provider selection ---------------------------------------
