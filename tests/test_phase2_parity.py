@@ -23,6 +23,14 @@ TODAY = pd.Timestamp("2026-07-01")  # pinned so both paths see identical anchors
 assert ALL_CUSTOMERS_VIEW == dashboard.ALL_CUSTOMERS_VIEW
 
 
+@pytest.fixture(autouse=True)
+def _skip_agent_llm(monkeypatch):
+    """Parity asserts on the deterministic forecast numbers, never the narrative,
+    so skip the LLM reasoning nodes (the default provider is a live local server)
+    — the suite must not depend on, or spend a call on, an LLM per view."""
+    monkeypatch.setenv("AGENT_SKIP_LLM", "1")
+
+
 def _agent_results(view, sample_raw_path):
     final_state = build_graph().invoke(
         {

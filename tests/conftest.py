@@ -36,6 +36,28 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_slow)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_agent_outputs(tmp_path_factory, monkeypatch):
+    """Keep every test's agent side effects off the real ``outputs/`` and ``logs/``.
+
+    ``build_graph()`` ends in the ``publish`` node, which writes
+    ``outputs/agent_summary_<view>.json`` and appends to ``logs/<date>/app.log``.
+    The parity/selection suites (test_phase2/3/6) invoke the *whole* graph on the
+    tiny synthetic fixture, so without this they overwrite the real agent
+    summaries with fixture data (4 SKUs, 9 weeks of history) and pollute the app
+    log — which is exactly how the real dashboard once showed a bogus
+    "history too short" summary for a healthy view. Redirect both to a temp dir
+    for every test. Tests that pin their own ``OUTPUT_DIR`` / ``LOG_ROOT``
+    (test_phase5_publish) still win: their monkeypatch runs after this fixture.
+    """
+    monkeypatch.setattr(
+        "agent.nodes.publish.OUTPUT_DIR", str(tmp_path_factory.mktemp("outputs"))
+    )
+    monkeypatch.setattr(
+        "log_config.LOG_ROOT", str(tmp_path_factory.mktemp("logs"))
+    )
+
+
 @pytest.fixture(scope="session")
 def sample_raw_path():
     """Path to the small deterministic raw workbook (built on demand, seeded)."""

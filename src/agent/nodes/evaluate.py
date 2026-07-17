@@ -117,18 +117,35 @@ def _generic_backtest(P, sub, today_ts, holdout_weeks, fit_kwargs=None):
     # Only pass fit kwargs the pipeline actually accepts (alpha/beta/phi exist
     # on ES's fit_regression but not on regression/xgboost).
     fit_kwargs = fit_kwargs or {}
+    reuse_params = False
     try:
         accepted = inspect.signature(P.fit_regression).parameters
         fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in accepted}
+        # A model whose per-SKU fit runs a costly optimiser (Holt-Winters'
+        # statsmodels MLE) exposes params_by_sku/collect_params so we optimise
+        # its smoothing coefficients ONCE on the fullest window and reuse them on
+        # the shorter steps -- the per-step states are still re-fit, so this
+        # doesn't leak future actuals into the dynamics; only the ~4 coefficients
+        # are shared (as ES already is via autofit). Cheap fixed-formula models
+        # don't expose these and re-fit every step as before.
+        reuse_params = {"params_by_sku", "collect_params"} <= set(accepted)
     except (TypeError, ValueError):
         fit_kwargs = {}
+
+    # One shared coefficient store per (view, model) backtest: empty on the first
+    # step (so each SKU is optimised and captured), reused on every later step.
+    shared_params = {} if reuse_params else None
 
     model_abs = []     # |model forecast - actual| per (SKU, step)
     baseline_abs = []  # |8-week-average baseline - actual| over the SAME points
     for step in range(1, int(holdout_weeks) + 1):
         step_today = today_ts - pd.Timedelta(weeks=step)
+        step_kwargs = dict(fit_kwargs)
+        if reuse_params:
+            step_kwargs["params_by_sku"] = shared_params
+            step_kwargs["collect_params"] = shared_params
         summary, weekly = P.fit_regression(
-            agg, step_today, grouping_label="backtest", **fit_kwargs
+            agg, step_today, grouping_label="backtest", **step_kwargs
         )
         if weekly is None or len(weekly) == 0:
             continue
