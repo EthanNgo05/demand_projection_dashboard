@@ -5,8 +5,11 @@ import pandas as pd
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+# The app's Python lives under src/ (dashboard, log_config, extract, agent, ...);
+# put it on the path so tests can import those top-level modules and packages.
+SRC_ROOT = os.path.join(REPO_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
 
 FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 FIXTURE_RAW = os.path.join(FIXTURE_DIR, "all_demand_projections_2026-07-01.xlsx")
@@ -31,6 +34,28 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip_slow)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_agent_outputs(tmp_path_factory, monkeypatch):
+    """Keep every test's agent side effects off the real ``outputs/`` and ``logs/``.
+
+    ``build_graph()`` ends in the ``publish`` node, which writes
+    ``outputs/agent_summary_<view>.json`` and appends to ``logs/<date>/app.log``.
+    The parity/selection suites (test_phase2/3/6) invoke the *whole* graph on the
+    tiny synthetic fixture, so without this they overwrite the real agent
+    summaries with fixture data (4 SKUs, 9 weeks of history) and pollute the app
+    log — which is exactly how the real dashboard once showed a bogus
+    "history too short" summary for a healthy view. Redirect both to a temp dir
+    for every test. Tests that pin their own ``OUTPUT_DIR`` / ``LOG_ROOT``
+    (test_phase5_publish) still win: their monkeypatch runs after this fixture.
+    """
+    monkeypatch.setattr(
+        "agent.nodes.publish.OUTPUT_DIR", str(tmp_path_factory.mktemp("outputs"))
+    )
+    monkeypatch.setattr(
+        "log_config.LOG_ROOT", str(tmp_path_factory.mktemp("logs"))
+    )
 
 
 @pytest.fixture(scope="session")
@@ -117,7 +142,7 @@ def _state(n_rows, view="TEST GROUP"):
     return {
         "view": view,
         "best_model": "8-Week Moving Average",
-        "results": {"8-Week Moving Average": {"summary_df": _summary_df(n_rows), "mae": 12.3}},
+        "results": {"8-Week Moving Average": {"summary_df": _summary_df(n_rows), "mase": 1.23}},
         "confidence_flag": False,
         "errors": [],
     }
@@ -132,4 +157,4 @@ def sample_state_with_summary():
 @pytest.fixture
 def large_summary_state():
     """ALL CUSTOMERS-sized state: 400+ SKU rows to prove the prompt is capped."""
-    return _state(420, view="ALL CUSTOMERS (combined)")
+    return _state(420, view="All customers (combined)")

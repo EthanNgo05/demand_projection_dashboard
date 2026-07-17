@@ -1,27 +1,33 @@
 """Phase 5 publish node: persist the agent's output for the dashboard.
 
 The terminal node of the graph. It writes a per-view JSON summary to
-``outputs/agent_summary_{view}.json`` and appends one ``AGENT`` line to
-``logs.txt`` (append, never overwrite — matching the existing Autofit lines).
-The dashboard reads the JSON back to show the last run without re-invoking the
-(slow, LLM-backed) graph on every Streamlit rerun.
+``outputs/agent_summary_{view}.json`` and appends one ``AGENT`` line to the
+daily app log, ``logs/<date>/app.log`` (append, never overwrite — matching the
+existing Autofit lines). The dashboard reads the JSON back to show the last run
+without re-invoking the (slow, LLM-backed) graph on every Streamlit rerun.
 
-Path note: this file lives at ``agent/nodes/publish.py``, so the repo root is
-THREE levels up. ``outputs/`` and ``logs.txt`` both live at the repo root
-alongside dashboard.py — not under ``agent/``. Tests monkeypatch OUTPUT_DIR,
-and the log path is derived from it at call time so the two stay consistent.
+Path note: this file lives at ``src/agent/nodes/publish.py``, so the repo root
+is FOUR levels up. ``outputs/`` lives at the repo root (the folder holding
+raw_inputs/ + logs/) — not under ``src/`` or ``agent/``. Tests monkeypatch
+OUTPUT_DIR for the JSON and ``log_config.LOG_ROOT`` for the audit line.
 """
 
 import json
 import os
 from datetime import datetime
 
-from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS
+from agent.config import MODEL_OPTIONS
+from agent.data_io import view_frame
 from agent.model_loader import load_pipeline
 from agent.state import AgentState
+from log_config import dated_log_path
 
-# agent/nodes/publish.py -> agent/nodes -> agent -> <repo root>
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# src/agent/nodes/publish.py -> agent/nodes -> agent -> src -> <repo root>
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+)
 OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs")
 
 
@@ -52,7 +58,7 @@ def _window_excluded_skus(state: AgentState) -> list[dict]:
     except Exception:  # noqa: BLE001 — a note must never break the terminal node
         return []
 
-    sub = df if view == ALL_CUSTOMERS_VIEW else df[df["Customer Grouping"] == view]
+    sub = view_frame(df, view, P)
     demand = sub[sub["POS"].notna() | sub["Orders"].notna()]
     if demand.empty:
         return []
@@ -81,7 +87,13 @@ def publish(state: AgentState) -> dict:
         "view": view,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "best_model": best,
-        "mae_by_model": {k: v.get("mae") for k, v in results.items()},
+        "mase_by_model": {k: v.get("mase") for k, v in results.items()},
+        # The model the LLM would expect to fit best given this view's demand
+        # pattern (a MODEL_OPTIONS label or None), plus a concise sentence
+        # reconciling that with the actual MASE winner above. None on --no-llm
+        # runs. See agent.demand_profile + reasoning._fit_block.
+        "expected_best_model": state.get("expected_best_model"),
+        "model_fit_note": state.get("model_fit_note"),
         "narrative": state.get("narrative"),
         "anomalies": state.get("anomalies", []),
         # SKUs the winning model omits for having no demand inside its window
@@ -99,13 +111,13 @@ def publish(state: AgentState) -> dict:
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
-    # logs.txt sits one level up from outputs/ (i.e. the repo root). Deriving it
-    # from OUTPUT_DIR keeps the monkeypatched test layout consistent.
-    log_path = os.path.join(os.path.dirname(OUTPUT_DIR), "logs.txt")
-    with open(log_path, "a") as f:
+    # The agent's audit line joins the same daily log the dashboard writes:
+    # logs/<date>/app.log at the repo root (tests redirect via log_config.LOG_ROOT).
+    log_path = dated_log_path("app.log")
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             f"{datetime.now():%Y-%m-%d %H:%M:%S}  AGENT     [{view}] "
-            f"best={best} mae={payload['mae_by_model'].get(best)} -> {path}\n"
+            f"best={best} mase={payload['mase_by_model'].get(best)} -> {path}\n"
         )
 
     return {"window_excluded_skus": window_excluded}

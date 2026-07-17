@@ -18,14 +18,14 @@ from datetime import datetime
 from typing import Optional
 
 from agent import config
+from log_config import dated_log_path
 
-# Every prompt actually sent to an LLM is appended here verbatim, alongside the
-# view it was generated for and the wall-clock time, so you can see exactly what
-# left the machine. Kept separate from logs.txt (which is the terse audit trail)
-# because full prompts are multi-line and would drown the run log.
-LLM_PROMPTS_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "llm_prompts.log"
-)
+# Every prompt actually sent to an LLM is appended verbatim to the day's log,
+# logs/<date>/llm_prompts.log, alongside the view it was generated for and the
+# wall-clock time, so you can see exactly what left the machine. Kept in its own
+# file — separate from app.log, the terse audit trail — because full prompts are
+# multi-line and would drown the run log.
+LLM_PROMPTS_FILENAME = "llm_prompts.log"
 
 
 def _has_anthropic_credentials() -> bool:
@@ -87,8 +87,8 @@ def _resolve_model(resolved_provider: str) -> str:
 
 def _record_prompt(prompt: str, view: Optional[str], resolved_provider: str) -> None:
     """Append the exact prompt (with view + timestamp + target model) to
-    LLM_PROMPTS_PATH. Best-effort: a logging failure must never break a run, so
-    a read-only filesystem or encoding error is swallowed silently."""
+    the day's llm_prompts.log. Best-effort: a logging failure must never break a
+    run, so a read-only filesystem or encoding error is swallowed silently."""
     entry = (
         f"{'=' * 80}\n"
         f"time:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -99,7 +99,7 @@ def _record_prompt(prompt: str, view: Optional[str], resolved_provider: str) -> 
         f"{prompt}\n\n"
     )
     try:
-        with open(LLM_PROMPTS_PATH, "a", encoding="utf-8") as fh:
+        with open(dated_log_path(LLM_PROMPTS_FILENAME), "a", encoding="utf-8") as fh:
             fh.write(entry)
     except OSError:
         pass
@@ -115,8 +115,8 @@ def safe_invoke(
     API key or a network failure must land in state["errors"], not crash the
     graph after the deterministic pipeline already succeeded.
 
-    Every prompt is recorded to LLM_PROMPTS_PATH before the call, so the file
-    reflects what was sent even if the call itself then fails."""
+    Every prompt is recorded to the day's llm_prompts.log before the call, so
+    the file reflects what was sent even if the call itself then fails."""
     resolved = _resolve_provider(provider)
     _record_prompt(prompt, view, resolved)
     try:

@@ -23,6 +23,14 @@ TODAY = pd.Timestamp("2026-07-01")  # pinned so both paths see identical anchors
 assert ALL_CUSTOMERS_VIEW == dashboard.ALL_CUSTOMERS_VIEW
 
 
+@pytest.fixture(autouse=True)
+def _skip_agent_llm(monkeypatch):
+    """Parity asserts on the deterministic forecast numbers, never the narrative,
+    so skip the LLM reasoning nodes (the default provider is a live local server)
+    — the suite must not depend on, or spend a call on, an LLM per view."""
+    monkeypatch.setenv("AGENT_SKIP_LLM", "1")
+
+
 def _agent_results(view, sample_raw_path):
     final_state = build_graph().invoke(
         {
@@ -40,7 +48,13 @@ def _agent_results(view, sample_raw_path):
     return final_state["results"]
 
 
-@pytest.mark.parametrize("view", [ALL_CUSTOMERS_VIEW, "AMAZON-DC"])
+# Views: the global combined view, one real Customer Grouping, and one
+# per-region rollup (region chosen to match AMAZON-DC's region so the sample
+# data is guaranteed to populate it).
+@pytest.mark.parametrize(
+    "view",
+    [ALL_CUSTOMERS_VIEW, "AMAZON-DC", dashboard.region_all_view("US (LBC+NJ)")],
+)
 def test_parity_all_models(view, sample_raw_path, sample_cleaned_df):
     results = _agent_results(view, sample_raw_path)
     for label, path in MODEL_OPTIONS.items():

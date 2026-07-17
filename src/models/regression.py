@@ -165,7 +165,7 @@ DISPLAY_NAMES = {
     "updated_projection_avg": "Updated Projection Average",
     "projection_difference": "Projection Difference",
     "list_price_usd": "List Price (USD)",
-    "revenue_risk_usd": "Revenue Risk (USD)",
+    "revenue_risk_usd": "Revenue Risk (avg/wk)",
 }
 
 # Final column order for every summary sheet
@@ -180,7 +180,7 @@ SUMMARY_COLUMNS = [
     "Updated Projection Average",
     "Projection Difference",
     "List Price (USD)",
-    "Revenue Risk (USD)",
+    "Revenue Risk (avg/wk)",
 ]
 
 
@@ -407,11 +407,12 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
         x = ((src_grp["WeekDate"] - first_week).dt.days / 7).round().values
         slope = np.polyfit(x, y, 1)[0] if n >= 2 and len(set(x)) >= 2 else 0.0
 
-        # Anchor to the mean; nudge by the dampened slope each week out.
-        projected_15 = [
-            max(round(mean_val + slope * TREND_WEIGHT * (k + 1), 1), 0)
-            for k in range(15)
-        ]
+        # Flat forecast: compute the first week's value and hold it across all
+        # 15 weeks (no week-to-week trend drift). The app re-runs weekly and
+        # only the first projection is ever used, so every week repeats it.
+        # Rounded to a whole number: projections are unit counts, not decimals.
+        first = max(int(round(mean_val + slope * TREND_WEIGHT)), 0)
+        projected_15 = [first] * 15
 
         summary_rows.append(
             {
@@ -551,6 +552,12 @@ if __name__ == "__main__":
         }
     )
     df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
+    # The fixed-width export space-pads SKU/CUSTNMBR; strip before any key-based
+    # lookup so SKUs match the list-price index and CUSTNMBRs fold via
+    # COMBINED_GROUPING. Kept in sync with agent/data_io._clean (shared by the
+    # dashboard + agent), which this __main__ block mirrors.
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
     df = df[~df['CUSTNMBR'].isin(CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
 

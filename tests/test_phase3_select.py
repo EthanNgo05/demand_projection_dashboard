@@ -3,16 +3,16 @@
 from agent.nodes.select import route_after_select, select_best_model
 
 
-def test_select_best_model_picks_lowest_mae():
-    state = {"results": {"A": {"mae": 30.0}, "B": {"mae": 12.5}, "C": {"mae": 45.0}}}
+def test_select_best_model_picks_lowest_mase():
+    state = {"results": {"A": {"mase": 1.30}, "B": {"mase": 0.85}, "C": {"mase": 2.10}}}
     out = select_best_model(state)
     assert out["best_model"] == "B"
 
 
 def test_confidence_flag_boundary():
-    state = {"results": {"A": {"mae": 50.0}}, "mae_confidence_threshold": 50}
+    state = {"results": {"A": {"mase": 1.0}}, "mase_confidence_threshold": 1.0}
     assert select_best_model(state)["confidence_flag"] is False  # exactly at threshold = ok
-    state["results"]["A"]["mae"] = 50.01
+    state["results"]["A"]["mase"] = 1.01
     assert select_best_model(state)["confidence_flag"] is True
 
 
@@ -27,8 +27,8 @@ def test_select_best_model_handles_no_scored_models():
 
 
 def test_graph_routes_to_low_confidence_branch(monkeypatch):
-    """Force every model's mae above threshold; the compiled graph must reach
-    flag_low_confidence (and summarize on the low-MAE run). Ingest/forecast/
+    """Force every model's mase above threshold; the compiled graph must reach
+    flag_low_confidence (and summarize on the low-MASE run). Ingest/forecast/
     evaluate are stubbed — this proves the *routing*, not the models."""
     import agent.graph as graph_mod
 
@@ -40,8 +40,8 @@ def test_graph_routes_to_low_confidence_branch(monkeypatch):
     def fake_run_all(state):
         return {"results": {}}
 
-    def make_fake_evaluate(mae):
-        return lambda state: {"results": {"Stub Model": {"mae": mae}}}
+    def make_fake_evaluate(mase):
+        return lambda state: {"results": {"Stub Model": {"mase": mase}}}
 
     monkeypatch.setattr(graph_mod, "ingest", fake_ingest)
     monkeypatch.setattr(graph_mod, "run_all_models", fake_run_all)
@@ -57,13 +57,13 @@ def test_graph_routes_to_low_confidence_branch(monkeypatch):
         graph_mod, "summarize", lambda state: visited.append("summarize") or {}
     )
 
-    base = {"view": "TEST", "mae_confidence_threshold": 50}
+    base = {"view": "TEST", "mase_confidence_threshold": 1.0}
 
     monkeypatch.setattr(graph_mod, "evaluate_models", make_fake_evaluate(999.0))
     graph_mod.build_graph().invoke(dict(base))
     assert visited == ["flag_low_confidence"]
 
     # Phase 4: the confident branch runs flag_anomalies then summarize
-    monkeypatch.setattr(graph_mod, "evaluate_models", make_fake_evaluate(1.0))
+    monkeypatch.setattr(graph_mod, "evaluate_models", make_fake_evaluate(0.5))
     graph_mod.build_graph().invoke(dict(base))
     assert visited == ["flag_low_confidence", "flag_anomalies", "summarize"]

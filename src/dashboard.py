@@ -38,12 +38,15 @@ to this file. Override paths with the DEMAND_PIPELINE / DEMAND_RAW_DIR env vars.
 import os
 import re
 import sys
+import time
 import glob
 import html
 import json
 import inspect
 import logging
 import tempfile
+import threading
+import subprocess
 import traceback
 import importlib.util
 from io import BytesIO
@@ -59,14 +62,20 @@ import streamlit as st
 # stay here, wrapping thin calls into the shared module.
 from agent import data_io
 
+# Date-organized logging (logs/<date>/...), Streamlit-free so the agent can
+# share it. See log_config.py.
+from log_config import DateFolderHandler, dated_log_path
+
 # --------------------------------------------------------------------------- #
 # Logging                                                                     #
 # --------------------------------------------------------------------------- #
-# Developer-facing log. Written next to this file as ``logs.txt`` so issues can
-# be inspected after the fact (on Streamlit Cloud, also visible via Manage app
-# → logs). Configured once per process; Streamlit reruns import the module only
-# once, so the handler isn't attached repeatedly.
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs.txt")
+# Developer-facing log, organized by day under ``logs/<date>/app.log`` at the
+# repo root so issues can be inspected after the fact (on Streamlit Cloud, also
+# visible via Manage app → logs). Configured once per process; Streamlit reruns
+# import the module only once, so the handler isn't attached repeatedly. The
+# DateFolderHandler rolls to a new day's folder on its own, so a dashboard left
+# running for days still files each line under the date it was written.
+LOG_FILENAME = "app.log"
 
 logger = logging.getLogger("demand_dashboard")
 if not logger.handlers:
@@ -74,14 +83,11 @@ if not logger.handlers:
     _fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
-    try:
-        _fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-        _fh.setFormatter(_fmt)
-        logger.addHandler(_fh)
-    except OSError:
-        # Read-only filesystem (some hosts): fall back to the console only so
-        # the app still runs; logs then live in the platform's own log stream.
-        pass
+    # File output is best-effort (read-only hosts): the handler swallows OSError
+    # internally, and the StreamHandler below still logs to the console.
+    _fh = DateFolderHandler(LOG_FILENAME)
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
     _sh = logging.StreamHandler()
     _sh.setFormatter(_fmt)
     logger.addHandler(_sh)
@@ -91,14 +97,20 @@ if not logger.handlers:
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Repo root (parent of src/) — where the data folders raw_inputs/, outputs/ and
+# logs/ live. HERE is used for sibling CODE (models/, extract script); REPO_ROOT
+# for DATA that stays at the repo root.
+REPO_ROOT = os.path.dirname(HERE)
 
 # The forecasting models on offer. Each entry maps the label shown in the
 # sidebar toggle to the pipeline file implementing it. When a DEMAND_PIPELINE
 # env var is set, that file is offered as an extra option and is the default.
 MODEL_OPTIONS = {
     "8-Week Moving Average": os.path.join(HERE, "models/regression.py"),
-    "Holt's Exponential Smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "Holt's (double) exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
+    "Holt-Winters (triple) exponential smoothing": os.path.join(HERE, "models/holt_winters.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
+    "TSB (intermittent demand)": os.path.join(HERE, "models/tsb.py"),
 }
 _ENV_PIPELINE = os.environ.get("DEMAND_PIPELINE")
 if _ENV_PIPELINE:
@@ -121,13 +133,44 @@ def pipeline_path():
     if choice is None:
         raise FileNotFoundError(
             "No forecasting pipeline found — expected "
-            "models/exponential_smoothing.py, models/xgboost.py or "
-            "models/regression.py next to dashboard.py "
-            "(or set the DEMAND_PIPELINE env var)."
+            "models/exponential_smoothing.py, models/holt_winters.py, "
+            "models/xgboost.py, models/tsb.py or models/regression.py next to "
+            "dashboard.py (or set the DEMAND_PIPELINE env var)."
         )
     return MODEL_OPTIONS[choice]
 
-ALL_CUSTOMERS_VIEW = "ALL CUSTOMERS (combined)"
+ALL_CUSTOMERS_VIEW = "All customers (combined)"
+
+# Per-region rollup views: "All Customers - <region label>" combines every
+# customer group in one region into a single forecast (e.g.
+# "All Customers - AU (ACR)" = Web Sales - AU + Others - AU). The region is
+# embedded in the view string so everything keyed on `view` — cache keys,
+# session signatures, headers, filename mangling, the agent's summary path —
+# works unchanged. Mirrored in agent/config.py (must match exactly).
+REGION_ALL_PREFIX = "All Customers - "
+
+
+def region_all_view(region):
+    """The synthetic per-region combined view string for ``region``."""
+    return f"{REGION_ALL_PREFIX}{region}"
+
+
+def region_from_view(view):
+    """Region label if ``view`` is a per-region rollup, else None."""
+    if isinstance(view, str) and view.startswith(REGION_ALL_PREFIX):
+        return view[len(REGION_ALL_PREFIX):]
+    return None
+
+
+def _region_frame(df, P, region):
+    """Rows of ``df`` whose customer group belongs to ``region``.
+
+    str() on region_for_group: a custom pipeline may return non-string labels
+    (see the key=str note in the sidebar), and the view string the region was
+    parsed from was built from the str form.
+    """
+    groups = df["Customer Grouping"].map(lambda g: str(P.region_for_group(g)))
+    return df[groups == region]
 
 # The warehouse regions we check "Active in" against. A SKU should only be
 # projected in a region it is "Active in" (per the Plytix export); a projection
@@ -139,7 +182,19 @@ WAREHOUSE_REGIONS = ["AU", "CA", "EU", "JP", "US"]
 # supplied (see DISPLAY_NAMES in the pipeline). Kept here so the dashboard can
 # format / sort on them.
 PRICE_COL = "List Price (USD)"
-RISK_COL = "Revenue Risk (USD)"
+RISK_COL = "Revenue Risk (avg/wk)"
+
+
+def fmt_dollar(v, decimals=0, signed=False):
+    """Format a dollar amount with the sign OUTSIDE the $ (e.g. -$500, +$500).
+
+    Python's ``{:+,.0f}`` puts the sign after the ``$`` (``$-500``); this keeps
+    it in front so negatives read like ``-$500``.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    sign = "-" if v < 0 else ("+" if signed else "")
+    return f"{sign}${abs(v):,.{decimals}f}"
 
 # Chart palette -- actuals are the anchor (solid), the two projections are
 # de-emphasised dashed/dotted lines so the eye reads "history -> forecast".
@@ -251,6 +306,236 @@ def discover_raw_files():
 
 
 # --------------------------------------------------------------------------- #
+# Manual data-warehouse refresh                                               #
+# --------------------------------------------------------------------------- #
+# The demand snapshot is normally refreshed by a nightly scheduled task that
+# runs extract_demand_details.py (the ~10-minute SQL pull) OUT of the request
+# path, so the dashboard always serves a recent file instantly. This button lets
+# a user force a fresh pull on demand WITHOUT blocking the page: it launches the
+# extract as a detached background process and drops a lock file in the snapshot
+# folder. While the lock is live the page stays fully usable on the current
+# snapshot; when the child writes the new (atomic) workbook, the snapshot
+# dropdown auto-selects it. The lock also stops a manual click and the nightly
+# task from overlapping into two concurrent 10-minute queries.
+EXTRACT_SCRIPT = os.path.join(HERE, "extract_demand_details.py")
+
+
+def _refresh_log_path():
+    """Today's refresh log: ``logs/<date>/logs_refresh.txt``. Computed per call
+    (not at import) so a long-running dashboard files each refresh under the day
+    it ran, and shares the exact file the scheduled task writes."""
+    return dated_log_path("logs_refresh.txt")
+# A pull older than this with no new file is treated as crashed, so the button
+# re-enables instead of wedging the UI forever. Comfortably above the ~10-minute
+# typical runtime and the extract's own 900s SQL_QUERY_TIMEOUT default.
+REFRESH_STALE_SECONDS = 30 * 60
+
+
+def _refresh_lock_path():
+    """Lock file marking an in-flight DW pull, kept in the snapshot folder.
+
+    Lives inside the raw folder (not matched by the ``all_demand_projections_*``
+    glob, so it never shows up as a snapshot) so a click and the nightly task
+    coordinate through one file regardless of which one started the pull.
+    """
+    return os.path.join(_raw_dir(), ".refresh.lock")
+
+
+def _clear_lock(lock_path):
+    """Remove a refresh lock, ignoring the case where it's already gone."""
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass
+
+
+def _refresh_state(lock_path, completed_since, label):
+    """Shared lock state-machine: (running, started_str) for a background pull.
+
+    Self-healing, so no process has to clean up after itself:
+      * ``completed_since(lock_mtime)`` says whether the pull's output has
+        landed since the lock appeared — if so, clear the lock and report idle.
+      * If the lock is older than REFRESH_STALE_SECONDS with no output, the
+        pull crashed/was killed — clear the lock so the button re-enables.
+
+    What "output has landed" means differs per pull (the demand snapshot is one
+    atomic workbook; a warehouse snapshot is a five-file set), which is exactly
+    the ``completed_since`` seam.
+    """
+    if not os.path.exists(lock_path):
+        return False, None
+    lock_mtime = os.path.getmtime(lock_path)
+
+    if completed_since(lock_mtime):
+        _clear_lock(lock_path)
+        return False, None
+
+    if time.time() - lock_mtime > REFRESH_STALE_SECONDS:
+        logger.warning("%s refresh lock is stale (>%ds); clearing it.",
+                       label, REFRESH_STALE_SECONDS)
+        _clear_lock(lock_path)
+        return False, None
+
+    try:
+        with open(lock_path, encoding="utf-8") as f:
+            started = f.read().strip()
+    except OSError:
+        started = ""
+    return True, started
+
+
+def refresh_in_progress():
+    """(running, started_str): is a background DW pull active, and when it began.
+
+    Completion = any demand snapshot written since the lock appeared (the
+    extract writes one atomic workbook, so the first newer file IS the result).
+    """
+    def _completed(lock_mtime):
+        files = discover_raw_files()
+        return bool(files) and max(
+            os.path.getmtime(p) for _, p in files
+        ) >= lock_mtime
+
+    return _refresh_state(_refresh_lock_path(), _completed, "DW")
+
+
+def start_refresh(incremental: bool = True):
+    """Launch extract_demand_details.py in the background. Returns (ok, message).
+
+    Reuses THIS interpreter (``sys.executable``) so the pull runs in the same
+    venv the dashboard was started with, and inherits the environment (the SQL_*
+    connection vars). ``DEMAND_RAW_DIR`` is pinned to the exact folder the
+    dashboard reads so the child writes where we look, regardless of CWD. The
+    child's output is appended to logs/<date>/logs_refresh.txt for diagnosis.
+
+    ``incremental`` (the default) pulls only the last few weeks of actuals plus
+    all forward projections and merges them into the newest snapshot — minutes
+    instead of the ~20-minute full pull. The nightly scheduled task still runs
+    the full pull as the self-healing baseline.
+    """
+    running, started = refresh_in_progress()
+    if running:
+        return False, f"A refresh is already running (started {started})."
+
+    raw_dir = _raw_dir()
+    os.makedirs(raw_dir, exist_ok=True)
+    mode = "incremental" if incremental else "full"
+    return _launch_refresh(
+        _refresh_lock_path(),
+        EXTRACT_SCRIPT,
+        ["--incremental"] if incremental else [],
+        {"DEMAND_RAW_DIR": raw_dir},
+        f"DW refresh ({mode})",
+    )
+
+
+def _launch_refresh(lock_path, script, extra_args, env_overrides, header):
+    """Write ``lock_path``, then launch ``script`` detached. Returns (ok, msg).
+
+    The lock is written BEFORE launching so a double-click can't spawn two
+    pulls. The child reuses THIS interpreter (``sys.executable``) so it runs in
+    the same venv the dashboard was started with and inherits the environment
+    (the SQL_* connection vars) plus ``env_overrides`` (the raw-dir pin, so the
+    child writes exactly where the dashboard looks, regardless of CWD). Output
+    is appended to logs/<date>/logs_refresh.txt for diagnosis.
+    """
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(lock_path, "w", encoding="utf-8") as f:
+        f.write(now)
+
+    try:
+        env = {**os.environ, **env_overrides}
+        # Detach on Windows so the pull outlives this Streamlit run/rerun and
+        # isn't tied to the parent's console.
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        logf = open(_refresh_log_path(), "a", encoding="utf-8")
+        try:
+            logf.write(f"\n===== {header} started {now} =====\n")
+            logf.flush()
+            subprocess.Popen(
+                [sys.executable, script] + extra_args,
+                cwd=HERE,
+                env=env,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                close_fds=True,
+            )
+        finally:
+            # The child holds its own duplicated handle; drop ours so the parent
+            # doesn't leak a file handle per click.
+            logf.close()
+    except Exception as exc:
+        _clear_lock(lock_path)
+        logger.exception("Failed to launch %s", header)
+        return False, f"Could not start refresh: {exc}"
+
+    logger.info("%s launched (%s)", header, now)
+    return True, now
+
+
+# --------------------------------------------------------------------------- #
+# Manual warehouse-projections refresh                                        #
+# --------------------------------------------------------------------------- #
+# Same lock-file coordination as the demand refresh above, with one twist: a
+# warehouse snapshot is FIVE region files written back-to-back, not one atomic
+# workbook. Each file is atomic, but the set is not — so completion means "the
+# newest dated group holds every region, all newer than the lock", not "any
+# newer file exists" (which would clear the lock after the first region lands
+# and briefly serve a partial snapshot).
+WAREHOUSE_EXTRACT_SCRIPT = os.path.join(HERE, "extract_warehouse_projections.py")
+
+
+def _wh_refresh_lock_path():
+    """Lock for an in-flight warehouse pull, in the warehouse snapshot folder
+    (not matched by the ``*.xlsx`` discovery glob)."""
+    return os.path.join(data_io._warehouse_dir(), ".refresh.lock")
+
+
+def _wh_snapshot_complete_since(lock_mtime):
+    """True once a full 5-region snapshot newer than the lock exists."""
+    groups = data_io.discover_warehouse_files()
+    if not groups:
+        return False
+    newest = [
+        p for p in next(iter(groups.values())) if data_io._warehouse_region(p)
+    ]
+    regions = {data_io._warehouse_region(p) for p in newest}
+    if not set(data_io.REGION_PREFIXES) <= regions:
+        return False
+    return all(os.path.getmtime(p) >= lock_mtime for p in newest)
+
+
+def warehouse_refresh_in_progress():
+    """(running, started_str): is a background warehouse pull active."""
+    return _refresh_state(
+        _wh_refresh_lock_path(), _wh_snapshot_complete_since, "Warehouse"
+    )
+
+
+def start_warehouse_refresh():
+    """Launch extract_warehouse_projections.py in the background; (ok, msg)."""
+    running, started = warehouse_refresh_in_progress()
+    if running:
+        return False, f"A warehouse refresh is already running (started {started})."
+
+    wh_dir = data_io._warehouse_dir()
+    os.makedirs(wh_dir, exist_ok=True)
+    return _launch_refresh(
+        _wh_refresh_lock_path(),
+        WAREHOUSE_EXTRACT_SCRIPT,
+        [],
+        {"WAREHOUSE_RAW_DIR": wh_dir},
+        "Warehouse refresh",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Plytix-based SKU exclusions live in agent/data_io.py (streamlit-free) so the #
 # dashboard and the agent's ingest node drop the EXACT same rows before        #
 # forecasting: a SKU is never projected or flagged when it is discontinued/    #
@@ -269,6 +554,16 @@ def read_plytix_from_path(path, _mtime):
 def read_plytix_from_bytes(_data, name):
     """Read the raw Plytix export from uploaded bytes (for the 'Active in' check)."""
     return data_io.read_plytix(BytesIO(_data))
+
+
+@st.cache_data(show_spinner="Fetching Plytix feed…")
+def fetch_plytix_from_url(url, _nonce):
+    """Fetch the raw Plytix export from the channel feed URL (CSV).
+
+    ``_nonce`` busts the cache when the user clicks "Refresh from Plytix" — a URL
+    has no mtime to key on. Returns the raw Plytix frame; list prices are derived
+    from it cheaply via ``data_io.prices_from_plytix``."""
+    return data_io.read_plytix(url)
 
 
 # Filter logic + constants live in agent/data_io.py (single source of truth);
@@ -300,7 +595,7 @@ def load_raw_from_path(path, _mtime, model_path):
     owns its own cleaning rules.
     """
     P = load_pipeline(model_path)
-    raw = pd.read_excel(path, header=2)
+    raw = data_io.read_raw_frame(path)  # Parquet sidecar when present, else xlsx
     return _clean(raw, P)
 
 
@@ -382,7 +677,7 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
     projection). For ALL CUSTOMERS the breakdown is included so the summary
     carries 'Top Volume Customer Groups'. When ``prices`` (a SKU -> price Series)
     is supplied and the pipeline supports it, the summary also carries
-    'List Price (USD)' and 'Revenue Risk (USD)'. ``alpha`` / ``beta`` / ``phi``,
+    'List Price (USD)' and 'Revenue Risk (avg/wk)'. ``alpha`` / ``beta`` / ``phi``,
     when given, override the pipeline's smoothing constants for this call, and
     ``min_weeks`` overrides MIN_WEEKS_FOR_TREND (all are part of the cache key, so
     moving a slider recomputes the forecast). ``model_path`` selects the
@@ -404,6 +699,15 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
         summary, weekly = P.fit_regression(
             agg, today_ts, grouping_label=combined_label,
             breakdown_df=df, **kwargs,
+        )
+    elif (region_all := region_from_view(view)) is not None:
+        # Per-region rollup: every customer group in the region, combined.
+        # breakdown_df mirrors the ALL CUSTOMERS branch so the summary carries
+        # 'Top Volume Customer Groups' (here: the region's groups).
+        sub = _region_frame(df, P, region_all)
+        agg = P.aggregate_to_sku_week(sub)
+        summary, weekly = P.fit_regression(
+            agg, today_ts, grouping_label=view, breakdown_df=sub, **kwargs
         )
     else:
         sub = df[df["Customer Grouping"] == view]
@@ -451,6 +755,8 @@ def run_autofit(df, view, today_ts, model_path, min_weeks=None):
         return None
     if view == ALL_CUSTOMERS_VIEW:
         agg = P.aggregate_to_sku_week(df)
+    elif (region_all := region_from_view(view)) is not None:
+        agg = P.aggregate_to_sku_week(_region_frame(df, P, region_all))
     else:
         agg = P.aggregate_to_sku_week(df[df["Customer Grouping"] == view])
     kwargs = {}
@@ -619,11 +925,73 @@ def _base_layout(fig, title, forecast_start, y_title="Units (POS / Orders)"):
     return fig
 
 
-def aggregate_chart(agg, summary, weekly, anchors, view):
+def _clip_to_range(df, date_range):
+    """Clip a trace frame to a chart date-range window on WeekDate (Y auto-fits).
+
+    date_range is None (no clipping — current behavior) or a (start, end) pair of
+    Timestamps. Empty frames pass through untouched.
+    """
+    if date_range is None or df.empty:
+        return df
+    s, e = date_range
+    return df[(df["WeekDate"] >= s) & (df["WeekDate"] <= e)]
+
+
+def chart_range_control(agg, weekly, lcw, key):
+    """Compact date-range picker rendered right above a chart.
+
+    Returns a (view_start, view_end) pair of Timestamps used to clip that chart's
+    traces so its Y-axis auto-fits the visible window. Each chart gets its own
+    control (unique `key`) and thus its own independent range.
+
+    Presets trim history only — the forecast horizon always stays visible.
+    "Custom…" reveals a calendar / typeable range picker.
+    """
+    RANGE_PRESETS = {
+        "1 Month":  pd.DateOffset(months=1),
+        "3 Months": pd.DateOffset(months=3),
+        "6 Months": pd.DateOffset(months=6),
+        "9 Months": pd.DateOffset(months=9),
+        "1 Year":   pd.DateOffset(years=1),
+        "2 Years":  pd.DateOffset(years=2),
+        "3 Years":  pd.DateOffset(years=3),
+        "All":      None,
+        "Custom…":  "custom",
+    }
+    data_min = pd.to_datetime(agg["WeekDate"]).min()
+    horizon_end = pd.to_datetime(weekly["WeekDate"]).max()
+
+    preset = st.selectbox(
+        "Date range", list(RANGE_PRESETS),
+        index=list(RANGE_PRESETS).index("6 Months"),
+        key=f"{key}_preset",
+        help="How much history to show. The forecast always stays visible.",
+    )
+    if preset == "Custom…":
+        default_start = max(data_min, horizon_end - pd.DateOffset(months=6))
+        picked = st.date_input(
+            "Custom range",
+            value=(default_start.date(), horizon_end.date()),
+            min_value=data_min.date(), max_value=horizon_end.date(),
+            key=f"{key}_custom",
+            help="Click the calendar or type dates. Pick a start and an end.",
+        )
+        # date_input returns a single date mid-selection; apply once both ends chosen.
+        if isinstance(picked, (tuple, list)) and len(picked) == 2:
+            return pd.Timestamp(picked[0]), pd.Timestamp(picked[1])
+        return data_min, horizon_end
+    if preset == "All":
+        return data_min, horizon_end
+    # Preset controls history start; forecast ALWAYS stays visible.
+    return max(data_min, lcw - RANGE_PRESETS[preset]), horizon_end
+
+
+def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None):
     """Total actual demand (historical window) flowing into total forecast (15 wks).
 
     Historical demand uses each SKU's forecast source (POS or Orders) so the
-    actual total is comparable to the forecast total.
+    actual total is comparable to the forecast total. When date_range is given,
+    the plotted traces are clipped to that window so the Y-axis rescales to fit.
     """
     lb, lcw, ffw = anchors
 
@@ -644,6 +1012,12 @@ def aggregate_chart(agg, summary, weekly, anchors, view):
         (agg["WeekDate"] >= lb) & (agg["WeekDate"] <= horizon_end)
     ].dropna(subset=["Projection"])
     sys_tot = sys_proj.groupby("WeekDate")["Projection"].sum().reset_index()
+
+    # Clip every plotted trace to the chosen chart window so the Y-axis auto-fits
+    # the visible weeks (does not affect the summary/forecast math).
+    hist_tot = _clip_to_range(hist_tot, date_range)
+    fc_tot = _clip_to_range(fc_tot, date_range)
+    sys_tot = _clip_to_range(sys_tot, date_range)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -672,8 +1046,12 @@ def aggregate_chart(agg, summary, weekly, anchors, view):
     return _base_layout(fig, f"Total weekly demand — {view}", ffw)
 
 
-def sku_chart(sku, desc, source, agg, weekly, anchors):
-    """Per-SKU: actuals (historical window, from its source) + updated forecast + original proj."""
+def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None):
+    """Per-SKU: actuals (historical window, from its source) + updated forecast + original proj.
+
+    When date_range is given, the plotted traces are clipped to that window so the
+    Y-axis rescales to fit the visible weeks.
+    """
     lb, lcw, ffw = anchors
     col = "Orders" if source == "Orders" else "POS"
 
@@ -690,6 +1068,11 @@ def sku_chart(sku, desc, source, agg, weekly, anchors):
 
     fc = weekly[weekly["SKU"].astype(str) == str(sku)].copy()
     fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
+
+    # Clip every plotted trace to the chosen chart window so the Y-axis auto-fits.
+    hist = _clip_to_range(hist, date_range)
+    fc = _clip_to_range(fc, date_range)
+    sys_proj = _clip_to_range(sys_proj, date_range)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -735,9 +1118,9 @@ def style_summary(summary_df):
     if avg_col in df.columns:
         fmt[avg_col] = "{:,.1f}"
     if PRICE_COL in df.columns:
-        fmt[PRICE_COL] = "${:,.2f}"
+        fmt[PRICE_COL] = lambda v: fmt_dollar(v, decimals=2)
     if RISK_COL in df.columns:
-        fmt[RISK_COL] = "${:,.0f}"
+        fmt[RISK_COL] = lambda v: fmt_dollar(v, decimals=0)
 
     def colour_diff(v):
         if pd.isna(v):
@@ -803,7 +1186,7 @@ LLM_PROVIDERS = {
 def _agent_summary_path(view):
     """Path publish.py writes for a given view (same view->filename mangling)."""
     safe_view = view.replace(" ", "_").replace("/", "-")
-    return os.path.join(HERE, "outputs", f"agent_summary_{safe_view}.json")
+    return os.path.join(REPO_ROOT, "outputs", f"agent_summary_{safe_view}.json")
 
 
 def _load_agent_summary(view):
@@ -816,6 +1199,128 @@ def _load_agent_summary(view):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def _agent_scores(payload):
+    """(scores_dict, is_mase) for an agent summary payload.
+
+    Prefers the current ``mase_by_model`` key; falls back to the legacy
+    ``mae_by_model`` written before the MASE migration so a stale JSON still
+    renders (with the old MAE wording) until the nightly batch regenerates it.
+    """
+    if payload.get("mase_by_model") is not None:
+        return payload["mase_by_model"], True
+    return payload.get("mae_by_model") or {}, False
+
+
+def _model_fit_callout(payload):
+    """(kind, text) for the expected-vs-actual model-fit callout, or None.
+
+    ``kind`` is "info" when the LLM's expected best model differs from the
+    selected (MASE-winning) model — worth a prominent callout — and "caption"
+    for the quieter agree/mismatch-less cases. Returns None when there's nothing
+    to show (older JSONs written before these fields existed). Pure so the render
+    branch is unit-testable without a Streamlit context.
+    """
+    expected = payload.get("expected_best_model")
+    best = payload.get("best_model")
+    note = payload.get("model_fit_note")
+    if expected and best and expected != best:
+        return "info", note or f"Expected best fit: {expected} — {best} won on backtest MASE."
+    if expected and note:
+        return "caption", f"Expected best fit: {expected} (matches the selected model). {note}"
+    if note:
+        return "caption", note
+    return None
+
+
+# Progress markers for the agent run. Keys are LangGraph node names (see
+# agent/graph.py); each maps to (fraction_complete, user-facing label). graph
+# .stream() yields one update per node as it finishes, so we bump the bar to the
+# node's fraction when its update arrives. evaluate_models is the long pole (4
+# models x 6 walk-forward re-fits), hence the big jump to 0.75.
+_AGENT_NODE_PROGRESS = {
+    "ingest": (0.15, "Loading & cleaning data…"),
+    "run_all_models": (0.40, "Fitting the forecast models…"),
+    "evaluate_models": (0.75, "Backtesting models (walk-forward) to compare accuracy…"),
+    "select_best_model": (0.80, "Selecting the best model…"),
+    "flag_anomalies": (0.88, "Flagging anomalies…"),
+    "summarize": (0.95, "Writing the summary…"),
+    "flag_low_confidence": (0.95, "Writing the low-confidence note…"),
+    "publish": (1.0, "Publishing results…"),
+}
+
+
+def _run_agent_job(view, today_ts, shared):
+    """Run the agent pipeline on a background thread, streaming progress.
+
+    Runs OFF the main Streamlit script thread so the UI stays interactive. It
+    must NOT touch any ``st.*`` API — it only mutates the plain ``shared`` dict
+    (created on the main thread, polled by the progress fragment). LLM_PROVIDER
+    is read from the env at call time by agent/llm.py, so the caller sets it
+    before starting this thread.
+    """
+    # Per-model progress from inside the fit/backtest node loops. The nodes call
+    # this via RunnableConfig (see agent/state.report_progress); it maps each
+    # phase to its slice of the bar so the user sees e.g. "Fitting XGBoost (3/4)".
+    def _cb(phase, model, done, total):
+        total = max(int(total), 1)
+        if phase == "fit":  # fit loop occupies 0.15 -> 0.40 of the bar
+            shared["progress"] = 0.15 + 0.25 * (done / total)
+            shared["step"] = f"Fitting {model} ({done}/{total})"
+        elif phase == "backtest":  # backtest loop occupies 0.40 -> 0.75
+            shared["progress"] = 0.40 + 0.35 * (done / total)
+            shared["step"] = f"Backtesting {model} ({done}/{total})"
+
+    try:
+        # Import here, not at module top: keeps langgraph off the hot import
+        # path for every rerun and matches the "only touched on click" rule.
+        from agent.graph import build_graph
+
+        graph = build_graph()
+        # stream_mode="updates" (the default) yields {node_name: state_delta}
+        # after each node finishes; accumulate the deltas so best_model/errors
+        # are available when the run ends. The progress_cb (passed via config)
+        # supplies finer per-model updates from inside the fit/backtest nodes.
+        config = {"configurable": {"progress_cb": _cb}}
+        for update in graph.stream({"view": view, "today_ts": today_ts}, config=config):
+            for node_name, delta in update.items():
+                frac, label = _AGENT_NODE_PROGRESS.get(
+                    node_name, (shared.get("progress", 0.0), "Working…")
+                )
+                shared["progress"] = frac
+                shared["step"] = label
+                if isinstance(delta, dict):
+                    shared["result"].update(delta)
+        shared["status"] = "done"
+    except Exception as exc:  # surface any failure to the UI instead of a dead spinner
+        shared["error"] = f"{type(exc).__name__}: {exc}"
+        shared["status"] = "error"
+
+
+@st.fragment(run_every=0.5)
+def _agent_progress_fragment():
+    """Poll the background agent job and render its progress bar.
+
+    Only THIS fragment reruns on the 0.5s timer — the rest of the page stays
+    interactive while the pipeline runs on its background thread. When the job
+    finishes, trigger one full app rerun so main() can finalize (toast, switch
+    the model toggle, render the summary).
+    """
+    job = st.session_state.get("agent_job") or {}
+    started = job.get("started_at")
+    elapsed_txt = ""
+    if started:
+        secs = int(time.time() - started)
+        elapsed_txt = f"  ·  {secs // 60}:{secs % 60:02d} elapsed"
+    st.progress(
+        min(float(job.get("progress", 0.0)), 1.0),
+        text=f"Running agent — {job.get('step', 'Working…')}{elapsed_txt}",
+    )
+    if started:
+        st.caption(f"Started at {time.strftime('%H:%M:%S', time.localtime(started))}")
+    if job.get("status") in ("done", "error"):
+        st.rerun(scope="app")
 
 
 def _render_agent_summary(view):
@@ -831,16 +1336,67 @@ def _render_agent_summary(view):
         if payload.get("errors"):
             st.error("\n".join(payload["errors"]))
 
+        scores, is_mase = _agent_scores(payload)
+
         best = payload.get("best_model")
         if best:
-            mae = (payload.get("mae_by_model") or {}).get(best)
+            score = scores.get(best)
             label = f"Best model: {best}"
-            if mae is not None:
-                label += f"  (backtest MAE {mae:.1f})"
+            if score is not None:
+                label += (
+                    f"  (backtest MASE {score:.2f})" if is_mase
+                    else f"  (backtest MAE {score:.1f})"
+                )
             if payload.get("confidence_flag"):
                 st.warning(label + "  —  ⚠️ low confidence")
             else:
                 st.success(label)
+
+        # Expected vs. actual best model: the LLM's a-priori pick from the view's
+        # demand pattern, reconciled against the MASE winner. Guarded so older
+        # summary JSONs (written before these fields existed) render as before.
+        callout = _model_fit_callout(payload)
+        if callout is not None:
+            kind, text = callout
+            (st.info if kind == "info" else st.caption)(text)
+
+        # All models' backtest scores side by side, so the user can see how
+        # close the call was. Scores come straight from publish.py; a model
+        # whose backtest failed has None -> shown as "n/a", sorted last.
+        if scores:
+            col = "Backtest MASE (vs 8-wk avg)" if is_mase else "Backtest MAE"
+            rows = [
+                {
+                    "Model": name,
+                    col: (
+                        "n/a" if score is None
+                        else round(float(score), 2 if is_mase else 1)
+                    ),
+                    "Best": "✓" if name == best else "",
+                    "_sort": (float("inf") if score is None else float(score)),
+                }
+                for name, score in scores.items()
+            ]
+            score_df = (
+                pd.DataFrame(rows)
+                .sort_values("_sort")
+                .drop(columns="_sort")
+                .reset_index(drop=True)
+            )
+            st.markdown("**Model comparison:**")
+            st.dataframe(score_df, hide_index=True)
+            if is_mase:
+                st.caption(
+                    "Backtest MASE from walk-forward (one-step-ahead) validation: "
+                    "model error ÷ a plain 8-week moving average's error on the "
+                    "same weeks. < 1 beats the 8-week average; lower = better; "
+                    "winner chosen by lowest MASE."
+                )
+            else:
+                st.caption(
+                    "Backtest MAE from walk-forward (one-step-ahead) validation — "
+                    "lower = closer fit; winner chosen by lowest MAE."
+                )
 
         if payload.get("narrative"):
             st.write(payload["narrative"])
@@ -919,9 +1475,9 @@ def main():
         if not MODEL_OPTIONS:
             st.error(
                 "No forecasting pipeline found — expected "
-                "models/exponential_smoothing.py, models/xgboost.py or "
-                "models/regression.py next to dashboard.py "
-                "(or set DEMAND_PIPELINE)."
+                "models/exponential_smoothing.py, models/holt_winters.py, "
+                "models/xgboost.py, models/tsb.py or models/regression.py next "
+                "to dashboard.py (or set DEMAND_PIPELINE)."
             )
             st.stop()
 
@@ -930,7 +1486,15 @@ def main():
             # the new pipeline re-autofits (or falls back to its file defaults).
             # A structural change also recomputes automatically via the compute
             # gate.
+            #
+            # Drop the "autofit_tried" marker too: it and autofit_params are one
+            # logical fact ("we have a backtest result for this model/view/
+            # snapshot"). Clearing only the params leaves the marker asserting we
+            # already tried, so returning to a smoothing model would SKIP the
+            # backtest and silently fall back to file-default α/β/φ — changing
+            # the forecast for an unchanged view. Keep the two in lock-step.
             st.session_state.pop("autofit_params", None)
+            st.session_state.pop("autofit_tried", None)
 
         # After "Run Agent Summary" picks a best model, switch the toggle to it
         # so the screen shows that model. The switch is stashed as a pending key
@@ -979,9 +1543,94 @@ def main():
         df = None
         today_str = None
 
+        # Background pulls are coordinated through lock files, so their state
+        # is known before the snapshot dropdowns are drawn (needed to auto-select
+        # the fresh files the instant a pull finishes — see below).
+        running, started = refresh_in_progress()
+        wh_running, wh_started = warehouse_refresh_in_progress()
+
+        # ----- Pull fresh data straight from the warehouse ------------------
+        # One button refreshes everything: the demand snapshot and the five
+        # regional warehouse-projection files are pulled in the background
+        # (see start_refresh / start_warehouse_refresh); the Plytix feed is
+        # re-fetched immediately via a cache-busting nonce. The page keeps
+        # serving the current snapshots and switches to the new ones once
+        # they land. The demand pull is a fast INCREMENTAL one (last few
+        # weeks + projections merged into the newest snapshot); the nightly
+        # scheduled task still does the full 36-month pull as the
+        # self-healing baseline.
+        if running or wh_running:
+            st.info(
+                f"⏳ Refreshing data… started {started or wh_started}. "
+                "You can keep working on the current snapshot; the page "
+                "switches to the fresh data automatically when it finishes "
+                "(usually a few minutes)."
+            )
+            if st.button("Check for new data", key="check_refresh"):
+                st.rerun()
+        elif st.button(
+            "🔄 Refresh data",
+            key="refresh_all",
+            help="Pull the demand snapshot (last few weeks + current "
+                 "projections) and the five regional warehouse-projection "
+                 "files from the data warehouse now, in the background, and "
+                 "re-fetch list prices from the Plytix feed. The page stays "
+                 "usable and switches to the new snapshots when they're "
+                 "ready. A nightly job does the full pull.",
+        ):
+            ok_dw, msg_dw = start_refresh()
+            if ok_dw:
+                # Remember the newest mtime NOW so we can tell, on completion,
+                # whether the pull actually produced a newer file.
+                st.session_state["_refresh_active"] = True
+                st.session_state["_refresh_baseline"] = max(
+                    (os.path.getmtime(p) for _, p in files), default=0.0
+                )
+            _wh_paths_now = [
+                p for ps in data_io.discover_warehouse_files().values() for p in ps
+            ]
+            ok_wh, msg_wh = start_warehouse_refresh()
+            if ok_wh:
+                st.session_state["_wh_refresh_active"] = True
+                st.session_state["_wh_refresh_baseline"] = max(
+                    (os.path.getmtime(p) for p in _wh_paths_now), default=0.0
+                )
+            st.session_state["plytix_nonce"] = (
+                st.session_state.get("plytix_nonce", 0) + 1
+            )
+            if ok_dw or ok_wh:
+                st.success(
+                    f"Refresh started ({msg_dw if ok_dw else msg_wh}) — "
+                    "running in the background."
+                )
+                st.rerun()
+            else:
+                st.warning(msg_dw)
+
+        # If a refresh we launched this session just finished AND actually wrote
+        # a newer file than existed when it started, jump the snapshot selection
+        # to that newest file so the page shows the fresh pull without a manual
+        # pick. Done BEFORE the selectbox is instantiated (Streamlit forbids
+        # setting a widget-keyed value once its widget exists this run).
+        if st.session_state.get("_refresh_active") and not running:
+            st.session_state.pop("_refresh_active", None)
+            baseline = st.session_state.pop("_refresh_baseline", 0.0)
+            newest_mtime = max((os.path.getmtime(p) for _, p in files), default=0.0)
+            if files and newest_mtime > baseline:
+                d0, p0 = files[0]
+                st.session_state["snapshot_choice"] = f"{d0}  ({os.path.basename(p0)})"
+                st.toast("Fresh snapshot loaded from the data warehouse.")
+            else:
+                st.warning(
+                    "The data-warehouse refresh didn't produce a new snapshot — "
+                    "see logs/<date>/logs_refresh.txt for details."
+                )
+
         if files:
             labels = {f"{d}  ({os.path.basename(p)})": (d, p) for d, p in files}
-            choice = st.selectbox("Snapshot (raw file)", list(labels.keys()))
+            choice = st.selectbox(
+                "Snapshot (raw file)", list(labels.keys()), key="snapshot_choice"
+            )
             today_str, path = labels[choice]
             df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
         else:
@@ -997,47 +1646,92 @@ def main():
         # ----- List prices (drive revenue risk) ---------------------------
         # The Plytix export doubles as the source of each SKU's list price AND
         # its 'Active in' regions (used by the active-in check below), so we read
-        # both from whichever Plytix file is in play — uploaded or on disk.
+        # both from whichever Plytix source is in play. Precedence: a manually
+        # uploaded workbook wins; otherwise pull the public Plytix channel feed
+        # (the default, so no file has to be dragged); otherwise fall back to the
+        # newest local list_prices_*.xlsx on disk.
         st.header("Revenue risk")
         prices = None
         plytix_df = None
         price_file = discover_price_file()
-        with st.expander("Upload Plytix file with list prices", expanded=not files):
+        with st.expander("Override: upload a Plytix list-price file", expanded=False):
             up_price = st.file_uploader(
                 "list_prices_*.xlsx", type=["xlsx"], key="price_upload",
                 help="SKU + List Price USD, plus SKU Status / SKU Type / "
                     "'Active in'. Drives revenue risk (projection difference × "
-                    "list price) and the active-in check.",
+                    "list price) and the active-in check. Overrides the Plytix "
+                    "feed when set.",
             )
-            if up_price is not None:
-                prices = load_prices_from_bytes(
-                    up_price.getvalue(), up_price.name, pipeline_path()
-                )
-                plytix_df = read_plytix_from_bytes(up_price.getvalue(), up_price.name)
+
+        if up_price is not None:
+            prices = load_prices_from_bytes(
+                up_price.getvalue(), up_price.name, pipeline_path()
+            )
+            plytix_df = read_plytix_from_bytes(up_price.getvalue(), up_price.name)
+            if prices is not None:
+                st.success(f"{len(prices):,} list prices (uploaded)")
+        elif data_io.PLYTIX_FEED_URL:
+            nonce = st.session_state.setdefault("plytix_nonce", 0)
+            try:
+                plytix_df = fetch_plytix_from_url(data_io.PLYTIX_FEED_URL, nonce)
+                prices = data_io.prices_from_plytix(plytix_df)
                 if prices is not None:
-                    st.success(f"{len(prices):,} list prices (uploaded)")
-            elif price_file is not None:
-                prices = load_prices_from_path(
-                    price_file, os.path.getmtime(price_file), pipeline_path()
+                    st.success(f"{len(prices):,} list prices (Plytix feed)")
+            except Exception as e:  # network/parse failure -> fall back to disk
+                plytix_df = None
+                prices = None
+                st.warning(
+                    f"Couldn't fetch the Plytix feed ({e}); "
+                    "falling back to the newest local list-price file."
                 )
-                plytix_df = read_plytix_from_path(
-                    price_file, os.path.getmtime(price_file)
+
+        # Fall back to the newest local xlsx when neither an upload nor the feed
+        # produced prices (feed disabled/unreachable and nothing uploaded).
+        if prices is None and up_price is None and price_file is not None:
+            prices = load_prices_from_path(
+                price_file, os.path.getmtime(price_file), pipeline_path()
+            )
+            plytix_df = read_plytix_from_path(
+                price_file, os.path.getmtime(price_file)
+            )
+            if prices is not None:
+                st.success(
+                    f"{len(prices):,} list prices "
+                    f"({os.path.basename(price_file)})"
                 )
-                if prices is not None:
-                    st.success(
-                        f"{len(prices):,} list prices "
-                        f"({os.path.basename(price_file)})"
-                    )
 
         # ----- Warehouse projections (drive the "missing projections" table) --
         # A DIFFERENT data source than the demand file above: the warehouse
-        # projection exports are wide grids (one per region: AU/CA/EU/JP/US) that
-        # list every active-in SKU×customer×week, with a blank cell where no
-        # projection exists. That blank is exactly what the "missing future
-        # projections" table finds, so it needs these files, not the demand file.
+        # projection exports (one per region: AU/CA/EU/JP/US) list which
+        # SKU×customer×week cells carry a projection — a missing cell is
+        # exactly what the "missing future projections" table finds, so it
+        # needs these files, not the demand file. The nightly SQL pull (or the
+        # refresh button under "Data source") writes them; a manual PowerBI
+        # export (wide matrix or long table layout — the reader sniffs which)
+        # still works.
         st.header("Warehouse projections")
         warehouse_df = None
+
+        # If a warehouse refresh we launched just finished and actually wrote a
+        # newer snapshot, jump the snapshot selection to it (before the widget
+        # is instantiated — same dance as the demand snapshot above).
         wh_snapshots = data_io.discover_warehouse_files()
+        _wh_all_paths = [p for ps in wh_snapshots.values() for p in ps]
+        if st.session_state.get("_wh_refresh_active") and not wh_running:
+            st.session_state.pop("_wh_refresh_active", None)
+            baseline = st.session_state.pop("_wh_refresh_baseline", 0.0)
+            newest_mtime = max(
+                (os.path.getmtime(p) for p in _wh_all_paths), default=0.0
+            )
+            if wh_snapshots and newest_mtime > baseline:
+                st.session_state["warehouse_snapshot"] = next(iter(wh_snapshots))
+                st.toast("Fresh warehouse projections loaded from the data warehouse.")
+            else:
+                st.warning(
+                    "The warehouse refresh didn't produce a new snapshot — "
+                    "see logs/<date>/logs_refresh.txt for details."
+                )
+
         with st.expander(
             "Upload warehouse projection files (AU/CA/EU/JP/US)",
             expanded=not wh_snapshots,
@@ -1140,7 +1834,7 @@ def main():
         st.header("View")
         by_region = list_views(df)
         scope = st.radio(
-            "Scope", [ALL_CUSTOMERS_VIEW, "By customer group"], index=0
+            "Scope", [ALL_CUSTOMERS_VIEW, "By region"], index=0
         )
         if scope == ALL_CUSTOMERS_VIEW:
             view = ALL_CUSTOMERS_VIEW
@@ -1150,7 +1844,15 @@ def main():
             # labels; sorting by their string form keeps the selectbox from
             # crashing on mixed types (see logs.txt, 2026-07-06).
             region = st.selectbox("Region", sorted(by_region.keys(), key=str))
-            view = st.selectbox("Customer group", by_region[region])
+            # First entry is the synthetic per-region rollup ("All Customers"),
+            # every group in this region combined. Its stored value embeds the
+            # region so caches/keys stay unique across regions; format_func
+            # shows the short label the user expects.
+            all_view = region_all_view(region)
+            view = st.selectbox(
+                "Customer group", [all_view] + by_region[region],
+                format_func=lambda v: f"All Customers - {region}" if v == all_view else v,
+            )
 
     # ----- Agent summary (LangGraph pipeline) ------------------------------
     # Button-triggered only: invoking the graph backtests all three models AND
@@ -1185,30 +1887,57 @@ def main():
         )
 
     if run_agent:
-        os.environ["LLM_PROVIDER"] = LLM_PROVIDERS[provider_label]
+        # Kick off the pipeline on a background thread and rerun immediately, so
+        # the (minutes-long) run never blocks the script. Progress is polled by
+        # _agent_progress_fragment; completion is finalized further below.
+        os.environ["LLM_PROVIDER"] = LLM_PROVIDERS[provider_label]  # llm.py reads env at call time
         # Remember that the agent was run for this view this session, so the
         # summary expander below appears only after an explicit click — never a
         # stale persisted summary surfacing on page load.
         st.session_state.setdefault("agent_ran_views", set()).add(view)
-        with st.spinner(f"Running agentic pipeline ({provider_label})…"):
-            # Import here, not at module top: keeps langgraph off the hot import
-            # path for every rerun and matches the "only touched on click" rule.
-            from agent.graph import build_graph
+        shared = {
+            "status": "running",
+            "progress": 0.0,
+            "step": "Starting…",
+            "view": view,
+            "started_at": time.time(),  # so the progress panel can show elapsed time
+            "result": {},
+            "error": None,
+        }
+        thread = threading.Thread(
+            target=_run_agent_job, args=(view, today_ts, shared), daemon=True
+        )
+        st.session_state["agent_job"] = shared
+        st.session_state["agent_job_thread"] = thread
+        thread.start()
+        st.rerun()
 
-            graph = build_graph()
-            final_state = graph.invoke({"view": view, "today_ts": today_ts})
-        if final_state.get("errors"):
-            st.error("\n".join(final_state["errors"]))
-        else:
-            best = final_state.get("best_model")
-            st.toast(f"Agent finished: {best or 'n/a'}")
-            # Switch the model toggle to the agent's winner so the screen shows
-            # the best model. Stash it as a pending key and rerun: the toggle
-            # widget already rendered above this run, so it can't be written
-            # here — the pending value is applied before the widget next build.
-            if best in MODEL_OPTIONS and best != st.session_state.get("model_choice"):
-                st.session_state["_pending_model_choice"] = best
-                st.rerun()
+    job = st.session_state.get("agent_job")
+    if job is not None and job.get("view") == view:
+        status = job.get("status")
+        if status == "running":
+            # Live, non-blocking progress. Only the fragment reruns on its timer;
+            # everything else on the page stays interactive.
+            _agent_progress_fragment()
+        elif status in ("done", "error"):
+            # A full rerun (fired by the fragment) lands here once the run ends.
+            result = job.get("result") or {}
+            if status == "error" or result.get("errors"):
+                st.error(job.get("error") or "\n".join(result.get("errors", [])) or "Agent run failed.")
+                job["status"] = "shown"  # consume so the error isn't re-raised on later reruns
+            else:
+                best = result.get("best_model") or (_load_agent_summary(view) or {}).get("best_model")
+                started = job.get("started_at")
+                dur = f" in {int(time.time() - started)}s" if started else ""
+                st.toast(f"Agent finished{dur}: {best or 'n/a'}")
+                job["status"] = "shown"  # consume before any rerun below
+                # Switch the model toggle to the agent's winner so the screen
+                # shows the best model. Stash it as a pending key and rerun: the
+                # toggle widget already rendered above, so it can't be written
+                # here — the pending value is applied before the widget rebuilds.
+                if best in MODEL_OPTIONS and best != st.session_state.get("model_choice"):
+                    st.session_state["_pending_model_choice"] = best
+                    st.rerun()
 
     # Show the cached run (from the JSON publish wrote) only for views the user
     # has run the agent on this session — clicking is what reveals it.
@@ -1322,15 +2051,19 @@ def main():
             )
 
             by_cust = None
-            if view == ALL_CUSTOMERS_VIEW and summary is not None and not summary.empty:
+            region_all = region_from_view(view)
+            is_combined = view == ALL_CUSTOMERS_VIEW or region_all is not None
+            if is_combined and summary is not None and not summary.empty:
                 def _bump(done, total, group):
                     frac = 0.4 + 0.55 * (done / max(total, 1))
                     prog.progress(
                         min(frac, 0.98),
                         text=f"Per-customer forecast… ({done}/{total})",
                     )
+                # A region rollup breaks out only its own region's groups.
+                src = df if region_all is None else _region_frame(df, P, region_all)
                 by_cust = compute_by_customer(
-                    df, today_ts, pipeline_path(),
+                    src, today_ts, pipeline_path(),
                     prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
                 )
             prog.progress(1.0, text="Done")
@@ -1353,8 +2086,8 @@ def main():
     st.subheader(view)
     w1, w2 = st.columns(2)
     # The window's nominal lower bound (lb) can sit earlier than the first week
-    # the data actually reaches — e.g. the all-history pipelines anchor lb at
-    # HISTORY_START (2026-03-01) but the raw file's earliest week is later. Show
+    # the data actually reaches — e.g. the all-history pipelines anchor lb a few
+    # years before the run date but the raw file's earliest week is later. Show
     # the first week that is genuinely used in the fit and the chart (earliest
     # WeekDate within [lb, lcw] carrying a POS/Orders signal) rather than the
     # nominal lb, so the displayed start matches what the graph plots.
@@ -1394,10 +2127,19 @@ def main():
     total_updated = summary["Updated Projection Average"].sum()
     total_initial = summary["Initial Projection Average"].sum()
     diff = total_updated - total_initial
+    # Total Projection Value = Σ (list price × updated weekly-avg forecast) over
+    # priced SKUs. Unpriced SKUs map to NaN and are skipped, so this covers the
+    # same population as Revenue Risk. Per-week basis (Updated Projection Average
+    # is already a weekly mean).
+    has_price = PRICE_COL in summary.columns and summary[PRICE_COL].notna().any()
+    proj_value = (
+        (summary[PRICE_COL] * summary["Updated Projection Average"]).sum()
+        if has_price else None
+    )
     n_orders = int((summary.get("Data Source") == "Orders").sum()) \
         if "Data Source" in summary.columns else 0
 
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     k1.metric(
         "SKUs Forecasted", f"{len(summary):,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
@@ -1427,14 +2169,25 @@ def main():
     if has_risk:
         net_risk = summary[RISK_COL].sum()
         k6.metric(
-            "Revenue Risk (net)", f"${net_risk:+,.0f}",
+            "Revenue Risk (avg/wk)", fmt_dollar(net_risk, signed=True),
             help="Σ (projection difference × list price) over priced SKUs. "
                  "Negative = forecast fell below the original projection.",
         )
     else:
         k6.metric(
-            "Revenue Risk (net)", "—",
+            "Revenue Risk (avg/wk)", "—",
             help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
+        )
+    if proj_value is not None:
+        k7.metric(
+            "Projected Revenue (avg/wk)", fmt_dollar(proj_value),
+            help="Σ (list price × updated weekly-avg forecast) over priced SKUs "
+                 "— the gross value at list price of the forecasted weekly demand.",
+        )
+    else:
+        k7.metric(
+            "Projected Revenue (avg/wk)", "—",
+            help="Load a list_prices_*.xlsx (sidebar) to enable projection value.",
         )
     if n_orders:
         st.caption(
@@ -1450,8 +2203,12 @@ def main():
             )
 
     # ----- Aggregate chart --------------------------------------------------
+    # Per-chart date-range picker (own key => independent from the SKU chart).
+    agg_ctrl, _ = st.columns([1, 2])
+    with agg_ctrl:
+        agg_range = chart_range_control(agg, weekly, lcw, key="range_agg")
     st.plotly_chart(
-        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view),
+        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view, date_range=agg_range),
         width="stretch",
     )
 
@@ -1465,8 +2222,10 @@ def main():
 
     cL, cR = st.columns([3, 1])
     with cL:
+        # Per-chart date-range picker (own key => independent from the aggregate chart).
+        sku_range = chart_range_control(agg, weekly, lcw, key="range_sku")
         st.plotly_chart(
-            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw)),
+            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw), date_range=sku_range),
             width="stretch",
         )
     with cR:
@@ -1496,11 +2255,18 @@ def main():
         if RISK_COL in summary.columns:
             pv = row.get(PRICE_COL)
             rv = row.get(RISK_COL)
-            st.metric("List Price", "—" if pd.isna(pv) else f"${pv:,.2f}")
+            st.metric("List Price", fmt_dollar(pv, decimals=2))
             st.metric(
-                "Revenue Risk",
-                "—" if pd.isna(rv) else f"${rv:+,.0f}",
+                "Revenue Risk (avg/wk)",
+                fmt_dollar(rv, signed=True),
                 help="Projection difference × list price.",
+            )
+            prv = pv * row["Updated Projection Average"] if pd.notna(pv) else None
+            st.metric(
+                "Projected Revenue (avg/wk)",
+                fmt_dollar(prv),
+                help="List price × updated weekly-avg forecast — the gross value "
+                     "at list price of this SKU's forecasted weekly demand.",
             )
         if "Top Volume Customer Groups" in summary.columns:
             st.markdown("**Top Volume Groups**")
@@ -1537,7 +2303,7 @@ def main():
     # broken out by customer group. Computed alongside the main forecast in the
     # recompute block above (and cached in session_state) so it stays on the
     # same snapshot / prices / parameters as the SKU table.
-    if view == ALL_CUSTOMERS_VIEW:
+    if view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None:
         st.markdown("### Summary table by SKU and Customer")
         if by_cust is None or by_cust.empty:
             st.info("No per-customer forecasts to show for this snapshot.")
@@ -1574,7 +2340,12 @@ def main():
             st.download_button(
                 "⬇️ Download the summary table by SKU and Customer",
                 data=summary_to_excel(by_cust_table),
-                file_name=f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx",
+                file_name=(
+                    f"{view.replace('/', '-').replace(' ', '_')}"
+                    f"_demand_projections_{today_str}.xlsx"
+                    if view != ALL_CUSTOMERS_VIEW
+                    else f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx"
+                ),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_by_customer",
             )
@@ -1715,10 +2486,16 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
     row_group = missing_df["CUSTNMBR"].map(lambda c: grouping.get(c, c))
 
     # A by-customer-group view shows only that group's rows (not every customer
-    # in the region); ALL CUSTOMERS shows everything.
+    # in the region); a per-region "All Customers" rollup shows every group in
+    # its region; ALL CUSTOMERS shows everything.
     group_scoped = view != ALL_CUSTOMERS_VIEW
+    region_all = region_from_view(view)
     table_df = missing_df
-    if group_scoped:
+    if region_all is not None and P is not None:
+        table_df = missing_df[
+            row_group.map(lambda g: str(P.region_for_group(g))) == region_all
+        ]
+    elif group_scoped:
         table_df = missing_df[row_group == view]
 
     if table_df.empty:
@@ -1881,7 +2658,7 @@ def _run():
         )
         with st.expander("Technical details (for developers)"):
             st.exception(exc)
-            st.caption(f"Full traceback is also recorded in {LOG_PATH}.")
+            st.caption(f"Full traceback is also recorded in {dated_log_path(LOG_FILENAME)}.")
         st.stop()
 
 

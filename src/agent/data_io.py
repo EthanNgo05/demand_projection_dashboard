@@ -17,18 +17,33 @@ Must never import streamlit (directly or transitively).
 import glob
 import os
 import re
+import urllib.request
+from io import BytesIO
 from typing import NamedTuple
 
 import numpy as np
 import openpyxl
 import pandas as pd
 
-from agent.config import MODEL_OPTIONS
+from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS, region_from_view
 from agent.model_loader import load_pipeline
 
-# Repo root (the folder holding dashboard.py), so relative RAW_INPUTS_FOLDER /
-# LIST_PRICE_GLOB paths resolve exactly as dashboard.py's HERE does.
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Repo root (parent of src/, the folder holding raw_inputs/ + outputs/), so
+# relative RAW_INPUTS_FOLDER / LIST_PRICE_GLOB paths resolve there. This file is
+# src/agent/data_io.py, so climb three levels: agent -> src -> repo root.
+HERE = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+# Public Plytix channel feed that publishes the same product data as the
+# list_prices_*.xlsx export (SKU, List Price USD, SKU Status, SKU Type,
+# "Active in"). Used as the default price/Plytix source so no one has to drag a
+# file. Overridable via the PLYTIX_FEED_URL env var (blank disables the feed and
+# falls back to the local xlsx). See read_plytix / prices_from_plytix below.
+PLYTIX_FEED_URL = os.getenv(
+    "PLYTIX_FEED_URL",
+    "https://pim.plytix.com/channels/6a56637a49b9e8566d5f2d4f/feed",
+)
 
 
 def default_pipeline():
@@ -36,14 +51,37 @@ def default_pipeline():
     if not MODEL_OPTIONS:
         raise FileNotFoundError(
             "No forecasting pipeline found — expected "
-            "models/exponential_smoothing.py, models/xgboost.py or "
-            "models/regression.py next to dashboard.py."
+            "models/exponential_smoothing.py, models/holt_winters.py, "
+            "models/xgboost.py or models/regression.py next to dashboard.py."
         )
     return load_pipeline(next(iter(MODEL_OPTIONS.values())))
 
 
 def _resolve_pipeline(P):
     return default_pipeline() if P is None else P
+
+
+def view_frame(df, view, P=None):
+    """Rows of ``df`` belonging to ``view``: the full frame (ALL CUSTOMERS),
+    one region's groups (an "All Customers - <region>" rollup), or one
+    customer group. The shared view->frame step for every agent node, kept in
+    exact lockstep with dashboard.compute_view's filtering.
+
+    ``P=None`` falls back to the first configured model — safe because
+    region_for_group is identical across the three model files (see the
+    pipeline contract). str() on its result matches how the view string was
+    built (a custom pipeline may return non-string region labels).
+    """
+    if view == ALL_CUSTOMERS_VIEW:
+        return df
+    region = region_from_view(view)
+    if region is not None:
+        P = _resolve_pipeline(P)
+        groups = df["Customer Grouping"].map(
+            lambda g: str(P.region_for_group(g))
+        )
+        return df[groups == region]
+    return df[df["Customer Grouping"] == view]
 
 
 def _raw_dir(P=None):
@@ -132,6 +170,17 @@ def _clean(raw_df, P):
         df["Orders"] = np.nan  # legacy file without an Orders/Sum of Quantity col
 
     df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
+    # The fixed-width warehouse export space-pads its key columns (e.g.
+    # 'BT1028      ', 'AMAZON-DS      '). Strip that surrounding whitespace here —
+    # the single ingestion boundary both the dashboard and agent share — before
+    # any key-based join or lookup runs. SKU padding made every SKU miss the
+    # (stripped) list-price index (blank revenue risk) and the Plytix SKU sets
+    # (active-in / discontinued checks silently ran on nothing). CUSTNMBR padding
+    # made padded customers miss CUSTOMERS_TO_IGNORE and COMBINED_GROUPING, so a
+    # group like AMAZON-DC fragmented across its padded/clean spellings instead of
+    # folding together. Strip CUSTNMBR *before* the ignore filter and grouping map.
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
     df = df[~df["CUSTNMBR"].isin(P.CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
     df["Customer Grouping"] = (
@@ -140,14 +189,68 @@ def _clean(raw_df, P):
     return df
 
 
+def _parquet_sidecar_path(xlsx_path):
+    """The ``.parquet`` sidecar path for a snapshot ``.xlsx`` (same basename)."""
+    root, _ = os.path.splitext(xlsx_path)
+    return root + ".parquet"
+
+
+def read_raw_frame(path):
+    """Read a raw demand snapshot into the pre-``_clean`` frame, fast path first.
+
+    The nightly extract writes a ``.parquet`` sidecar next to each
+    ``all_demand_projections_<date>.xlsx`` (see
+    ``extract_demand_details.write_parquet_sidecar``). Parquet preserves dtypes
+    and carries no banner rows, so it loads far faster than re-parsing the
+    workbook with openpyxl. This helper prefers that sidecar and falls back to
+    the ``.xlsx`` (``header=2`` for the two-row PowerBI banner):
+
+      1. sidecar exists and is at least as new as the ``.xlsx`` -> read Parquet;
+      2. otherwise read the ``.xlsx`` and **lazily backfill** the sidecar for
+         next time (best-effort — swallowed on read-only hosts / missing engine),
+         so pre-existing snapshots and manual PowerBI exports get the fast path
+         on their second load.
+
+    Returns the raw frame with the PowerBI column names ``_clean`` expects
+    (``'Demand'[DisplaySKU]``, ``Custnmbr``, ``WeekDate``, ``POS``,
+    ``Projection``, optionally ``Sum of Quantity``). Discovery stays keyed on the
+    ``.xlsx`` (see ``discover_raw_files``); only the physical read is swapped.
+    """
+    sidecar = _parquet_sidecar_path(path)
+    try:
+        if os.path.exists(sidecar) and (
+            not os.path.exists(path)
+            or os.path.getmtime(sidecar) >= os.path.getmtime(path)
+        ):
+            return pd.read_parquet(sidecar)
+    except Exception:  # corrupt/unreadable sidecar or engine missing -> xlsx
+        pass
+
+    raw = pd.read_excel(path, header=2)
+    # Lazy backfill so the next load hits the fast path. Never let a failed
+    # sidecar write break the read.
+    try:
+        tmp = sidecar + ".tmp"
+        raw.to_parquet(tmp, index=False)
+        os.replace(tmp, sidecar)
+    except Exception:
+        try:
+            if os.path.exists(sidecar + ".tmp"):
+                os.remove(sidecar + ".tmp")
+        except OSError:
+            pass
+    return raw
+
+
 def load_raw(path, P=None):
     """Read + clean a raw demand workbook from disk.
 
-    ``header=2`` matches the PowerBI export layout (two banner rows above the
-    header) — the same read dashboard.py's ``load_raw_from_path`` does.
+    Reads via ``read_raw_frame`` (Parquet sidecar when available, else the
+    ``header=2`` PowerBI workbook), then applies the shared ``_clean`` — the
+    same result dashboard.py's ``load_raw_from_path`` produces.
     """
     P = _resolve_pipeline(P)
-    raw = pd.read_excel(path, header=2)
+    raw = read_raw_frame(path)
     return _clean(raw, P)
 
 
@@ -178,13 +281,54 @@ DISCONTINUED_COLS = [
 ]
 
 
-def read_plytix(path):
+def _read_csv_url(url, timeout=30):
+    """Fetch a CSV feed over HTTP(S) into a DataFrame, with a timeout.
+
+    Uses stdlib urllib (no extra dependency) so a hung endpoint can't stall the
+    dashboard/agent indefinitely."""
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        raw = resp.read()
+    return pd.read_csv(BytesIO(raw))
+
+
+def read_plytix(src):
     """Read the raw Plytix export (for the 'Active in' / discontinued checks).
 
-    ``path`` may be a filesystem path or a file-like object (e.g. a BytesIO of
-    an uploaded workbook), so both the dashboard's on-disk and upload paths and
-    the agent's ingest node share this one reader."""
-    return pd.read_excel(path)
+    ``src`` may be:
+      - an ``http(s)`` URL to the Plytix channel feed (CSV) — fetched with a
+        timeout and parsed as CSV;
+      - a ``.csv`` filesystem path — read as CSV;
+      - a filesystem path or file-like object (e.g. a BytesIO of an uploaded
+        workbook) — read as an Excel workbook, as before.
+
+    Column names are stripped so the feed's trailing-space headers don't break
+    the exact-name column checks downstream. Shared by the dashboard's on-disk,
+    upload, and feed paths and the agent's ingest node."""
+    if isinstance(src, str) and src.lower().startswith("http"):
+        df = _read_csv_url(src)
+    elif isinstance(src, str) and src.lower().endswith(".csv"):
+        df = pd.read_csv(src)
+    else:
+        df = pd.read_excel(src)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def prices_from_plytix(plytix_df):
+    """SKU -> List Price (USD) Series from an already-read Plytix frame.
+
+    Mirrors the tail of each model's ``load_list_prices`` so the CSV/feed path
+    yields the exact same lookup without re-reading through ``pd.read_excel``.
+    SKUs with a blank price are dropped so they map to NaN downstream (an
+    unknown price is left blank rather than treated as $0). Returns None if the
+    frame lacks the required columns."""
+    if plytix_df is None or not {"SKU", "List Price USD"}.issubset(plytix_df.columns):
+        return None
+    prices = plytix_df[["SKU", "List Price USD"]].dropna(subset=["SKU"]).copy()
+    prices["SKU"] = prices["SKU"].astype(str).str.strip()
+    prices["List Price USD"] = pd.to_numeric(prices["List Price USD"], errors="coerce")
+    prices = prices.dropna(subset=["List Price USD"]).drop_duplicates("SKU", keep="last")
+    return prices.set_index("SKU")["List Price USD"]
 
 
 def _this_week_start():
@@ -532,22 +676,117 @@ def _warehouse_region(name):
     return next((p for p in REGION_PREFIXES if base.startswith(p)), None)
 
 
+def _long_export_header_row(source):
+    """Header row index of a long-format export, or None if the file is wide.
+
+    The long PowerBI export ("export data" of the underlying table) carries a
+    literal ``WeekDate`` column header within the first few rows (banner row,
+    blank row, then headers). The legacy wide matrix export never does — its
+    week dates are *column values* on the title row. That makes ``WeekDate``
+    a reliable format discriminator.
+    """
+    probe = pd.read_excel(source, header=None, nrows=6)
+    for i in range(min(len(probe), 4)):
+        row = probe.iloc[i].map(lambda v: str(v).strip())
+        if (row == "WeekDate").any():
+            return i
+    return None
+
+
+def _warehouse_long_export_to_long(source, location, header_row):
+    """Clean one long-format export (PowerBI table export, or the file written
+    by extract_warehouse_projections.py) into the WAREHOUSE_LONG_COLS shape.
+
+    Unlike the wide grid, a long file has no blank cells: a missing projection
+    is an *absent row*. The frame returned here is therefore only the observed
+    values — combine_warehouse_projections reconstructs the full
+    pairs × weeks grid (reintroducing NaN = missing) across the snapshot.
+    Explicit zero rows are kept as real values: a 0 cell in the wide grid
+    rendered as 0, i.e. "has a projection", not "missing".
+
+    Keys are normalized here (whitespace-stripped — GP CHAR columns are
+    space-padded — and trailing '*' display markers dropped) so SKUs line up
+    with the Plytix side, which compute_active_products strips the same way.
+    """
+    df = pd.read_excel(source, header=header_row)
+
+    renames = {}
+    for c in df.columns:
+        s = str(c).strip()
+        if "DisplaySKU" in s or s == "SKU":
+            renames[c] = "SKU"
+        elif s == "CUSTNMBR":
+            renames[c] = "CUSTNMBR"
+        elif s == "WeekDate":
+            renames[c] = "WeekDate"
+        elif "Proj" in s:
+            renames[c] = "Projection"
+    df = df.rename(columns=renames)
+    needed = ["SKU", "CUSTNMBR", "WeekDate", "Projection"]
+    missing_cols = [c for c in needed if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Long-format warehouse export is missing column(s) {missing_cols} "
+            f"(found: {list(df.columns)})"
+        )
+    df = df[needed].copy()
+
+    df["SKU"] = df["SKU"].astype(str).str.strip().str.rstrip("*")
+    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
+    # Timestamps *before* any cross-file week union — a mixed wide/long
+    # snapshot must not end up with string-vs-Timestamp duplicate week keys.
+    df["WeekDate"] = pd.to_datetime(df["WeekDate"], errors="coerce")
+    df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce")
+
+    # Footer notes / stray rows: no usable key -> not data.
+    bad_key = (
+        df["SKU"].isin(["", "nan", "None"])
+        | df["CUSTNMBR"].isin(["", "nan", "None"])
+        | df["WeekDate"].isna()
+    )
+    df = df[~bad_key]
+
+    long_df = df.sort_values(["SKU", "CUSTNMBR", "WeekDate"]).reset_index(drop=True)
+    long_df["Location"] = location
+    long_df = long_df[WAREHOUSE_LONG_COLS]
+    # Tag for combine_warehouse_projections: this frame still needs its
+    # missing cells reconstructed (attrs survive because combine reads the
+    # flag before doing anything to the frame).
+    long_df.attrs["needs_grid_reconstruction"] = True
+    return long_df, location
+
+
 def warehouse_wide_to_long(source, name=None):
-    """Clean one wide warehouse export into a long frame with a Location column.
+    """Clean one warehouse export into a long frame with a Location column.
 
     ``source`` is a filesystem path or a file-like object (e.g. a BytesIO of an
     uploaded workbook); ``name`` supplies the filename used to detect the region
     prefix (defaults to ``source`` when it is a path). Returns (long_df,
     location), or (None, None) if the name has no known region prefix.
 
-    Ported verbatim from active_missing_projections.py: unmerge the SKU column
-    and forward-fill it, cut the footer notes, then melt wide -> long. Blank
-    projection cells are kept as NaN (that is exactly what "missing" means).
+    Despite the name (kept for compatibility), this now sniffs the layout and
+    dispatches: legacy *wide* matrix exports go through the original
+    unmerge-and-melt path below; *long* table exports (what PowerBI's
+    "export data" produces today, and what extract_warehouse_projections.py
+    writes from the data warehouse) go through _warehouse_long_export_to_long.
+    Pointing the wide parser at a long file used to melt the banner row into
+    garbage — silently emptying the missing-projections table.
     """
     name = name if name is not None else source
     location = _warehouse_region(name)
     if location is None:
         return None, None
+
+    # Sniff the layout. ``source`` may be a BytesIO from an upload, which the
+    # probe read consumes — rewind before and after so the real parse (and a
+    # caller retry) starts from the top.
+    if hasattr(source, "seek"):
+        source.seek(0)
+    header_row = _long_export_header_row(source)
+    if hasattr(source, "seek"):
+        source.seek(0)
+    if header_row is not None:
+        return _warehouse_long_export_to_long(source, location, header_row)
 
     # 1) Load with openpyxl so we can unmerge the SKU column and propagate its value
     wb = openpyxl.load_workbook(source, data_only=True)
@@ -599,6 +838,28 @@ def warehouse_wide_to_long(source, name=None):
     return long_df, location
 
 
+def _reconstruct_missing_cells(long_df, weeks):
+    """Rebuild the full pairs × weeks grid for one long-format export.
+
+    A long export only lists observed values, so a missing projection is an
+    absent row. Recreate what the wide matrix showed: every (SKU, CUSTNMBR)
+    pair in the file gets a cell for every week in ``weeks``, NaN where the
+    file had no row — NaN being exactly the "missing" signal downstream.
+    Duplicate keys (e.g. a starred and unstarred variant of the same SKU that
+    normalization collapsed) are summed.
+    """
+    pairs = long_df[["SKU", "CUSTNMBR"]].drop_duplicates()
+    values = (
+        long_df.dropna(subset=["Projection"])
+        .groupby(["SKU", "CUSTNMBR", "WeekDate"], as_index=False)["Projection"]
+        .sum()
+    )
+    grid = pairs.merge(pd.DataFrame({"WeekDate": weeks}), how="cross")
+    grid = grid.merge(values, on=["SKU", "CUSTNMBR", "WeekDate"], how="left")
+    grid["Location"] = long_df["Location"].iloc[0]
+    return grid[WAREHOUSE_LONG_COLS]
+
+
 def combine_warehouse_projections(sources):
     """Clean and concatenate many warehouse exports into one long frame.
 
@@ -606,12 +867,32 @@ def combine_warehouse_projections(sources):
     path or file-like object and ``name`` is the filename (for region
     detection). Files whose name lacks a region prefix are skipped. Returns an
     empty (but correctly-columned) frame when nothing usable is provided.
+
+    Long-format exports get their missing cells reconstructed against the
+    union of week dates across ALL long files in the snapshot — per-file weeks
+    are not enough: a week in which a small region (e.g. JP) has no
+    projections at all vanishes from that region's file entirely, and its
+    missing cells would otherwise never be flagged. The big regions (US/EU)
+    anchor the union. Wide-grid frames already carry their NaN cells and pass
+    through untouched.
     """
-    frames = []
+    frames, to_reconstruct = [], []
     for source, name in sources:
         long_df, _ = warehouse_wide_to_long(source, name)
-        if long_df is not None:
+        if long_df is None:
+            continue
+        if long_df.attrs.get("needs_grid_reconstruction") and not long_df.empty:
+            to_reconstruct.append(long_df)
+        elif not long_df.attrs.get("needs_grid_reconstruction"):
             frames.append(long_df)
+        # empty long-format frame (headers-only region file): nothing to add.
+
+    if to_reconstruct:
+        weeks = sorted(
+            pd.concat([f["WeekDate"] for f in to_reconstruct]).dropna().unique()
+        )
+        frames.extend(_reconstruct_missing_cells(f, weeks) for f in to_reconstruct)
+
     if not frames:
         return pd.DataFrame(columns=WAREHOUSE_LONG_COLS)
     return pd.concat(frames, ignore_index=True)

@@ -1,10 +1,12 @@
-streamlit
+streamlit>=1.37   # st.fragment(run_every=...) — non-blocking agent progress panel
 pandas
 numpy
 plotly
 openpyxl
+pyarrow
 scikit-learn
 xgboost
+statsmodels
 langgraph
 langchain-core
 langchain-anthropic
@@ -12,3 +14,5 @@ langchain-openai
 python-dotenv
 pyodbc
 tabulate
+# The Plytix channel feed is fetched with stdlib urllib + pandas.read_csv,
+# so no extra HTTP dependency is required here.

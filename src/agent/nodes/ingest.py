@@ -4,8 +4,6 @@ Calls through the ``data_io`` module object (not ``from ... import name``) so
 tests can monkeypatch ``agent.data_io.discover_raw_files`` / ``discover_price_file``.
 """
 
-import pandas as pd
-
 from agent import data_io
 from agent.config import MODEL_OPTIONS
 from agent.logging_util import logger
@@ -14,6 +12,14 @@ from agent.state import AgentState
 
 
 def ingest(state: AgentState) -> dict:
+    # Batch fast path: the batch runner (agent/batch.py) ingests once in the
+    # parent and pre-seeds every per-view state with the cleaned frame + prices,
+    # so skip the read/clean/exclusions and the Plytix fetch entirely — doing
+    # them per view would re-read the snapshot and re-hit the feed ~57×. Normal
+    # single-view runs never set cleaned_df, so this branch is inert for them.
+    if state.get("cleaned_df") is not None:
+        return {}
+
     # Honour a pre-set raw_path (parity tests / reruns pin the input file);
     # otherwise take the newest discovered file, mirroring resolve_input_file().
     raw_path = state.get("raw_path")
@@ -26,17 +32,19 @@ def ingest(state: AgentState) -> dict:
             }
         _, raw_path = files[0]  # newest first
 
-    # Same for the price file — "price_path" explicitly present (even as None)
-    # is respected, so tests can force the no-prices path.
+    # Same for the price source — "price_path" explicitly present (even as None)
+    # is respected, so tests can force the no-prices path. Otherwise default to
+    # the public Plytix channel feed (so the agent tracks the same live data the
+    # dashboard does), falling back to the newest local list-price file.
     if "price_path" in state:
         price_path = state["price_path"]
     else:
-        price_path = data_io.discover_price_file()
+        price_path = data_io.PLYTIX_FEED_URL or data_io.discover_price_file()
 
     # Any model file works to drive _clean's schema (CUSTOMERS_TO_IGNORE /
     # COMBINED_GROUPING are identical across the three model modules today).
     P = load_pipeline(next(iter(MODEL_OPTIONS.values())))
-    raw = pd.read_excel(raw_path, header=2)  # header=2 matches dashboard load_raw_from_path
+    raw = data_io.read_raw_frame(raw_path)  # Parquet sidecar when present, else xlsx
     cleaned = data_io._clean(raw, P)
 
     # Apply the exact same pre-forecast exclusions the dashboard does, so the
@@ -44,7 +52,27 @@ def ingest(state: AgentState) -> dict:
     # region it is not 'Active in'. The Plytix export doubles as the list-price
     # file, so it is read from the same price_path. With no Plytix file the
     # checks degrade to no-ops (bar the trailing-'*' drop), preserving parity.
-    plytix_df = data_io.read_plytix(price_path) if price_path else None
+    # A URL/CSV source (the feed) derives prices from the fetched frame; a local
+    # workbook uses the pipeline's own load_list_prices. If the feed is
+    # unreachable, fall back to the newest local file so the agent still runs.
+    is_feed = isinstance(price_path, str) and (
+        price_path.lower().startswith("http") or price_path.lower().endswith(".csv")
+    )
+    plytix_df = None
+    if price_path:
+        try:
+            plytix_df = data_io.read_plytix(price_path)
+        except Exception as exc:  # network/parse failure on the feed
+            if is_feed:
+                logger.warning(
+                    "Plytix feed fetch failed (%s); falling back to local file.",
+                    exc,
+                )
+                price_path = data_io.discover_price_file()
+                is_feed = False
+                plytix_df = data_io.read_plytix(price_path) if price_path else None
+            else:
+                raise
     today_ts = state.get("today_ts")
     anchors = P.week_anchors(today_ts) if today_ts is not None else None
     excl = data_io.apply_exclusions(cleaned, plytix_df, P, anchors=anchors)
@@ -62,11 +90,12 @@ def ingest(state: AgentState) -> dict:
             excl.n_disc_rows, excl.n_disc_skus,
         )
 
-    prices = (
-        P.load_list_prices(price_path)
-        if price_path and hasattr(P, "load_list_prices")
-        else None
-    )
+    if is_feed:
+        prices = data_io.prices_from_plytix(plytix_df)
+    elif price_path and hasattr(P, "load_list_prices"):
+        prices = P.load_list_prices(price_path)
+    else:
+        prices = None
 
     return {
         "raw_path": raw_path,

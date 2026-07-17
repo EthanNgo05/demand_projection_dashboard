@@ -1,23 +1,25 @@
-# folders
+# Data & generated output (live at the repo root, alongside src/)
 /raw_inputs
 /outputs
+/logs
+/sql
+
+# Docs & exploratory notebooks
 /docs
 /notebooks
 
-# pycache
-__pycache__
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
 
-# logs
-logs.txt
-llm_prompts.log
+# Parquet fast-load sidecars are a regenerable read cache written next to each
+# .xlsx snapshot (raw_inputs is already ignored; this covers the test fixtures,
+# which read_raw_frame backfills on first read).
+tests/fixtures/*.parquet
 
-# secrets
+# Secrets
 .env
 
-
-# local tooling
+# Local tooling
 .claude/
-
-/sql
-
-testing.ipynb

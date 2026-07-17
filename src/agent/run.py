@@ -1,6 +1,6 @@
 """CLI entry point for the agent pipeline.
 
-    python -m agent.run --view "ALL CUSTOMERS (combined)"
+    python -m agent.run --view "All customers (combined)"
     python -m agent.run --view "AMAZON-DC" --provider local
 
 --provider switches the Phase 4 reasoning nodes between the Claude API
@@ -20,7 +20,8 @@ from agent.graph import build_graph
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Run the demand-projection agent pipeline.")
     ap.add_argument("--view", default=ALL_CUSTOMERS_VIEW,
-                    help="Customer Grouping to forecast, or the combined view (default).")
+                    help="Customer Grouping to forecast, the combined view (default), "
+                         "or a per-region rollup like 'All Customers - AU (ACR)'.")
     ap.add_argument("--provider", choices=["anthropic", "local"], default=None,
                     help="LLM provider for the reasoning nodes (overrides LLM_PROVIDER).")
     args = ap.parse_args(argv)
@@ -34,10 +35,10 @@ def main(argv=None) -> int:
         {"view": args.view, "today_ts": pd.Timestamp.today().normalize()}
     )
     for label, r in final_state.get("results", {}).items():
-        mae = r.get("mae")
+        mase = r.get("mase")
         print(
             label, "->", len(r["summary_df"]), "rows,",
-            f"backtest MAE {mae:.2f}" if mae is not None else "backtest MAE n/a",
+            f"backtest MASE {mase:.2f}" if mase is not None else "backtest MASE n/a",
         )
     best = final_state.get("best_model")
     if best is not None:
