@@ -52,6 +52,13 @@ class AgentState(TypedDict, total=False):
     confidence_flag: bool
     anomalies: list[str]
     narrative: Optional[str]
+    # The model the LLM would expect to fit best given the view's demand pattern
+    # (a MODEL_OPTIONS label, or None if it couldn't/didn't pick one), plus a
+    # concise sentence reconciling that expectation with the actual MASE winner
+    # (``best_model``). Set by the summarize / flag_low_confidence reasoning
+    # nodes; None on the --no-llm path. See agent.demand_profile.
+    expected_best_model: Optional[str]
+    model_fit_note: Optional[str]
     # Active SKUs with demand history that fall outside the winning model's
     # history window (e.g. the 8-week moving average drops a SKU whose only
     # sales predate its window). Empty when the winner uses all history. Lets

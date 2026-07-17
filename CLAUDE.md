@@ -51,6 +51,45 @@ Two front-ends run over one shared forecasting core:
 
 Views offered by both front-ends: `All customers (combined)`, one `All Customers - <region>` rollup per region, and every individual Customer Grouping (`agent/batch.py`'s `enumerate_views` mirrors `dashboard.list_views` without importing streamlit).
 
+### The agent pipeline (target architecture)
+
+```
+raw_inputs/*.xlsx (demand) ─┐
+list_prices/*.xlsx (Plytix) ─┤
+                             ▼
+                    ┌─────────────────┐
+                    │     ingest      │  discover files, load, clean, apply Plytix exclusions
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ run_all_models  │  fit all 5 models for the view (serial; see Parallelism)
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ evaluate_models │  one shared walk-forward backtest → pooled MASE per model
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+              ┌─────┤ select_best_model├─────┐   winner = lowest MASE; confidence_flag if MASE > threshold
+              │     └─────────────────┘      │
+   confidence ok                      low confidence / no scoreable backtest
+              ▼                               ▼
+     ┌─────────────────┐            ┌────────────────────┐
+     │ flag_anomalies  │  (LLM)     │ flag_low_confidence │  (LLM)
+     └────────┬────────┘            └──────────┬─────────┘
+              ▼                                 │
+     ┌─────────────────┐                        │   both LLM nodes also emit the
+     │    summarize    │  (LLM)                  │   expected-best-model reasoning
+     └────────┬────────┘                        │   (see below)
+              └────────────────┬────────────────┘
+                               ▼
+                     ┌───────────────────┐
+                     │      publish      │  write outputs/agent_summary_<view>.json + app.log
+                     └───────────────────┘
+```
+
+**Model-fit reasoning (expected vs. actual best model).** `select_best_model` picks the winner purely by lowest backtest MASE. The two LLM nodes (`summarize` and `flag_low_confidence`) additionally record what model the LLM would *expect* to fit best given the view's demand character, reconciled against the MASE winner — so a view that is clearly intermittent yet won by XGBoost surfaces that mismatch rather than hiding it. This is **grounded, not guessed**: `agent/demand_profile.py` deterministically computes Syntetos-Boylan demand-classification features (% zero-weeks, average demand interval / ADI, lumpiness CV², weeks of history, SKU count, and a `smooth/intermittent/erratic/lumpy` `pattern`) and `reasoning._fit_block` folds them plus the per-model MASE table into the *same* LLM call (no extra call per view). The response is pinned to three parseable sections (`EXPECTED_MODEL` / `FIT_NOTE` / `SUMMARY`); `reasoning._parse_model_fit` validates the expected label against `MODEL_OPTIONS` and degrades to plain narrative if a weak local model ignores the format. The publish payload gains `expected_best_model` (a `MODEL_OPTIONS` label or `null`) and `model_fit_note` (a concise expected-vs-actual sentence) alongside `best_model`/`mase_by_model`; both are `null` on `--no-llm` runs. The dashboard's agent section renders the reconciliation via `dashboard._model_fit_callout`.
+
 ### The pipeline contract (most important thing to understand)
 
 Each model file in `src/models/` is **deliberately standalone and self-contained** — shared constants (customer groupings, ignore lists) are **duplicated in every model file on purpose** so a model can be swapped in via `DEMAND_PIPELINE` with no package imports. Both the dashboard and the agent talk to a model through this convention:

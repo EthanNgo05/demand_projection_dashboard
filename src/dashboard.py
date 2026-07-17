@@ -1213,6 +1213,27 @@ def _agent_scores(payload):
     return payload.get("mae_by_model") or {}, False
 
 
+def _model_fit_callout(payload):
+    """(kind, text) for the expected-vs-actual model-fit callout, or None.
+
+    ``kind`` is "info" when the LLM's expected best model differs from the
+    selected (MASE-winning) model — worth a prominent callout — and "caption"
+    for the quieter agree/mismatch-less cases. Returns None when there's nothing
+    to show (older JSONs written before these fields existed). Pure so the render
+    branch is unit-testable without a Streamlit context.
+    """
+    expected = payload.get("expected_best_model")
+    best = payload.get("best_model")
+    note = payload.get("model_fit_note")
+    if expected and best and expected != best:
+        return "info", note or f"Expected best fit: {expected} — {best} won on backtest MASE."
+    if expected and note:
+        return "caption", f"Expected best fit: {expected} (matches the selected model). {note}"
+    if note:
+        return "caption", note
+    return None
+
+
 # Progress markers for the agent run. Keys are LangGraph node names (see
 # agent/graph.py); each maps to (fraction_complete, user-facing label). graph
 # .stream() yields one update per node as it finishes, so we bump the bar to the
@@ -1330,6 +1351,14 @@ def _render_agent_summary(view):
                 st.warning(label + "  —  ⚠️ low confidence")
             else:
                 st.success(label)
+
+        # Expected vs. actual best model: the LLM's a-priori pick from the view's
+        # demand pattern, reconciled against the MASE winner. Guarded so older
+        # summary JSONs (written before these fields existed) render as before.
+        callout = _model_fit_callout(payload)
+        if callout is not None:
+            kind, text = callout
+            (st.info if kind == "info" else st.caption)(text)
 
         # All models' backtest scores side by side, so the user can see how
         # close the call was. Scores come straight from publish.py; a model
