@@ -141,6 +141,15 @@ def pipeline_path():
 
 ALL_CUSTOMERS_VIEW = "All customers (combined)"
 
+# A combined view that, unlike ALL_CUSTOMERS_VIEW (one model over all SKUs
+# summed), forecasts each customer group with ITS OWN backtest-winning model —
+# the model published in that group's agent_summary_<group>.json — and stitches
+# every group's per-SKU rows into one table with a "Model Used" column. It is the
+# "best model per group, combined" table, so it depends on the agent batch having
+# run for every group (the "Agent Summary (all views)" button / `agent.batch`).
+BEST_MODEL_COMBINED_VIEW = "Combined (best model per group)"
+MODEL_USED_COL = "Model Used"
+
 # Per-region rollup views: "All Customers - <region label>" combines every
 # customer group in one region into a single forecast (e.g.
 # "All Customers - AU (ACR)" = Web Sales - AU + Others - AU). The region is
@@ -536,6 +545,132 @@ def start_warehouse_refresh():
 
 
 # --------------------------------------------------------------------------- #
+# Precompute every view's agent summary (agent.batch)                          #
+# --------------------------------------------------------------------------- #
+# The "Run Agent Summary" button above runs the agent for ONE view live. This
+# section runs it for EVERY view (the same work as `python -m agent.batch`),
+# which backtests all models across ~60 views and can take up to an hour. It
+# reuses the demand-refresh pattern — a detached background process plus a lock
+# file — so the page stays usable while it runs; the batch writes each
+# outputs/agent_summary_<view>.json exactly as the nightly job does. We also keep
+# the Popen handle in session_state so the current session detects completion
+# promptly (the lock's stale timeout is only the cross-restart fallback).
+BATCH_STALE_SECONDS = 90 * 60  # generous: a full LLM batch can approach an hour.
+
+
+def _batch_lock_path():
+    """Lock file marking an in-flight all-views batch, kept under outputs/."""
+    return os.path.join(REPO_ROOT, "outputs", ".agent_batch.lock")
+
+
+def _batch_log_path():
+    """Today's batch log: ``logs/<date>/logs_agent_batch.txt`` (computed per call
+    so a long-running dashboard files each run under the day it ran)."""
+    return dated_log_path("logs_agent_batch.txt")
+
+
+def _batch_result_line():
+    """The last 'Done: N ok, M failed …' line from the batch log, or None.
+
+    Lets the completion toast report the outcome without the batch signalling
+    back into this process. Best-effort: any read error just yields None.
+    """
+    try:
+        with open(_batch_log_path(), encoding="utf-8") as f:
+            done = [ln.strip() for ln in f if ln.strip().startswith("Done:")]
+        return done[-1] if done else None
+    except OSError:
+        return None
+
+
+def batch_in_progress():
+    """(running, started_str): is the all-views batch active, and when it began.
+
+    Self-healing like _refresh_state, but completion is detected two ways:
+      * the Popen handle we kept this session has exited (prompt, same-session), or
+      * the lock is older than BATCH_STALE_SECONDS (cross-restart / crash fallback).
+    """
+    lock_path = _batch_lock_path()
+    if not os.path.exists(lock_path):
+        return False, None
+    lock_mtime = os.path.getmtime(lock_path)
+
+    proc = st.session_state.get("agent_batch_proc")
+    if proc is not None and proc.poll() is not None:
+        _clear_lock(lock_path)
+        return False, None
+
+    if time.time() - lock_mtime > BATCH_STALE_SECONDS:
+        logger.warning("Agent-batch lock is stale (>%ds); clearing it.",
+                       BATCH_STALE_SECONDS)
+        _clear_lock(lock_path)
+        return False, None
+
+    try:
+        with open(lock_path, encoding="utf-8") as f:
+            started = f.read().strip()
+    except OSError:
+        started = ""
+    return True, started
+
+
+def start_agent_batch(provider):
+    """Launch `python -m agent.batch` in the background. Returns (ok, message).
+
+    Reuses THIS interpreter/venv and inherits the environment; ``provider`` pins
+    the reasoning LLM (LLM_PROVIDER) for the run. The lock is written BEFORE
+    launching so a double-click can't spawn two batches. Output is appended to
+    logs/<date>/logs_agent_batch.txt; the Popen handle is stored in session_state
+    so this session detects completion without waiting for the stale timeout.
+    """
+    running, started = batch_in_progress()
+    if running:
+        return False, f"An agent batch is already running (started {started})."
+
+    lock_path = _batch_lock_path()
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(lock_path, "w", encoding="utf-8") as f:
+        f.write(now)
+
+    try:
+        env = {**os.environ, "LLM_PROVIDER": provider}
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        logf = open(_batch_log_path(), "a", encoding="utf-8")
+        try:
+            logf.write(f"\n===== Agent batch (all views) started {now} =====\n")
+            logf.flush()
+            # `-m agent.batch` resolves because cwd=HERE is src/ (agent is a
+            # package under src/). Provider is also passed as a flag so a stale
+            # env can't override it.
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "agent.batch", "--provider", provider],
+                cwd=HERE,
+                env=env,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                close_fds=True,
+            )
+        finally:
+            logf.close()
+    except Exception as exc:
+        _clear_lock(lock_path)
+        logger.exception("Failed to launch agent batch")
+        return False, f"Could not start agent batch: {exc}"
+
+    st.session_state["agent_batch_proc"] = proc
+    st.session_state["agent_batch_started"] = now
+    logger.info("Agent batch launched (%s, provider=%s)", now, provider)
+    return True, now
+
+
+# --------------------------------------------------------------------------- #
 # Plytix-based SKU exclusions live in agent/data_io.py (streamlit-free) so the #
 # dashboard and the agent's ingest node drop the EXACT same rows before        #
 # forecasting: a SKU is never projected or flagged when it is discontinued/    #
@@ -827,6 +962,194 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
     if not frames:
         return None
     return pd.concat(frames, ignore_index=True)
+
+
+def _agent_summaries_mtime():
+    """Newest mtime among outputs/agent_summary_*.json, or 0.0 if none exist.
+
+    Folded into the combined view's cache signature so the table rebuilds
+    automatically as soon as a batch (the "Agent Summary (all views)" button, the
+    nightly job, or `agent.batch`) writes fresh summaries — no manual reload."""
+    paths = glob.glob(os.path.join(REPO_ROOT, "outputs", "agent_summary_*.json"))
+    return max((os.path.getmtime(p) for p in paths), default=0.0)
+
+
+def _best_model_for_group(group):
+    """(label, model_path) for a group's backtest-winning model, or None.
+
+    Reads the group's published agent summary (agent_summary_<group>.json) and
+    maps its ``best_model`` label to a MODEL_OPTIONS file path. Returns None when
+    the summary is missing, has no best model, or names a label this deployment
+    doesn't offer — the caller treats all three as "no summary yet".
+    """
+    payload = _load_agent_summary(group)
+    if not payload:
+        return None
+    label = payload.get("best_model")
+    path = MODEL_OPTIONS.get(label)
+    if not label or path is None:
+        return None
+    return label, path
+
+
+def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
+                             progress_cb=None):
+    """Per-(SKU, Customer Grouping) summary using each group's BEST model.
+
+    Like ``compute_by_customer``, but instead of one model for every group it
+    forecasts each group with the model that won that group's backtest (from
+    ``agent_summary_<group>.json``) and stamps a ``MODEL_USED_COL`` column. To
+    match what the single-group view shows, groups whose best model supports
+    autofit are tuned per group via ``run_autofit`` before forecasting.
+
+    Requires every group to have a published summary (the "Agent Summary (all
+    views)" batch). If any group is missing one, returns the sentinel
+    ``("MISSING", [group, ...])`` so the caller can prompt the user to run the
+    batch rather than silently falling back to some other model.
+
+    Returns a DataFrame (SUMMARY_COLUMNS + MODEL_USED_COL), the MISSING sentinel,
+    or None if no group produced any rows.
+    """
+    groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
+
+    # First pass: every group must have a resolvable best model.
+    resolved = {}
+    missing = []
+    for group in groups:
+        best = _best_model_for_group(group)
+        if best is None:
+            missing.append(group)
+        else:
+            resolved[group] = best
+    if missing:
+        return ("MISSING", missing)
+
+    # Second pass: forecast each group with its own model (autofit when supported).
+    frames = []
+    n_groups = len(groups)
+    for i, group in enumerate(groups):
+        label, path = resolved[group]
+        sub = df[df["Customer Grouping"] == group]
+        alpha = beta = phi = None
+        P = load_pipeline(path)
+        if _supports_autofit(P):
+            fitted = run_autofit(df, group, today_ts, path, min_weeks)
+            if fitted:
+                alpha, beta, phi = fitted.get("alpha"), fitted.get("beta"), fitted.get("phi")
+        summary = _forecast_one_group(
+            sub, today_ts, path, group, prices, alpha, beta, phi, min_weeks,
+        )
+        if summary is not None and not summary.empty:
+            summary = summary.copy()
+            summary[MODEL_USED_COL] = label
+            frames.append(summary)
+        if progress_cb is not None:
+            progress_cb(i + 1, n_groups, group)
+
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    # Surface the model used right after the customer group for readability.
+    if "Customer Grouping" in combined.columns:
+        cols = [c for c in combined.columns if c != MODEL_USED_COL]
+        pos = cols.index("Customer Grouping") + 1
+        cols.insert(pos, MODEL_USED_COL)
+        combined = combined[cols]
+    return combined
+
+
+def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows):
+    """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
+
+    Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
+    handles the "run the batch first" case, and renders the table + a model-usage
+    line + a download. Called from main() in place of the single-model page body.
+    The page title is already rendered by main() before this branch, so we start
+    at the section subheader to avoid showing it twice.
+    """
+    st.subheader("Combined — best model per customer group")
+    st.caption(
+        "Each customer group is forecast with its own backtest-winning model "
+        "(from the latest agent summaries) and stitched into one table. The "
+        "sidebar model choice does not apply to this view."
+    )
+
+    # Cache on a structural signature so search-box reruns don't rebuild it. The
+    # agent-summaries mtime is part of the signature so the table rebuilds as soon
+    # as a batch writes fresh summaries (e.g. right after "Agent Summary (all
+    # views)" finishes) — without it a stale "run the batch first" result would
+    # linger in this session until an unrelated structural change.
+    price_marker = None if prices is None else int(len(prices))
+    sig = (BEST_MODEL_COMBINED_VIEW, today_str, price_marker, n_excluded_rows,
+           _agent_summaries_mtime())
+    if st.session_state.get("bestmix_structural") != sig:
+        prog = st.progress(0.0, text="Preparing…")
+        try:
+            def _bump(done, total, group):
+                prog.progress(
+                    min(0.05 + 0.93 * done / max(total, 1), 0.98),
+                    text=f"Forecasting each group with its best model… "
+                         f"({done}/{total})",
+                )
+            result = compute_by_customer_best(
+                df, today_ts, prices, min_weeks=None, progress_cb=_bump,
+            )
+            prog.progress(1.0, text="Done")
+        finally:
+            prog.empty()
+        st.session_state["bestmix_result"] = result
+        st.session_state["bestmix_structural"] = sig
+    else:
+        result = st.session_state.get("bestmix_result")
+
+    # Missing summaries → require the batch first (no silent fallback).
+    if isinstance(result, tuple) and result and result[0] == "MISSING":
+        missing = result[1]
+        st.warning(
+            f"{len(missing)} customer group(s) have no agent summary yet, so a "
+            "best model can't be chosen for them. Click **Agent Summary (all "
+            "views)** in the sidebar (or run `python -m agent.batch`), then "
+            "reopen this view."
+        )
+        with st.expander(f"Groups missing a summary ({len(missing)})"):
+            st.write(", ".join(missing))
+        return
+
+    if result is None or getattr(result, "empty", True):
+        st.info("No per-group forecasts to show for this snapshot.")
+        return
+
+    # Model-usage summary: how many groups each model won.
+    counts = (
+        result.drop_duplicates("Customer Grouping")[MODEL_USED_COL].value_counts()
+    )
+    parts = ", ".join(f"{m} ×{c}" for m, c in counts.items())
+    st.caption(f"{int(counts.sum())} groups — {parts}")
+
+    # Keep each SKU's rows together; largest revenue risk first when present.
+    if RISK_COL in result.columns and result[RISK_COL].notna().any():
+        table = (
+            result.assign(_abs=result[RISK_COL].abs())
+            .sort_values(["SKU", "_abs"], ascending=[True, False], na_position="last")
+            .drop(columns="_abs").reset_index(drop=True)
+        )
+        st.caption("Each SKU broken out by customer group; within a SKU, "
+                   "largest revenue risk first (by magnitude).")
+    else:
+        table = result.sort_values(["SKU", "Customer Grouping"]).reset_index(drop=True)
+        st.caption("Each SKU broken out by customer group.")
+
+    st.dataframe(
+        style_summary(search_filter(table, key="search_best_mix")),
+        width="stretch", hide_index=True,
+    )
+    st.download_button(
+        "⬇️ Download the combined best-model table",
+        data=summary_to_excel(table),
+        file_name=f"Combined_best_model_demand_projections_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_best_mix",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1234,6 +1557,32 @@ def _model_fit_callout(payload):
     return None
 
 
+@st.dialog("Run agent summary for every view?")
+def _confirm_run_all_dialog(provider):
+    """Confirmation modal for the all-views batch (it can take up to an hour)."""
+    st.write(
+        "This backtests all models and writes an LLM narrative for **every** "
+        "view — the combined view, each regional rollup, and every customer "
+        "group (~60 views)."
+    )
+    st.warning(
+        "It runs in the background and can take **up to 1 hour**. You can keep "
+        "using the dashboard while it runs; each view's summary updates as it "
+        "finishes. Results land in outputs/agent_summary_<view>.json."
+    )
+    left, right = st.columns(2)
+    if left.button("Cancel", key="confirm_batch_cancel", width="stretch"):
+        st.rerun()
+    if right.button("Run all views", key="confirm_batch_go",
+                    type="primary", width="stretch"):
+        ok, msg = start_agent_batch(provider)
+        if ok:
+            st.session_state["_batch_toast"] = f"Agent batch started ({msg})."
+        else:
+            st.session_state["_batch_toast"] = f"⚠️ {msg}"
+        st.rerun()
+
+
 # Progress markers for the agent run. Keys are LangGraph node names (see
 # agent/graph.py); each maps to (fraction_complete, user-facing label). graph
 # .stream() yields one update per node as it finishes, so we bump the bar to the
@@ -1519,22 +1868,26 @@ def main():
     st.title("📦 Demand Projection Dashboard")
     # Header caption: the pipeline can supply its own (DASHBOARD_CAPTION, e.g.
     # the XGBoost pipeline); otherwise fall back to the smoothing-aware blurbs.
+    # It describes the *selected* model, so render it into a slot we fill only
+    # once the view is known — the combined best-model view uses a different model
+    # per group, so it suppresses this caption (and supplies its own).
     caption = getattr(P, "DASHBOARD_CAPTION", None)
     if caption:
-        st.caption(caption)
+        header_caption = caption
     elif _supports_smoothing(P):
-        st.caption(
+        header_caption = (
             "15-week Holt damped-trend forecast from the historical demand "
             "window (POS where available, else Orders). Smoothing (α/β/φ) is "
             "autofitted per view by backtesting."
         )
     else:
         tw = getattr(P, "TREND_WEIGHT", None)
-        st.caption(
+        header_caption = (
             "15-week forecasts from the historical demand window "
             "(POS where available, else Orders"
             + (f"; trend weight = {tw})." if tw is not None else ").")
         )
+    _header_caption_slot = st.empty()
 
     # ----- Data source -----------------------------------------------------
     with st.sidebar:
@@ -1886,10 +2239,18 @@ def main():
         st.header("View")
         by_region = list_views(df)
         scope = st.radio(
-            "Scope", [ALL_CUSTOMERS_VIEW, "By region"], index=0
+            "Scope",
+            [ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, "By region"],
+            index=0,
+            help="“Combined (best model per group)” forecasts each customer "
+                 "group with its own backtest-winning model (from the agent "
+                 "summaries) and stitches them into one table.",
         )
         if scope == ALL_CUSTOMERS_VIEW:
             view = ALL_CUSTOMERS_VIEW
+            region = None
+        elif scope == BEST_MODEL_COMBINED_VIEW:
+            view = BEST_MODEL_COMBINED_VIEW
             region = None
         else:
             # key=str: a custom pipeline's region_for_group may return non-string
@@ -1905,6 +2266,12 @@ def main():
                 "Customer group", [all_view] + by_region[region],
                 format_func=lambda v: f"All Customers - {region}" if v == all_view else v,
             )
+
+    # Now that the view is known, fill the header caption — except for the
+    # combined best-model view, which uses a different model per group (so the
+    # selected-model blurb would mislead) and renders its own caption instead.
+    if view != BEST_MODEL_COMBINED_VIEW:
+        _header_caption_slot.caption(header_caption)
 
     # ----- Agent summary (LangGraph pipeline) ------------------------------
     # Button-triggered only: invoking the graph backtests all three models AND
@@ -1929,14 +2296,51 @@ def main():
         )
         if anthropic_no_key:
             st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the agent.")
+        # The combined best-model view isn't a single agent view — it reads the
+        # per-group summaries. Steer the user to the all-views batch instead.
+        single_view_agent = view != BEST_MODEL_COMBINED_VIEW
+        if not single_view_agent:
+            st.caption("This view combines every group's best model — use "
+                       "**Agent Summary (all views)** below to (re)generate them.")
         run_agent = st.button(
             "Run Agent Summary",
             key="run_agent_summary",
-            disabled=anthropic_no_key,
+            disabled=anthropic_no_key or not single_view_agent,
             help="Backtests all models for this view, picks the best, and writes "
                  "an LLM narrative + flagged anomalies. Slow/expensive — runs "
                  "only when you click, never on a normal rerun.",
         )
+
+        # All-views batch (same work as `python -m agent.batch`). Detached
+        # background process; while it runs the button becomes a status check.
+        batch_running, batch_started = batch_in_progress()
+        if batch_running:
+            st.info(f"⏳ Running agent summary for all views… started "
+                    f"{batch_started or '?'}. Runs in the background — "
+                    "see logs/<date>/logs_agent_batch.txt.")
+            if st.button("Check progress", key="check_agent_batch"):
+                st.rerun()
+        else:
+            # A just-finished batch (this session): surface its outcome once.
+            proc = st.session_state.get("agent_batch_proc")
+            if proc is not None and proc.poll() is not None:
+                line = _batch_result_line() or "Agent batch finished."
+                st.session_state["_batch_toast"] = line
+                st.session_state.pop("agent_batch_proc", None)
+            run_all = st.button(
+                "Agent Summary (all views)",
+                key="run_agent_all",
+                disabled=anthropic_no_key,
+                help="Backtests all models for EVERY view and writes each "
+                     "agent_summary_<view>.json. Runs ~60 views — can take up "
+                     "to 1 hour. Asks for confirmation first.",
+            )
+            if run_all:
+                _confirm_run_all_dialog(LLM_PROVIDERS[provider_label])
+
+    # Surface batch start/finish toasts once (set from the dialog / poll above).
+    if "_batch_toast" in st.session_state:
+        st.toast(st.session_state.pop("_batch_toast"))
 
     if run_agent:
         # Kick off the pipeline on a background thread and rerun immediately, so
@@ -1995,6 +2399,14 @@ def main():
     # has run the agent on this session — clicking is what reveals it.
     if view in st.session_state.get("agent_ran_views", set()):
         _render_agent_summary(view)
+
+    # ----- Combined best-model-per-group view ------------------------------
+    # This view has no single model, so it skips the smoothing sidebar, the
+    # single-model compute, and the charts/KPIs below entirely: it renders the
+    # stitched per-group best-model table and stops.
+    if view == BEST_MODEL_COMBINED_VIEW:
+        _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows)
+        st.stop()
 
     # ----- Model parameters (Holt damped-trend smoothing) ------------------
     # Parameters are hidden from the UI entirely: Holt always uses autofitted
