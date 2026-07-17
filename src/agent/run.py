@@ -35,10 +35,10 @@ def main(argv=None) -> int:
         {"view": args.view, "today_ts": pd.Timestamp.today().normalize()}
     )
     for label, r in final_state.get("results", {}).items():
-        mae = r.get("mae")
+        mase = r.get("mase")
         print(
             label, "->", len(r["summary_df"]), "rows,",
-            f"backtest MAE {mae:.2f}" if mae is not None else "backtest MAE n/a",
+            f"backtest MASE {mase:.2f}" if mase is not None else "backtest MASE n/a",
         )
     best = final_state.get("best_model")
     if best is not None:

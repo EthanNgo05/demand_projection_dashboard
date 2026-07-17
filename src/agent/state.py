@@ -33,7 +33,7 @@ class ModelResult(TypedDict, total=False):
     summary_df: pd.DataFrame
     weekly_df: pd.DataFrame
     agg: pd.DataFrame
-    mae: float  # comparison score from the shared _generic_backtest
+    mase: float  # comparison score from the shared _generic_backtest (pooled MASE vs an 8-week-average baseline)
     autofit_mae: float  # ES autofit internal MAE (audit only, NOT comparable)
     baseline_mae: float
     params: dict  # alpha/beta/phi if applicable
@@ -48,10 +48,17 @@ class AgentState(TypedDict, total=False):
     prices: Optional[pd.Series]
     results: dict[str, ModelResult]  # keyed by MODEL_OPTIONS label
     best_model: Optional[str]
-    mae_confidence_threshold: Optional[float]  # per-run override; select falls back to config
+    mase_confidence_threshold: Optional[float]  # per-run override; select falls back to config
     confidence_flag: bool
     anomalies: list[str]
     narrative: Optional[str]
+    # The model the LLM would expect to fit best given the view's demand pattern
+    # (a MODEL_OPTIONS label, or None if it couldn't/didn't pick one), plus a
+    # concise sentence reconciling that expectation with the actual MASE winner
+    # (``best_model``). Set by the summarize / flag_low_confidence reasoning
+    # nodes; None on the --no-llm path. See agent.demand_profile.
+    expected_best_model: Optional[str]
+    model_fit_note: Optional[str]
     # Active SKUs with demand history that fall outside the winning model's
     # history window (e.g. the 8-week moving average drops a SKU whose only
     # sales predate its window). Empty when the winner uses all history. Lets

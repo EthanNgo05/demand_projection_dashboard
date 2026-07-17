@@ -87,7 +87,13 @@ def publish(state: AgentState) -> dict:
         "view": view,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "best_model": best,
-        "mae_by_model": {k: v.get("mae") for k, v in results.items()},
+        "mase_by_model": {k: v.get("mase") for k, v in results.items()},
+        # The model the LLM would expect to fit best given this view's demand
+        # pattern (a MODEL_OPTIONS label or None), plus a concise sentence
+        # reconciling that with the actual MASE winner above. None on --no-llm
+        # runs. See agent.demand_profile + reasoning._fit_block.
+        "expected_best_model": state.get("expected_best_model"),
+        "model_fit_note": state.get("model_fit_note"),
         "narrative": state.get("narrative"),
         "anomalies": state.get("anomalies", []),
         # SKUs the winning model omits for having no demand inside its window
@@ -111,7 +117,7 @@ def publish(state: AgentState) -> dict:
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             f"{datetime.now():%Y-%m-%d %H:%M:%S}  AGENT     [{view}] "
-            f"best={best} mae={payload['mae_by_model'].get(best)} -> {path}\n"
+            f"best={best} mase={payload['mase_by_model'].get(best)} -> {path}\n"
         )
 
     return {"window_excluded_skus": window_excluded}

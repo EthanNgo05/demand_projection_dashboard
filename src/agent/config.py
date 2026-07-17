@@ -23,6 +23,7 @@ MODEL_OPTIONS = {
     "Holt's (double) exponential smoothing": os.path.join(HERE, "models/exponential_smoothing.py"),
     "Holt-Winters (triple) exponential smoothing": os.path.join(HERE, "models/holt_winters.py"),
     "XGBoost": os.path.join(HERE, "models/xgboost.py"),
+    "TSB (intermittent demand)": os.path.join(HERE, "models/tsb.py"),
 }
 # dashboard.py also supports an optional DEMAND_PIPELINE env override and
 # filters out non-existent paths (dashboard.py:90-101) — mirror the existence
@@ -61,16 +62,20 @@ def region_all_view(region):
     """
     return f"{REGION_ALL_PREFIX}{region}"
 
-# Phase 3 calibration (2026-07-08, all_demand_projections_2026-07-07.xlsx):
-# ran evaluate/select across all 48 real views (ALL + 47 groupings). Winning
-# backtest MAEs (shared 6-week single-holdout, raw actuals): p50=7.7, p80=39.1,
-# p90=70.9, max=1208 (one huge-volume view; MAE is unit-scaled, so the largest
-# views dominate the tail). Threshold set at the ~80th percentile per the
-# Phase 3 plan -- flags the worst ~20% of views (incl. the combined view when
-# it backtests poorly) without drowning Phase 4 in false alarms. 7 tiny views
-# produced no backtestable holdout at all; they get flagged via best_model=None
-# regardless of this value. Revisit once MAE is normalised per-view (e.g. MASE).
-MAE_CONFIDENCE_THRESHOLD = 40
+# The comparison score is a pooled MASE: the winning model's pooled backtest
+# MAE divided by the pooled MAE of a plain 8-week moving average of each SKU's
+# actuals over the same points (see evaluate._generic_backtest). Scale-free
+# across views, so one threshold fits the huge combined view and the tiny
+# groupings alike. 1.0 = "no better than the 8-week average of actuals".
+# MASE calibration (2026-07-16, all_demand_projections_2026-07-16.xlsx, 5
+# models incl. TSB): agent.batch --no-llm across all 70 views. Winning MASEs
+# over the 43 backtestable views: p50=0.91, p80=1.00, p90=1.11, max=5.50 --
+# so the semantic anchor (worse than the 8-week average) IS the ~80th
+# percentile, flagging 9/43 (~20%) of views, the same flag rate the old
+# unit-scaled MAE threshold (40) was tuned for. 27 tiny views produced no
+# backtestable holdout at all; they get flagged via best_model=None
+# regardless of this value.
+MASE_CONFIDENCE_THRESHOLD = 1.0
 
 # --- Phase 4: LLM provider selection ---------------------------------------
 # "anthropic" = Claude API (needs ANTHROPIC_API_KEY in .env)

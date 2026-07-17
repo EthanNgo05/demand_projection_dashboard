@@ -22,7 +22,7 @@ pip install -r requirements.txt
 streamlit run src/dashboard.py
 
 # Batch forecast (each model file is also a standalone script; writes per-group + combined .xlsx to outputs/)
-python src/models/exponential_smoothing.py   # or regression.py / holt_winters.py / xgboost.py
+python src/models/exponential_smoothing.py   # or regression.py / holt_winters.py / xgboost.py / tsb.py
 
 # Warehouse pulls (or the scheduled wrapper for all three nightly steps: ./refresh_demand_data.ps1)
 python src/extract_demand_details.py          # ~10 min full 36-month pull -> dated all_demand_projections_<date>.xlsx + .parquet sidecar
@@ -51,6 +51,45 @@ Two front-ends run over one shared forecasting core:
 
 Views offered by both front-ends: `All customers (combined)`, one `All Customers - <region>` rollup per region, and every individual Customer Grouping (`agent/batch.py`'s `enumerate_views` mirrors `dashboard.list_views` without importing streamlit).
 
+### The agent pipeline (target architecture)
+
+```
+raw_inputs/*.xlsx (demand) ─┐
+list_prices/*.xlsx (Plytix) ─┤
+                             ▼
+                    ┌─────────────────┐
+                    │     ingest      │  discover files, load, clean, apply Plytix exclusions
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ run_all_models  │  fit all 5 models for the view (serial; see Parallelism)
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ evaluate_models │  one shared walk-forward backtest → pooled MASE per model
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+              ┌─────┤ select_best_model├─────┐   winner = lowest MASE; confidence_flag if MASE > threshold
+              │     └─────────────────┘      │
+   confidence ok                      low confidence / no scoreable backtest
+              ▼                               ▼
+     ┌─────────────────┐            ┌────────────────────┐
+     │ flag_anomalies  │  (LLM)     │ flag_low_confidence │  (LLM)
+     └────────┬────────┘            └──────────┬─────────┘
+              ▼                                 │
+     ┌─────────────────┐                        │   both LLM nodes also emit the
+     │    summarize    │  (LLM)                  │   expected-best-model reasoning
+     └────────┬────────┘                        │   (see below)
+              └────────────────┬────────────────┘
+                               ▼
+                     ┌───────────────────┐
+                     │      publish      │  write outputs/agent_summary_<view>.json + app.log
+                     └───────────────────┘
+```
+
+**Model-fit reasoning (expected vs. actual best model).** `select_best_model` picks the winner purely by lowest backtest MASE. The two LLM nodes (`summarize` and `flag_low_confidence`) additionally record what model the LLM would *expect* to fit best given the view's demand character, reconciled against the MASE winner — so a view that is clearly intermittent yet won by XGBoost surfaces that mismatch rather than hiding it. This is **grounded, not guessed**: `agent/demand_profile.py` deterministically computes Syntetos-Boylan demand-classification features (% zero-weeks, average demand interval / ADI, lumpiness CV², weeks of history, SKU count, and a `smooth/intermittent/erratic/lumpy` `pattern`) and `reasoning._fit_block` folds them plus the per-model MASE table into the *same* LLM call (no extra call per view). The response is pinned to three parseable sections (`EXPECTED_MODEL` / `FIT_NOTE` / `SUMMARY`); `reasoning._parse_model_fit` validates the expected label against `MODEL_OPTIONS` and degrades to plain narrative if a weak local model ignores the format. The publish payload gains `expected_best_model` (a `MODEL_OPTIONS` label or `null`) and `model_fit_note` (a concise expected-vs-actual sentence) alongside `best_model`/`mase_by_model`; both are `null` on `--no-llm` runs. The dashboard's agent section renders the reconciliation via `dashboard._model_fit_callout`.
+
 ### The pipeline contract (most important thing to understand)
 
 Each model file in `src/models/` is **deliberately standalone and self-contained** — shared constants (customer groupings, ignore lists) are **duplicated in every model file on purpose** so a model can be swapped in via `DEMAND_PIPELINE` with no package imports. Both the dashboard and the agent talk to a model through this convention:
@@ -60,14 +99,15 @@ Each model file in `src/models/` is **deliberately standalone and self-contained
 
 The dashboard **introspects `fit_regression`'s signature** to decide which sidebar controls to show: `alpha`/`beta`/`phi` args → smoothing sliders; `min_weeks_for_trend` → min-weeks slider; `list_prices` → revenue-risk columns; an `autofit_smoothing` function → the Autofit button. This is why XGBoost's sliders hide automatically — its signature carries no smoothing params.
 
-**⚠️ If you change the customer groupings or ignore lists, edit all four model files identically** (`regression.py`, `exponential_smoothing.py`, `holt_winters.py`, `xgboost.py`). `src/agent/data_io.py`'s `_clean` is the shared cleaning step and must stay in sync too (see the sync comment in `regression.py`'s `__main__`).
+**⚠️ If you change the customer groupings or ignore lists, edit all five model files identically** (`regression.py`, `exponential_smoothing.py`, `holt_winters.py`, `xgboost.py`, `tsb.py`). `src/agent/data_io.py`'s `_clean` is the shared cleaning step and must stay in sync too (see the sync comment in `regression.py`'s `__main__`).
 
-### The four models (`src/models/`)
+### The five models (`src/models/`)
 
 - **`regression.py`** — 8-week moving average nudged by a dampened linear-regression slope (`TREND_WEIGHT = 0.25`). Labeled "8-Week Moving Average" in the UI.
 - **`exponential_smoothing.py`** — Holt's double exponential smoothing (level + trend, damped by `PHI`). The only model with outlier cleansing, promo uplift, and an `autofit_smoothing` grid search.
 - **`holt_winters.py`** — Holt-Winters triple exponential smoothing: level + damped trend + **additive seasonality** (`SEASONAL_PERIODS = 52`, annual), fit via `statsmodels` (self-tunes α/β/γ/φ, so no smoothing sliders/autofit, like XGBoost). Labeled "Holt-Winters (triple) exponential smoothing". Needs ≥2 full annual cycles (`MIN_WEEKS_FOR_SEASONAL = 104`); short-history SKUs and non-converging fits fall back to non-seasonal damped Holt. Reuses `exponential_smoothing.py`'s cleansing / window / flatten-to-week-1 behaviour. By far the slowest model — this shapes the parallelism design below.
 - **`xgboost.py`** — gradient-boosted trees, **pooled per Customer Grouping** (SKU histories are too short to train per-SKU), each SKU scaled by its own mean, forecast 15 weeks recursively. Falls back to sklearn's `HistGradientBoostingRegressor` if `xgboost` isn't installed.
+- **`tsb.py`** — TSB (Teunter–Syntetos–Babai) for intermittent/lumpy demand (the majority of SKUs here): a smoothed demand *probability* (updated every week, so dead SKUs decay to 0) × a smoothed demand *size* (updated on non-zero weeks); forecast = probability × size, an intrinsically flat rate. Fixed `ALPHA_P`/`ALPHA_Z`, no sliders/autofit (like XGBoost); `FILL_GAPS_WITH_ZERO` must stay True (zeros are TSB's signal). Labeled "TSB (intermittent demand)".
 
 ### Parallelism model (`src/agent/batch.py`)
 

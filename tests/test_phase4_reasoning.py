@@ -106,7 +106,22 @@ def test_summarize_feeds_anomalies_into_prompt(fake_llm, sample_state_with_summa
     state = dict(sample_state_with_summary, anomalies=["- SKU-001 tripled"])
     summarize(state)
     assert "- SKU-001 tripled" in model.prompts[0]
-    assert "12.3" in model.prompts[0]  # the backtest MAE reaches the prompt
+    assert "1.23" in model.prompts[0]  # the backtest MASE reaches the prompt
+
+
+def test_low_confidence_prompt_falls_back_to_config_threshold(
+    fake_llm, sample_state_with_summary
+):
+    # No per-run threshold in state -> the prompt must carry the config value
+    # (guards against reintroducing a hardcoded default that drifts from
+    # select's fallback).
+    from agent import config
+
+    model = fake_llm(["low confidence explanation"])
+    state = dict(sample_state_with_summary, confidence_flag=True)
+    assert "mase_confidence_threshold" not in state
+    flag_low_confidence(state)
+    assert str(config.MASE_CONFIDENCE_THRESHOLD) in model.prompts[0]
 
 
 # ---------------------------------------------------------------------------
