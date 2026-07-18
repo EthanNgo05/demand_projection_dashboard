@@ -150,6 +150,15 @@ ALL_CUSTOMERS_VIEW = "All customers (combined)"
 BEST_MODEL_COMBINED_VIEW = "Combined (best model per group)"
 MODEL_USED_COL = "Model Used"
 
+# Friendly labels shown in the Scope selector. The keys are the stable internal
+# view IDs (also the agent-summary filenames / agent config), so we rename only
+# what the planner sees, never the ID.
+SCOPE_LABELS = {
+    ALL_CUSTOMERS_VIEW: "Company total",
+    BEST_MODEL_COMBINED_VIEW: "Best model per customer group",
+    "By region": "By region",
+}
+
 # Per-region rollup views: "All Customers - <region label>" combines every
 # customer group in one region into a single forecast (e.g.
 # "All Customers - AU (ACR)" = Web Sales - AU + Others - AU). The region is
@@ -1070,11 +1079,11 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     page title is already rendered by main() before this branch, so we start at the
     section subheader to avoid showing it twice.
     """
-    st.subheader("Combined — best model per customer group")
+    st.subheader("Best model per customer group")
     st.caption(
-        "Each customer group is forecast with its own backtest-winning model "
-        "(from the latest agent summaries) and stitched into one table. The "
-        "sidebar model choice does not apply to this view."
+        "Each customer group is forecast with its own most-accurate model "
+        "(from the latest model-analysis recommendations) and stitched into one "
+        "table. The sidebar model choice does not apply to this view."
     )
 
     # Cache on a structural signature so search-box reruns don't rebuild it. The
@@ -1122,8 +1131,8 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     # No group had a resolvable best model → prompt to run the batch.
     if combined is None or getattr(combined, "empty", True):
         st.warning(
-            "No customer group has a backtest-winning model yet. Click **Agent "
-            "Summary (all views)** in the sidebar (or run `python -m "
+            "No customer group has a recommended model yet. Click **Recommend "
+            "models (all views)** in the sidebar (or run `python -m "
             "agent.batch`), then reopen this view."
         )
         _render_excluded("Groups without a best model")
@@ -1569,27 +1578,28 @@ def _model_fit_callout(payload):
     return None
 
 
-@st.dialog("Run agent summary for every view?")
+@st.dialog("Recommend a best model for every view?")
 def _confirm_run_all_dialog(provider):
-    """Confirmation modal for the all-views batch (it can take up to an hour)."""
+    """Confirmation modal for the all-views run (it can take up to an hour)."""
     st.write(
-        "This backtests all models and writes an LLM narrative for **every** "
-        "view — the combined view, each regional rollup, and every customer "
-        "group (~60 views)."
+        "This backtests all models and recommends the most accurate one, plus an "
+        "AI summary, for **every** view — the company total, each regional "
+        "rollup, and every customer group (~60 views)."
     )
     st.warning(
         "It runs in the background and can take **up to 1 hour**. You can keep "
-        "using the dashboard while it runs; each view's summary updates as it "
-        "finishes. Results land in outputs/agent_summary_<view>.json."
+        "using the dashboard while it runs; each view's recommendation updates as "
+        "it finishes, and the **Best model per customer group** view fills in as "
+        "groups complete."
     )
     left, right = st.columns(2)
     if left.button("Cancel", key="confirm_batch_cancel", width="stretch"):
         st.rerun()
-    if right.button("Run all views", key="confirm_batch_go",
+    if right.button("Recommend all views", key="confirm_batch_go",
                     type="primary", width="stretch"):
         ok, msg = start_agent_batch(provider)
         if ok:
-            st.session_state["_batch_toast"] = f"Agent batch started ({msg})."
+            st.session_state["_batch_toast"] = f"Model analysis started ({msg})."
         else:
             st.session_state["_batch_toast"] = f"⚠️ {msg}"
         st.rerun()
@@ -1676,7 +1686,7 @@ def _agent_progress_fragment():
         elapsed_txt = f"  ·  {secs // 60}:{secs % 60:02d} elapsed"
     st.progress(
         min(float(job.get("progress", 0.0)), 1.0),
-        text=f"Running agent — {job.get('step', 'Working…')}{elapsed_txt}",
+        text=f"Analyzing models — {job.get('step', 'Working…')}{elapsed_txt}",
     )
     if started:
         st.caption(f"Started at {time.strftime('%H:%M:%S', time.localtime(started))}")
@@ -1689,7 +1699,7 @@ def _render_agent_summary(view):
     payload = _load_agent_summary(view)
     if payload is None:
         return
-    with st.expander("Agent summary", expanded=True):
+    with st.expander("Model recommendation", expanded=True):
         gen = payload.get("generated_at")
         if gen:
             st.caption(f"Generated {gen}  ·  view: {payload.get('view', view)}")
@@ -2254,9 +2264,10 @@ def main():
             "Scope",
             [ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, "By region"],
             index=0,
-            help="“Combined (best model per group)” forecasts each customer "
-                 "group with its own backtest-winning model (from the agent "
-                 "summaries) and stitches them into one table.",
+            format_func=lambda s: SCOPE_LABELS.get(s, s),
+            help="“Best model per customer group” forecasts each customer group "
+                 "with its own most-accurate model (from the model-analysis "
+                 "recommendations) and stitches them into one table.",
         )
         if scope == ALL_CUSTOMERS_VIEW:
             view = ALL_CUSTOMERS_VIEW
@@ -2292,12 +2303,12 @@ def main():
     # a local OpenAI-compatible server; agent/llm.py re-reads LLM_PROVIDER from
     # the env at call time, so setting it here just before invoke() is enough.
     with st.sidebar:
-        st.header("Agent")
+        st.header("Model analysis")
         provider_label = st.radio(
             "Reasoning LLM",
             list(LLM_PROVIDERS.keys()),
             key="agent_llm_provider",
-            help="Which LLM writes the narrative + anomaly flags. Anthropic "
+            help="Which LLM writes the summary + anomaly flags. Anthropic "
                  "calls the Claude API (needs ANTHROPIC_API_KEY in .env); Local "
                  "uses the OpenAI-compatible server in LOCAL_LLM_* (.env).",
         )
@@ -2307,45 +2318,45 @@ def main():
             os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
         )
         if anthropic_no_key:
-            st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the agent.")
-        # The combined best-model view isn't a single agent view — it reads the
-        # per-group summaries. Steer the user to the all-views batch instead.
+            st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the analysis.")
+        # The best-model-per-group view isn't a single view — it reads every
+        # group's recommendation. Steer the user to the all-views run instead.
         single_view_agent = view != BEST_MODEL_COMBINED_VIEW
         if not single_view_agent:
-            st.caption("This view combines every group's best model — use "
-                       "**Agent Summary (all views)** below to (re)generate them.")
+            st.caption("This view uses each group's recommended model — use "
+                       "**Recommend models (all views)** below to (re)generate them.")
         run_agent = st.button(
-            "Run Agent Summary",
+            "Recommend best model",
             key="run_agent_summary",
             disabled=anthropic_no_key or not single_view_agent,
-            help="Backtests all models for this view, picks the best, and writes "
-                 "an LLM narrative + flagged anomalies. Slow/expensive — runs "
-                 "only when you click, never on a normal rerun.",
+            help="Backtests all models for this view, recommends the most "
+                 "accurate one, and writes an AI summary + flagged anomalies. "
+                 "Slow — runs only when you click, never on a normal rerun.",
         )
 
-        # All-views batch (same work as `python -m agent.batch`). Detached
+        # All-views run (same work as `python -m agent.batch`). Detached
         # background process; while it runs the button becomes a status check.
         batch_running, batch_started = batch_in_progress()
         if batch_running:
-            st.info(f"⏳ Running agent summary for all views… started "
+            st.info(f"⏳ Recommending models for all views… started "
                     f"{batch_started or '?'}. Runs in the background — "
                     "see logs/<date>/logs_agent_batch.txt.")
             if st.button("Check progress", key="check_agent_batch"):
                 st.rerun()
         else:
-            # A just-finished batch (this session): surface its outcome once.
+            # A just-finished run (this session): surface its outcome once.
             proc = st.session_state.get("agent_batch_proc")
             if proc is not None and proc.poll() is not None:
-                line = _batch_result_line() or "Agent batch finished."
+                line = _batch_result_line() or "Model analysis finished (all views)."
                 st.session_state["_batch_toast"] = line
                 st.session_state.pop("agent_batch_proc", None)
             run_all = st.button(
-                "Agent Summary (all views)",
+                "Recommend models (all views)",
                 key="run_agent_all",
                 disabled=anthropic_no_key,
-                help="Backtests all models for EVERY view and writes each "
-                     "agent_summary_<view>.json. Runs ~60 views — can take up "
-                     "to 1 hour. Asks for confirmation first.",
+                help="Recommends the most accurate model for EVERY view and "
+                     "writes each recommendation to disk. Runs ~60 views — can "
+                     "take up to 1 hour. Asks for confirmation first.",
             )
             if run_all:
                 _confirm_run_all_dialog(LLM_PROVIDERS[provider_label])
@@ -2391,13 +2402,13 @@ def main():
             # A full rerun (fired by the fragment) lands here once the run ends.
             result = job.get("result") or {}
             if status == "error" or result.get("errors"):
-                st.error(job.get("error") or "\n".join(result.get("errors", [])) or "Agent run failed.")
+                st.error(job.get("error") or "\n".join(result.get("errors", [])) or "Model analysis failed.")
                 job["status"] = "shown"  # consume so the error isn't re-raised on later reruns
             else:
                 best = result.get("best_model") or (_load_agent_summary(view) or {}).get("best_model")
                 started = job.get("started_at")
                 dur = f" in {int(time.time() - started)}s" if started else ""
-                st.toast(f"Agent finished{dur}: {best or 'n/a'}")
+                st.toast(f"Recommended model{dur}: {best or 'n/a'}")
                 job["status"] = "shown"  # consume before any rerun below
                 # Switch the model toggle to the agent's winner so the screen
                 # shows the best model. Stash it as a pending key and rerun: the
