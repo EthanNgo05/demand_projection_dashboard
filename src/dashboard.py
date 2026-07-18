@@ -120,6 +120,20 @@ if _ENV_PIPELINE:
 MODEL_OPTIONS = {k: v for k, v in MODEL_OPTIONS.items() if os.path.exists(v)}
 DEFAULT_MODEL = next(iter(MODEL_OPTIONS), None)
 
+# Title-cased model names for the UI. The MODEL_OPTIONS keys stay the canonical
+# model IDs (the agent's best_model, agent/config.py, agent_summary_*.json), so
+# we only prettify what the planner sees — never the stored identifier.
+MODEL_DISPLAY = {
+    "Holt's (double) exponential smoothing": "Holt's (Double) Exponential Smoothing",
+    "Holt-Winters (triple) exponential smoothing": "Holt-Winters (Triple) Exponential Smoothing",
+    "TSB (intermittent demand)": "TSB (Intermittent Demand)",
+}
+
+
+def model_display(label):
+    """The UI label for a model ID (title-cased); unknown labels pass through."""
+    return MODEL_DISPLAY.get(label, label) if label is not None else label
+
 
 def pipeline_path():
     """Path of the currently selected pipeline (the sidebar model toggle).
@@ -154,9 +168,9 @@ MODEL_USED_COL = "Model Used"
 # view IDs (also the agent-summary filenames / agent config), so we rename only
 # what the planner sees, never the ID.
 SCOPE_LABELS = {
-    ALL_CUSTOMERS_VIEW: "Company total",
-    BEST_MODEL_COMBINED_VIEW: "Best model per customer group",
-    "By region": "By region",
+    ALL_CUSTOMERS_VIEW: "Executive Overview",
+    BEST_MODEL_COMBINED_VIEW: "Optimal Projections (Combined)",
+    "By region": "By Region",
 }
 
 # Per-region rollup views: "All Customers - <region label>" combines every
@@ -1052,7 +1066,7 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         )
         if summary is not None and not summary.empty:
             summary = summary.copy()
-            summary[MODEL_USED_COL] = label
+            summary[MODEL_USED_COL] = model_display(label)
             frames.append(summary)
         if progress_cb is not None:
             progress_cb(i + 1, n, group)
@@ -1079,7 +1093,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     page title is already rendered by main() before this branch, so we start at the
     section subheader to avoid showing it twice.
     """
-    st.subheader("Best model per customer group")
+    st.subheader("Optimal Projections (Combined)")
     st.caption(
         "Each customer group is forecast with its own most-accurate model "
         "(from the latest model-analysis recommendations) and stitched into one "
@@ -1570,9 +1584,12 @@ def _model_fit_callout(payload):
     best = payload.get("best_model")
     note = payload.get("model_fit_note")
     if expected and best and expected != best:
-        return "info", note or f"Expected best fit: {expected} — {best} won on backtest MASE."
+        return "info", note or (
+            f"Expected best fit: {model_display(expected)} — "
+            f"{model_display(best)} won on backtest MASE."
+        )
     if expected and note:
-        return "caption", f"Expected best fit: {expected} (matches the selected model). {note}"
+        return "caption", f"Expected best fit: {model_display(expected)} (matches the selected model). {note}"
     if note:
         return "caption", note
     return None
@@ -1589,7 +1606,7 @@ def _confirm_run_all_dialog(provider):
     st.warning(
         "It runs in the background and can take **up to 1 hour**. You can keep "
         "using the dashboard while it runs; each view's recommendation updates as "
-        "it finishes, and the **Best model per customer group** view fills in as "
+        "it finishes, and the **Optimal Projections (Combined)** view fills in as "
         "groups complete."
     )
     left, right = st.columns(2)
@@ -1712,7 +1729,7 @@ def _render_agent_summary(view):
         best = payload.get("best_model")
         if best:
             score = scores.get(best)
-            label = f"Best model: {best}"
+            label = f"Best model: {model_display(best)}"
             if score is not None:
                 label += (
                     f"  (backtest MASE {score:.2f})" if is_mase
@@ -1738,7 +1755,7 @@ def _render_agent_summary(view):
             col = "Backtest MASE (vs 8-wk avg)" if is_mase else "Backtest MAE"
             rows = [
                 {
-                    "Model": name,
+                    "Model": model_display(name),
                     col: (
                         "n/a" if score is None
                         else round(float(score), 2 if is_mase else 1)
@@ -1785,7 +1802,7 @@ def _render_agent_summary(view):
         # dropped without explanation. Empty for an all-history winner.
         excluded = payload.get("window_excluded_skus") or []
         if excluded:
-            best_lbl = payload.get("best_model") or "this model"
+            best_lbl = model_display(payload.get("best_model")) or "this model"
             # Rendered as a native HTML <details> dropdown (collapsed by
             # default) so this list — often 15+ SKUs — doesn't dominate the
             # summary. A Streamlit st.expander can't be used here: it's illegal
@@ -1883,6 +1900,7 @@ def main():
         st.radio(
             "Forecasting model", list(MODEL_OPTIONS.keys()),
             key="model_choice", on_change=_on_model_change,
+            format_func=model_display,
             help="Switching recomputes everything with the selected pipeline.",
         )
 
@@ -1936,7 +1954,7 @@ def main():
         # self-healing baseline.
         if running or wh_running:
             st.info(
-                f"⏳ Refreshing data… started {started or wh_started}. "
+                f"⏳ Syncing from data warehouse… started {started or wh_started}. "
                 "You can keep working on the current snapshot; the page "
                 "switches to the fresh data automatically when it finishes "
                 "(usually a few minutes)."
@@ -1963,7 +1981,7 @@ def main():
                     st.rerun()
             else:
                 do_refresh = st.button(
-                    "🔄 Refresh data",
+                    "🔄 Sync from Data Warehouse",
                     key="refresh_all",
                     help="Pull the demand snapshot (last few weeks + current "
                          "projections) and the five regional warehouse-projection "
@@ -2265,7 +2283,7 @@ def main():
             [ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, "By region"],
             index=0,
             format_func=lambda s: SCOPE_LABELS.get(s, s),
-            help="“Best model per customer group” forecasts each customer group "
+            help="“Optimal Projections (Combined)” forecasts each customer group "
                  "with its own most-accurate model (from the model-analysis "
                  "recommendations) and stitches them into one table.",
         )
@@ -2319,20 +2337,9 @@ def main():
         )
         if anthropic_no_key:
             st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the analysis.")
-        # The best-model-per-group view isn't a single view — it reads every
-        # group's recommendation. Steer the user to the all-views run instead.
-        single_view_agent = view != BEST_MODEL_COMBINED_VIEW
-        if not single_view_agent:
-            st.caption("This view uses each group's recommended model — use "
-                       "**Recommend models (all views)** below to (re)generate them.")
-        run_agent = st.button(
-            "Recommend best model",
-            key="run_agent_summary",
-            disabled=anthropic_no_key or not single_view_agent,
-            help="Backtests all models for this view, recommends the most "
-                 "accurate one, and writes an AI summary + flagged anomalies. "
-                 "Slow — runs only when you click, never on a normal rerun.",
-        )
+        # The per-view "Recommend best model" button lives on the page (next to
+        # the recommendation it produces); only the global all-views run and the
+        # reasoning-LLM selector stay here in the sidebar.
 
         # All-views run (same work as `python -m agent.batch`). Detached
         # background process; while it runs the button becomes a status check.
@@ -2364,6 +2371,26 @@ def main():
     # Surface batch start/finish toasts once (set from the dialog / poll above).
     if "_batch_toast" in st.session_state:
         st.toast(st.session_state.pop("_batch_toast"))
+
+    # ----- Model recommendation (this view) --------------------------------
+    # The per-view analysis button lives on the page, right above the live
+    # progress and the recommendation panel it produces (rendered below), so the
+    # trigger and its output sit together. The best-model-per-group view isn't a
+    # single-model view, so it has no button here — it reads every group's
+    # recommendation and points to the sidebar's all-views run instead.
+    run_agent = False
+    if view != BEST_MODEL_COMBINED_VIEW:
+        run_agent = st.button(
+            "Recommend best model",
+            key="run_agent_summary",
+            disabled=anthropic_no_key,
+            help="Backtests all models for this view, recommends the most "
+                 "accurate one, and writes an AI summary + flagged anomalies. "
+                 "Slow — runs only when you click, never on a normal rerun.",
+        )
+        if anthropic_no_key:
+            st.caption("⚠️ No ANTHROPIC_API_KEY found — pick **Local LLM** in the "
+                       "sidebar to enable this.")
 
     if run_agent:
         # Kick off the pipeline on a background thread and rerun immediately, so
