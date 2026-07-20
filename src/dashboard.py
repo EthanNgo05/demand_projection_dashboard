@@ -1000,6 +1000,25 @@ def _agent_summaries_mtime():
     return max((os.path.getmtime(p) for p in paths), default=0.0)
 
 
+def _agent_summaries_generated_at():
+    """Latest ``generated_at`` stamped across outputs/agent_summary_*.json.
+
+    Reflects when the batch last produced the per-group recommendations that the
+    Optimal Projections (Combined) view is stitched from. Returns the ISO string,
+    or None if no summary carries a parseable timestamp. The stamps share one
+    format (``YYYY-MM-DDTHH:MM:SS``), so a lexical max is also the newest."""
+    latest = None
+    for p in glob.glob(os.path.join(REPO_ROOT, "outputs", "agent_summary_*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                gen = json.load(f).get("generated_at")
+        except (OSError, ValueError):
+            continue
+        if gen and (latest is None or str(gen) > latest):
+            latest = str(gen)
+    return latest
+
+
 def _best_model_for_group(group):
     """(label, model_path) for a group's backtest-winning model, or None.
 
@@ -1127,11 +1146,18 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         finally:
             prog.empty()
         st.session_state["bestmix_result"] = result
+        st.session_state["bestmix_generated_at"] = _agent_summaries_generated_at()
         st.session_state["bestmix_structural"] = sig
     else:
         result = st.session_state.get("bestmix_result")
 
     combined, excluded = result if result is not None else (None, [])
+
+    generated_at = st.session_state.get("bestmix_generated_at")
+    if generated_at:
+        st.caption(
+            f"Recommendations last generated {_format_generated_at(generated_at)}"
+        )
 
     def _render_excluded(title):
         """Dropdown listing groups left out (bullet-pointed, one per line)."""
@@ -1159,8 +1185,8 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     counts = (
         combined.drop_duplicates("Customer Grouping")[MODEL_USED_COL].value_counts()
     )
-    parts = ", ".join(f"{m} ×{c}" for m, c in counts.items())
-    st.caption(f"{int(counts.sum())} groups — {parts}")
+    parts = "\n".join(f"- {m} ×{c}" for m, c in counts.items())
+    st.caption(f"{int(counts.sum())} groups:\n{parts}")
 
     # Keep each SKU's rows together; largest revenue risk first when present.
     if RISK_COL in combined.columns and combined[RISK_COL].notna().any():
