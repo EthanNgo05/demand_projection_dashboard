@@ -1867,6 +1867,33 @@ def main():
             width: {SIDEBAR_WIDTH_PX}px !important;
             min-width: {SIDEBAR_WIDTH_PX}px !important;
         }}
+
+        /* Replace Streamlit's top-right "running" status graphic — which cycles
+           through animated sport figures (runner, cyclist, swimmer…) — with a
+           plain spinning loader. We hide the icon wrapper's contents and draw a
+           CSS spinner in its place; the "Running..." text and Stop button are
+           separate elements and stay intact. */
+        [data-testid="stStatusWidgetRunningIcon"] > * {{
+            display: none !important;
+        }}
+        [data-testid="stStatusWidgetRunningIcon"] {{
+            display: inline-flex !important;
+            align-items: center;
+            justify-content: center;
+        }}
+        [data-testid="stStatusWidgetRunningIcon"]::after {{
+            content: "";
+            width: 0.9rem;
+            height: 0.9rem;
+            border: 2px solid currentColor;
+            border-top-color: transparent;
+            border-radius: 50%;
+            opacity: 0.55;
+            animation: sh-status-spin 0.7s linear infinite;
+        }}
+        @keyframes sh-status-spin {{
+            to {{ transform: rotate(360deg); }}
+        }}
         </style>
         """,
         unsafe_allow_html=True,
