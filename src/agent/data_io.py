@@ -280,6 +280,11 @@ DISCONTINUED_COLS = [
     "First_WeekDate", "Last_WeekDate", "Original_Projection",
 ]
 
+MISSING_POS_COLS = [
+    "SKU", "Location", "Region", "Active in", "CUSTNMBR",
+    "First Missing Week", "Last Missing Week", "Missing Weeks",
+]
+
 
 def _read_csv_url(url, timeout=30):
     """Fetch a CSV feed over HTTP(S) into a DataFrame, with a timeout.
@@ -523,6 +528,92 @@ def compute_discontinued_projections(df, disc_status, P):
     )
     g["SKU Status"] = g["SKU"].map(lambda s: disc_status.get(s))
     out = g[DISCONTINUED_COLS]
+    return out.sort_values(["SKU", "CUSTNMBR"]).reset_index(drop=True)
+
+
+def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
+    """Active SKUs (incl. Parts) with no recent POS/Orders where they're active.
+
+    Ported from missing_pos.ipynb. For every ACTIVE SKU (Plytix SKU Status ==
+    Active — any SKU Type, so Parts like PD6306 are kept, unlike
+    compute_active_products), look at each customer whose warehouse region is one
+    the SKU is "Active in", and flag the SKU x customer combos with no POS/Orders
+    signal at or after the last completed week. This surfaces prolonged stockouts
+    and gone-silent channels the forecast would otherwise carry quietly.
+
+    Unlike the sibling checks this looks over FULL history (no window): the gap is
+    measured from the week after the combo's last data week (or, for combos that
+    never had any POS/Orders, from the earliest week the snapshot reaches).
+
+    Returns a table (columns = MISSING_POS_COLS), empty if none. Returns None if
+    the Plytix export lacks the columns the check needs (an older list-price file)
+    or there are no anchors / no demand frame to work from.
+    """
+    required = {"SKU", "SKU Status", "Active in"}
+    if plytix_df is None or not required.issubset(plytix_df.columns):
+        return None
+    if df is None or df.empty or anchors is None:
+        return None
+
+    # --- Plytix: active SKUs (any Type) and their "Active in" regions ---------
+    p = plytix_df.copy()
+    p["SKU"] = p["SKU"].astype(str).str.rstrip("*").str.strip()
+    active = p[p["SKU Status"] == "Active"]
+    active_skus = set(active["SKU"])
+    sku_active_in = dict(zip(active["SKU"], active["Active in"].astype(str)))
+
+    _, last_complete_week, _ = anchors
+
+    # --- Candidate combos: active SKU x customer, restricted to active regions -
+    m = df.copy()
+    m["SKU"] = m["SKU"].astype(str).str.rstrip("*").str.strip()
+    m["WeekDate"] = pd.to_datetime(m["WeekDate"])
+    m = m[m["SKU"].isin(active_skus)]
+    if m.empty:
+        return pd.DataFrame(columns=MISSING_POS_COLS)
+
+    combos = m[["SKU", "CUSTNMBR", "Customer Grouping"]].drop_duplicates().copy()
+    combos["Location"] = combos["Customer Grouping"].map(lambda g: _region_code(P, g))
+    combos["Region"] = combos["Customer Grouping"].map(lambda g: P.region_for_group(g))
+    combos = combos[combos["Location"].notna()]
+    combos = combos[[
+        loc in _active_in_list(sku_active_in, sku)
+        for sku, loc in zip(combos["SKU"], combos["Location"])
+    ]]
+    if combos.empty:
+        return pd.DataFrame(columns=MISSING_POS_COLS)
+
+    # --- Last week each combo had ANY POS/Orders (full history, incl. future) --
+    # A recorded 0 counts as data; only NaN/absent is "no data". Future weeks
+    # carry booked orders, so a combo with data at/after the reference week is NOT
+    # missing. (SKU, CUSTNMBR, WeekDate) isn't unique, but the max data-bearing
+    # week is unaffected by the duplicate grain.
+    had = m[m["POS"].notna() | m["Orders"].notna()]
+    combos["Last Data Week"] = pd.MultiIndex.from_frame(
+        combos[["SKU", "CUSTNMBR"]]
+    ).map(had.groupby(["SKU", "CUSTNMBR"])["WeekDate"].max())
+
+    # --- Currently missing: no data at/after the last completed week -----------
+    # Kept: combos whose most recent data is BEFORE last_complete_week, PLUS
+    # combos that never had any POS/Orders (Last Data Week is NaT -> False).
+    missing = combos[~(combos["Last Data Week"] >= last_complete_week)].copy()
+    if missing.empty:
+        return pd.DataFrame(columns=MISSING_POS_COLS)
+
+    # --- Build the report -----------------------------------------------------
+    # Gap runs from the week AFTER the last data week through the last completed
+    # week. Never-had-data combos start at the earliest week the snapshot reaches.
+    missing["Active in"] = missing["SKU"].map(lambda s: sku_active_in.get(s))
+    earliest_week = m["WeekDate"].min()
+    missing["First Missing Week"] = (
+        (missing["Last Data Week"] + pd.Timedelta(weeks=1)).fillna(earliest_week)
+    )
+    missing["Last Missing Week"] = last_complete_week
+    missing["Missing Weeks"] = (
+        (last_complete_week - missing["First Missing Week"]).dt.days // 7 + 1
+    ).astype("Int64")
+
+    out = missing[MISSING_POS_COLS]
     return out.sort_values(["SKU", "CUSTNMBR"]).reset_index(drop=True)
 
 

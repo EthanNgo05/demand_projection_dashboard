@@ -730,6 +730,7 @@ WAREHOUSE_REGIONS = data_io.WAREHOUSE_REGIONS
 INACTIVE_COLS = data_io.INACTIVE_COLS
 DISCONTINUED_COLS = data_io.DISCONTINUED_COLS
 MISSING_COLS = data_io.MISSING_COLS
+MISSING_POS_COLS = data_io.MISSING_POS_COLS
 _this_week_start = data_io._this_week_start
 _active_in_list = data_io._active_in_list
 _region_code = data_io._region_code
@@ -738,6 +739,7 @@ compute_inactive_projections = data_io.compute_inactive_projections
 compute_discontinued_products = data_io.compute_discontinued_products
 compute_discontinued_projections = data_io.compute_discontinued_projections
 compute_missing_projections = data_io.compute_missing_projections
+compute_missing_pos_orders = data_io.compute_missing_pos_orders
 
 
 # Cleaning lives in agent/data_io.py (shared with the agent's ingest node);
@@ -2882,6 +2884,12 @@ def main():
         cust_source, P,
     )
 
+    # ----- Active SKUs (incl. Parts) MISSING POS/Orders data where active ----
+    # Uses the demand file's full history (not the warehouse grid), so gone-silent
+    # channels and prolonged stockouts surface even with no recent data.
+    missing_pos_df = compute_missing_pos_orders(df, plytix_df, P, anchors=(lb, lcw, ffw))
+    render_missing_pos_section(view, region, missing_pos_df, today_str)
+
     # ----- Discontinued/inactive products with projections ------------------
     render_discontinued_section(
         view, region, disc_check_ran, discontinued_df, today_str,
@@ -3135,6 +3143,66 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
         file_name=f"discontinued_with_projections_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="dl_discontinued_projections",
+    )
+
+
+def render_missing_pos_section(view, region, missing_pos_df, today_str):
+    """Table of active SKUs (incl. Parts) missing POS/Orders where they're active.
+
+    Ported from missing_pos.ipynb. Flags SKU x customer combos that have stopped
+    receiving (or never received) POS/Orders data in a region the SKU is "Active
+    in", over full history. In a "By customer group" view only rows whose region
+    matches the selected region are shown; ALL CUSTOMERS shows every region.
+    """
+    HEADER = "### SKUs missing POS/Orders data in locations they are active in"
+    st.markdown(HEADER)
+    if missing_pos_df is None:
+        st.info(
+            "Upload a Plytix export with an 'Active in' column (sidebar) to run "
+            "the missing POS/Orders check."
+        )
+        return
+
+    region_scoped = view != ALL_CUSTOMERS_VIEW and region is not None
+    table_df = missing_pos_df
+    if region_scoped:
+        table_df = missing_pos_df[missing_pos_df["Region"] == region]
+
+    if table_df.empty:
+        if region_scoped:
+            st.success(
+                f"None found for {region} — every active SKU has recent "
+                "POS/Orders data in its active channels here."
+            )
+        else:
+            st.success(
+                "None found — every active SKU has recent POS/Orders data in "
+                "its active channels."
+            )
+        return
+
+    n_skus = table_df["SKU"].nunique()
+    scope_note = f" for {region}" if region_scoped else ""
+    st.caption(
+        f"Flagged{scope_note}: {n_skus:,} distinct active SKUs (Parts included) "
+        "with no POS/Orders data in a location they're active in (full-history "
+        "look-back)."
+    )
+
+    show = table_df.drop(columns=["Region"]).copy()
+    show["First Missing Week"] = pd.to_datetime(show["First Missing Week"]).dt.date
+    show["Last Missing Week"] = pd.to_datetime(show["Last Missing Week"]).dt.date
+
+    st.dataframe(
+        search_filter(show, key="search_missing_pos"),
+        width="stretch", hide_index=True,
+    )
+    st.download_button(
+        "⬇️ Download the missing POS/Orders table",
+        data=summary_to_excel(show, sheet_name="missing_pos_orders"),
+        file_name=f"missing_pos_orders_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_missing_pos_orders",
     )
 
 
