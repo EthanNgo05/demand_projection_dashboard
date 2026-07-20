@@ -935,6 +935,10 @@ def _forecast_one_group(df_group, today_ts, model_path, group_label,
     """Forecast a single customer group's SKUs. Cached; calls NO Streamlit
     element, so it is safe to replay on a cache hit. ``group_label`` is a
     normal (hashable) argument so distinct groups get distinct cache entries.
+
+    Returns ``(summary, weekly, agg)`` — the same three frames ``compute_view``
+    produces for a single view, so callers that stitch groups together (the
+    Optimal Projections combined view) can build charts, not just the summary.
     """
     P = load_pipeline(model_path)
     kwargs = {}
@@ -945,10 +949,10 @@ def _forecast_one_group(df_group, today_ts, model_path, group_label,
     if min_weeks is not None and _supports_min_weeks(P):
         kwargs["min_weeks_for_trend"] = min_weeks
     agg = P.aggregate_to_sku_week(df_group)
-    summary, _ = P.fit_regression(
+    summary, weekly = P.fit_regression(
         agg, today_ts, grouping_label=group_label, **kwargs
     )
-    return summary
+    return summary, weekly, agg
 
 
 def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
@@ -976,7 +980,7 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
     n_groups = len(groups)
     for i, group in enumerate(groups):
         sub = df[df["Customer Grouping"] == group]
-        summary = _forecast_one_group(
+        summary, _, _ = _forecast_one_group(
             sub, today_ts, model_path, group,
             prices, alpha, beta, phi, min_weeks,
         )
@@ -1052,9 +1056,14 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
     null — history too short to score any model), are left OUT of the table and
     returned separately so the caller can list them.
 
-    Returns ``(table, excluded)`` where ``table`` is a DataFrame (SUMMARY_COLUMNS
-    + MODEL_USED_COL) or None when no group resolved / produced rows, and
-    ``excluded`` is the sorted list of group names with no best model.
+    Returns ``(table, weekly_all, agg_all, excluded)`` where ``table`` is a
+    DataFrame (SUMMARY_COLUMNS + MODEL_USED_COL) or None when no group resolved /
+    produced rows; ``weekly_all`` / ``agg_all`` are the per-group forecast and
+    SKU-week aggregate frames stitched together and summed by (SKU, WeekDate) so
+    the view can draw the total-demand and per-SKU charts (None alongside a None
+    table); and ``excluded`` is the sorted list of group names with no best model.
+    Groups are disjoint customer subsets, so summing by (SKU, WeekDate) is a plain
+    total — no double counting — and the actuals match the Executive Overview.
     """
     groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
 
@@ -1069,11 +1078,14 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         else:
             resolved[group] = best
     if not resolved:
-        return None, excluded
+        return None, None, None, excluded
 
     # Second pass: forecast each resolved group with its own model (autofit when
-    # supported).
+    # supported). Alongside each group's summary we keep its weekly forecast and
+    # SKU-week aggregate so the charts have series to plot.
     frames = []
+    weekly_frames = []
+    agg_frames = []
     n = len(resolved)
     for i, (group, (label, path)) in enumerate(resolved.items()):
         sub = df[df["Customer Grouping"] == group]
@@ -1083,18 +1095,26 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
             fitted = run_autofit(df, group, today_ts, path, min_weeks)
             if fitted:
                 alpha, beta, phi = fitted.get("alpha"), fitted.get("beta"), fitted.get("phi")
-        summary = _forecast_one_group(
+        summary, weekly, agg = _forecast_one_group(
             sub, today_ts, path, group, prices, alpha, beta, phi, min_weeks,
         )
         if summary is not None and not summary.empty:
             summary = summary.copy()
             summary[MODEL_USED_COL] = model_display(label)
             frames.append(summary)
+            # Keep only the columns the charts need; models carry extra columns
+            # (e.g. promo_uplift) that differ across models and would break concat.
+            wk = weekly[["SKU", "WeekDate", "projected_pos"]].copy()
+            wk["WeekDate"] = pd.to_datetime(wk["WeekDate"])
+            weekly_frames.append(wk)
+            ag = agg[["SKU", "WeekDate", "POS", "Orders", "Projection"]].copy()
+            ag["WeekDate"] = pd.to_datetime(ag["WeekDate"])
+            agg_frames.append(ag)
         if progress_cb is not None:
             progress_cb(i + 1, n, group)
 
     if not frames:
-        return None, excluded
+        return None, None, None, excluded
     combined = pd.concat(frames, ignore_index=True)
     # Surface the model used right after the customer group for readability.
     if "Customer Grouping" in combined.columns:
@@ -1102,10 +1122,122 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         pos = cols.index("Customer Grouping") + 1
         cols.insert(pos, MODEL_USED_COL)
         combined = combined[cols]
-    return combined, excluded
+
+    # Stitch the per-group series into one total per (SKU, WeekDate). min_count=1
+    # keeps a genuinely-absent cell NaN rather than coercing it to 0.
+    weekly_all = (
+        pd.concat(weekly_frames, ignore_index=True)
+        .groupby(["SKU", "WeekDate"], as_index=False)["projected_pos"].sum()
+    )
+    agg_all = (
+        pd.concat(agg_frames, ignore_index=True)
+        .groupby(["SKU", "WeekDate"], as_index=False)[["POS", "Orders", "Projection"]]
+        .sum(min_count=1)
+    )
+    return combined, weekly_all, agg_all, excluded
 
 
-def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows):
+def _render_kpis(summary, agg, anchors):
+    """Render the 7-metric KPI row shared by every view.
+
+    Uses only ``summary`` + the SKU-week ``agg`` + the week ``anchors``. SKU
+    counts use ``nunique`` (not row count) so the Optimal Projections combined
+    view — which carries one row per (SKU, Customer Grouping) — reports distinct
+    SKUs; for single-model views SKU is unique per row, so this is unchanged.
+    """
+    lb, lcw, ffw = anchors
+    # Avg. weekly demand = the mean of the TOTAL weekly demand actually plotted
+    # on the chart's "Actual demand" line (POS/Orders summed across SKUs per
+    # week, then averaged over the weeks in the window). Do NOT sum the per-SKU
+    # "N Week POS/Orders Average" column here: that per-SKU average divides each
+    # SKU by its own weeks-with-data, so summing it counts a SKU that sold in
+    # only a few weeks as if it sold every week and overstates the total.
+    n_skus = int(summary["SKU"].nunique())
+    avg_col = resolve_avg_col(summary)
+    hist_demand = historical_window(agg, summary, (lb, lcw, ffw))
+    weekly_totals = hist_demand.groupby("WeekDate")["demand"].sum(min_count=1)
+    total_avg = float(weekly_totals.mean()) if not weekly_totals.empty else 0.0
+    total_updated = summary["Updated Projection Average"].sum()
+    total_initial = summary["Initial Projection Average"].sum()
+    diff = total_updated - total_initial
+    # Total Projection Value = Σ (list price × updated weekly-avg forecast) over
+    # priced SKUs. Unpriced SKUs map to NaN and are skipped, so this covers the
+    # same population as Revenue Risk. Per-week basis (Updated Projection Average
+    # is already a weekly mean).
+    has_price = PRICE_COL in summary.columns and summary[PRICE_COL].notna().any()
+    proj_value = (
+        (summary[PRICE_COL] * summary["Updated Projection Average"]).sum()
+        if has_price else None
+    )
+    n_orders = int((summary.get("Data Source") == "Orders").sum()) \
+        if "Data Source" in summary.columns else 0
+
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+    k1.metric(
+        "SKUs Forecasted", f"{n_skus:,}",
+        help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
+    )
+    k2.metric(
+        "Historical Demand (avg/wk)", f"{total_avg:,.0f}",
+        help=f"Mean of total weekly actual demand (POS/Orders) over the "
+             f"{avg_window_phrase(avg_col).lower()} window — the average of the "
+             f"chart's actual-demand line.",
+    )
+    k3.metric(
+        "Initial Forecast (avg/wk)", f"{total_initial:,.0f}",
+        help="Mean of the existing system projection over the forecast horizon "
+             "(the 15 future weeks) — the average of the chart's original-"
+             "projection line over the forecast window.",
+    )
+    k4.metric(
+        "Updated Forecast (avg/wk)", f"{total_updated:,.0f}",
+        help="Mean of this model's updated forecast over the 15 future weeks — "
+             "the average of the chart's updated-forecast line.",
+    )
+    k5.metric(
+        "Projection Difference (avg/wk)", f"{diff:+,.0f}",
+        delta=f"{(diff / total_initial * 100):+.1f}%" if total_initial else None,
+    )
+    has_risk = RISK_COL in summary.columns and summary[RISK_COL].notna().any()
+    if has_risk:
+        net_risk = summary[RISK_COL].sum()
+        k6.metric(
+            "Revenue Risk (avg/wk)", fmt_dollar(net_risk, signed=True),
+            help="Σ (projection difference × list price) over priced SKUs. "
+                 "Negative = forecast fell below the original projection.",
+        )
+    else:
+        k6.metric(
+            "Revenue Risk (avg/wk)", "—",
+            help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
+        )
+    if proj_value is not None:
+        k7.metric(
+            "Projected Revenue (avg/wk)", fmt_dollar(proj_value),
+            help="Σ (list price × updated weekly-avg forecast) over priced SKUs "
+                 "— the gross value at list price of the forecasted weekly demand.",
+        )
+    else:
+        k7.metric(
+            "Projected Revenue (avg/wk)", "—",
+            help="Load a list_prices_*.xlsx (sidebar) to enable projection value.",
+        )
+    if n_orders:
+        st.caption(
+            f"⚑ {n_orders} of {n_skus} SKUs had no POS in the window and "
+            "were forecast from Orders (see the Data Source column)."
+        )
+    if PRICE_COL in summary.columns:
+        n_noprice = int(summary.drop_duplicates("SKU")[PRICE_COL].isna().sum())
+        if n_noprice:
+            st.caption(
+                f"💲 {n_noprice} of {n_skus} SKUs have no list price; "
+                "their revenue risk is left blank."
+            )
+
+
+def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows,
+                                anchors):
     """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
 
     Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
@@ -1151,7 +1283,9 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     else:
         result = st.session_state.get("bestmix_result")
 
-    combined, excluded = result if result is not None else (None, [])
+    combined, weekly_all, agg_all, excluded = (
+        result if result is not None else (None, None, None, [])
+    )
 
     generated_at = st.session_state.get("bestmix_generated_at")
     if generated_at:
@@ -1187,6 +1321,102 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     )
     parts = "\n".join(f"- {m} ×{c}" for m, c in counts.items())
     st.caption(f"{int(counts.sum())} groups:\n{parts}")
+
+    _, lcw, _ = anchors
+    view_label = "Optimal Projections (Combined)"
+
+    # ----- KPIs -------------------------------------------------------------
+    # Same seven metrics as every other view. The combined frame carries one row
+    # per (SKU, Customer Grouping); _render_kpis counts distinct SKUs and the
+    # forecast/risk totals sum naturally across a SKU's groups.
+    _render_kpis(combined, agg_all, anchors)
+
+    # ----- Aggregate chart --------------------------------------------------
+    # Total actual demand + total forecast, summed across every group. Actuals
+    # match the Executive Overview; only the forecast line differs (each group
+    # uses its backtest-winning model).
+    agg_ctrl, _ = st.columns([1, 2])
+    with agg_ctrl:
+        agg_range = chart_range_control(agg_all, weekly_all, lcw, key="range_agg_best")
+    st.plotly_chart(
+        aggregate_chart(agg_all, combined, weekly_all, anchors, view_label,
+                        date_range=agg_range),
+        width="stretch",
+    )
+    st.caption(
+        "Actual demand uses each SKU's forecast source (POS or Orders); where a "
+        "SKU is forecast from different sources across groups, the most recent "
+        "group's source labels the actual-demand line."
+    )
+
+    # ----- Per-SKU detail ---------------------------------------------------
+    st.markdown("### SKU detail")
+    skus = sorted(combined["SKU"].astype(str).unique())
+    sku = st.selectbox("SKU", skus, help="Type to search", key="best_sku")
+    rows = combined[combined["SKU"].astype(str) == sku]
+    row0 = rows.iloc[0]
+    desc = row0["Description"] if isinstance(row0["Description"], str) else ""
+    # Resolve one source for the SKU's chart (same last-wins rule as source_map).
+    src_vals = rows["Data Source"].dropna().unique().tolist() \
+        if "Data Source" in rows.columns else []
+    source = src_vals[-1] if src_vals else "POS"
+    mixed_source = len(src_vals) > 1
+
+    cL, cR = st.columns([3, 1])
+    with cL:
+        sku_range = chart_range_control(agg_all, weekly_all, lcw, key="range_sku_best")
+        st.plotly_chart(
+            sku_chart(sku, desc, source, agg_all, weekly_all, anchors,
+                      date_range=sku_range),
+            width="stretch",
+        )
+        st.caption(
+            f"Totals across every group carrying this SKU "
+            f"({len(rows)} group{'s' if len(rows) != 1 else ''}: "
+            f"{', '.join(rows['Customer Grouping'].astype(str))})."
+        )
+    with cR:
+        # Metrics aggregate the SKU's per-group rows: forecast/risk totals sum;
+        # the historical avg/wk is derived from the stitched actuals (do NOT sum
+        # the per-SKU average column across groups — it would over-count).
+        st.metric("Data Source", f"{source} (mixed)" if mixed_source else source)
+        sku_hist = historical_window(
+            agg_all[agg_all["SKU"].astype(str) == sku], combined, anchors
+        )
+        sku_weekly_tot = sku_hist.groupby("WeekDate")["demand"].sum(min_count=1)
+        st.metric(
+            "Historical Demand (avg/wk)",
+            f"{float(sku_weekly_tot.mean()) if not sku_weekly_tot.empty else 0.0:,.1f}",
+        )
+        sysv = rows["Initial Projection Average"].sum(min_count=1)
+        st.metric(
+            "Initial Forecast (avg/wk)",
+            "—" if pd.isna(sysv) else f"{sysv:,.0f}",
+        )
+        updated = rows["Updated Projection Average"].sum()
+        st.metric("Updated Forecast (avg/wk)", f"{updated:,.0f}")
+        pdiff = rows["Projection Difference"].sum(min_count=1)
+        st.metric(
+            "Projection Difference (avg/wk)",
+            f"{pdiff:+,.0f}" if pd.notna(pdiff) else "—",
+        )
+        if RISK_COL in combined.columns:
+            price = rows[PRICE_COL].dropna().iloc[0] \
+                if PRICE_COL in rows.columns and rows[PRICE_COL].notna().any() \
+                else None
+            rv = rows[RISK_COL].sum(min_count=1)
+            st.metric("List Price", fmt_dollar(price, decimals=2))
+            st.metric(
+                "Revenue Risk (avg/wk)", fmt_dollar(rv, signed=True),
+                help="Σ (projection difference × list price) across this SKU's groups.",
+            )
+            prv = price * updated if price is not None else None
+            st.metric(
+                "Projected Revenue (avg/wk)", fmt_dollar(prv),
+                help="List price × total updated weekly-avg forecast for this SKU.",
+            )
+
+    st.markdown("### Summary table by SKU and customer")
 
     # Keep each SKU's rows together; largest revenue risk first when present.
     if RISK_COL in combined.columns and combined[RISK_COL].notna().any():
@@ -2525,7 +2755,9 @@ def main():
     # single-model compute, and the charts/KPIs below entirely: it renders the
     # stitched per-group best-model table and stops.
     if view == BEST_MODEL_COMBINED_VIEW:
-        _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows)
+        _render_best_model_combined(
+            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw)
+        )
         st.stop()
 
     # ----- Model parameters (Holt damped-trend smoothing) ------------------
@@ -2698,93 +2930,7 @@ def main():
     )
 
     # ----- KPIs -------------------------------------------------------------
-    # Avg. weekly demand = the mean of the TOTAL weekly demand actually plotted
-    # on the chart's "Actual demand" line (POS/Orders summed across SKUs per
-    # week, then averaged over the weeks in the window). Do NOT sum the per-SKU
-    # "N Week POS/Orders Average" column here: that per-SKU average divides each
-    # SKU by its own weeks-with-data, so summing it counts a SKU that sold in
-    # only a few weeks as if it sold every week and overstates the total.
-    avg_col = resolve_avg_col(summary)
-    hist_demand = historical_window(agg, summary, (lb, lcw, ffw))
-    weekly_totals = hist_demand.groupby("WeekDate")["demand"].sum(min_count=1)
-    total_avg = float(weekly_totals.mean()) if not weekly_totals.empty else 0.0
-    total_updated = summary["Updated Projection Average"].sum()
-    total_initial = summary["Initial Projection Average"].sum()
-    diff = total_updated - total_initial
-    # Total Projection Value = Σ (list price × updated weekly-avg forecast) over
-    # priced SKUs. Unpriced SKUs map to NaN and are skipped, so this covers the
-    # same population as Revenue Risk. Per-week basis (Updated Projection Average
-    # is already a weekly mean).
-    has_price = PRICE_COL in summary.columns and summary[PRICE_COL].notna().any()
-    proj_value = (
-        (summary[PRICE_COL] * summary["Updated Projection Average"]).sum()
-        if has_price else None
-    )
-    n_orders = int((summary.get("Data Source") == "Orders").sum()) \
-        if "Data Source" in summary.columns else 0
-
-    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-    k1.metric(
-        "SKUs Forecasted", f"{len(summary):,}",
-        help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
-    )
-    k2.metric(
-        "Historical Demand (avg/wk)", f"{total_avg:,.0f}",
-        help=f"Mean of total weekly actual demand (POS/Orders) over the "
-             f"{avg_window_phrase(avg_col).lower()} window — the average of the "
-             f"chart's actual-demand line.",
-    )
-    k3.metric(
-        "Initial Forecast (avg/wk)", f"{total_initial:,.0f}",
-        help="Mean of the existing system projection over the forecast horizon "
-             "(the 15 future weeks) — the average of the chart's original-"
-             "projection line over the forecast window.",
-    )
-    k4.metric(
-        "Updated Forecast (avg/wk)", f"{total_updated:,.0f}",
-        help="Mean of this model's updated forecast over the 15 future weeks — "
-             "the average of the chart's updated-forecast line.",
-    )
-    k5.metric(
-        "Projection Difference (avg/wk)", f"{diff:+,.0f}",
-        delta=f"{(diff / total_initial * 100):+.1f}%" if total_initial else None,
-    )
-    has_risk = RISK_COL in summary.columns and summary[RISK_COL].notna().any()
-    if has_risk:
-        net_risk = summary[RISK_COL].sum()
-        k6.metric(
-            "Revenue Risk (avg/wk)", fmt_dollar(net_risk, signed=True),
-            help="Σ (projection difference × list price) over priced SKUs. "
-                 "Negative = forecast fell below the original projection.",
-        )
-    else:
-        k6.metric(
-            "Revenue Risk (avg/wk)", "—",
-            help="Load a list_prices_*.xlsx (sidebar) to enable revenue risk.",
-        )
-    if proj_value is not None:
-        k7.metric(
-            "Projected Revenue (avg/wk)", fmt_dollar(proj_value),
-            help="Σ (list price × updated weekly-avg forecast) over priced SKUs "
-                 "— the gross value at list price of the forecasted weekly demand.",
-        )
-    else:
-        k7.metric(
-            "Projected Revenue (avg/wk)", "—",
-            help="Load a list_prices_*.xlsx (sidebar) to enable projection value.",
-        )
-    if n_orders:
-        st.caption(
-            f"⚑ {n_orders} of {len(summary)} SKUs had no POS in the window and "
-            "were forecast from Orders (see the Data Source column)."
-        )
-    if PRICE_COL in summary.columns:
-        n_noprice = int(summary[PRICE_COL].isna().sum())
-        if n_noprice:
-            st.caption(
-                f"💲 {n_noprice} of {len(summary)} SKUs have no list price; "
-                "their revenue risk is left blank."
-            )
+    _render_kpis(summary, agg, (lb, lcw, ffw))
 
     # ----- Aggregate chart --------------------------------------------------
     # Per-chart date-range picker (own key => independent from the SKU chart).
