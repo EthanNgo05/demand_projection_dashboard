@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import time
+import datetime
 import glob
 import html
 import json
@@ -1713,6 +1714,20 @@ def _agent_progress_fragment():
         st.rerun(scope="app")
 
 
+def _format_generated_at(gen):
+    """Format an ISO timestamp (e.g. '2026-07-17T14:12:00') as '2026-07-17 2:12 PM'.
+
+    Falls back to the raw string if it can't be parsed.
+    """
+    try:
+        dt = datetime.datetime.fromisoformat(str(gen))
+    except (ValueError, TypeError):
+        return gen
+    # %I is zero-padded (02); lstrip("0") on the hour gives a cleaner "2:12 PM".
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    return dt.strftime(f"%Y-%m-%d {hour}:%M %p")
+
+
 def _render_agent_summary(view):
     """Render the cached agent summary for `view` in the main body, if any."""
     payload = _load_agent_summary(view)
@@ -1721,7 +1736,7 @@ def _render_agent_summary(view):
     with st.expander("Model recommendation", expanded=True):
         gen = payload.get("generated_at")
         if gen:
-            st.caption(f"Generated {gen}  ·  view: {payload.get('view', view)}")
+            st.caption(f"Generated {_format_generated_at(gen)}  ·  view: {payload.get('view', view)}")
 
         if payload.get("errors"):
             st.error("\n".join(payload["errors"]))
