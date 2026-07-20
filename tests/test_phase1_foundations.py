@@ -32,7 +32,11 @@ def test_all_customers_view_matches_dashboard():
     # a drift here silently compares/filters the wrong view in every later phase.
     from agent.config import ALL_CUSTOMERS_VIEW
 
-    with open(os.path.join(SRC_ROOT, "dashboard.py"), encoding="utf-8") as f:
+    # The constant moved into dashboard_app/config.py during the refactor; the
+    # dashboard.py facade re-exports it. The drift guard (labels match
+    # agent/config.py) is unchanged — only the file it reads.
+    with open(os.path.join(SRC_ROOT, "dashboard_app", "config.py"),
+              encoding="utf-8") as f:
         dashboard_src = f.read()
     assert f'ALL_CUSTOMERS_VIEW = "{ALL_CUSTOMERS_VIEW}"' in dashboard_src
 
@@ -43,7 +47,9 @@ def test_region_all_prefix_matches_dashboard():
     # build/parse it with the identical prefix.
     from agent.config import REGION_ALL_PREFIX
 
-    with open(os.path.join(SRC_ROOT, "dashboard.py"), encoding="utf-8") as f:
+    # Moved into dashboard_app/config.py during the refactor (see above).
+    with open(os.path.join(SRC_ROOT, "dashboard_app", "config.py"),
+              encoding="utf-8") as f:
         dashboard_src = f.read()
     assert f'REGION_ALL_PREFIX = "{REGION_ALL_PREFIX}"' in dashboard_src
 

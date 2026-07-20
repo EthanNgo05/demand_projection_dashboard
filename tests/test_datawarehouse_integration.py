@@ -155,9 +155,14 @@ def dash(monkeypatch, tmp_path):
                 out.append((m.group(1), p))
         return sorted(out, reverse=True)
 
-    monkeypatch.setattr(dashboard, "_raw_dir", lambda: folder)
-    monkeypatch.setattr(dashboard, "discover_raw_files", _discover)
-    monkeypatch.setattr(dashboard, "_refresh_log_path",
+    # These helpers moved into the dashboard_app package during the refactor;
+    # refresh functions resolve them in their own module namespace, so patch the
+    # modules that actually define/consume them (the dashboard facade only
+    # re-exports copies, which the refresh code no longer reads).
+    from dashboard_app import datasources as _ds, refresh as _rf
+    monkeypatch.setattr(_ds, "_raw_dir", lambda: folder)
+    monkeypatch.setattr(_ds, "discover_raw_files", _discover)
+    monkeypatch.setattr(_rf, "_refresh_log_path",
                         lambda: os.path.join(folder, "logs_refresh.txt"))
     return dashboard, folder
 
@@ -294,7 +299,8 @@ def wh_dash(monkeypatch, tmp_path):
     folder = str(tmp_path)
     monkeypatch.setattr(data_io, "_warehouse_dir",
                         lambda warehouse_dir=None: folder)
-    monkeypatch.setattr(dashboard, "_refresh_log_path",
+    from dashboard_app import refresh as _rf
+    monkeypatch.setattr(_rf, "_refresh_log_path",
                         lambda: os.path.join(folder, "logs_refresh.txt"))
     return dashboard, folder
 
