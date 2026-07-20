@@ -117,7 +117,7 @@ from dashboard_app.charts import (  # noqa: F401
     _base_layout, _clip_to_range, aggregate_chart, chart_range_control, sku_chart,
 )
 from dashboard_app.tables import (  # noqa: F401
-    search_filter, style_summary,
+    render_filtered_table, search_filter, style_summary,
 )
 from dashboard_app.datasources import (  # noqa: F401
     DISCONTINUED_COLS, INACTIVE_COLS, MISSING_COLS, MISSING_POS_COLS, WAREHOUSE_REGIONS,
@@ -1067,10 +1067,7 @@ def main():
             .reset_index(drop=True)
         )
         st.caption("Ordered by largest revenue risk (by magnitude); blanks last.")
-    st.dataframe(
-        style_summary(search_filter(summary_table, key="search_by_sku")),
-        width="stretch", hide_index=True,
-    )
+    render_filtered_table(summary_table, "filter_by_sku", P)
     st.download_button(
         "⬇️ Download the summary table by SKU",
         data=view_to_excel(summary_table, weekly),
@@ -1113,12 +1110,7 @@ def main():
                     .reset_index(drop=True)
                 )
                 st.caption("Each SKU broken out by customer group.")
-            st.dataframe(
-                style_summary(
-                    search_filter(by_cust_table, key="search_by_customer")
-                ),
-                width="stretch", hide_index=True,
-            )
+            render_filtered_table(by_cust_table, "filter_by_customer", P)
             st.download_button(
                 "⬇️ Download the summary table by SKU and Customer",
                 data=summary_to_excel(by_cust_table),
