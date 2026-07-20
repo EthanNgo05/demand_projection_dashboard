@@ -38,7 +38,7 @@ def source_map(summary):
 def customer_source_map(summary):
     """(Customer Grouping, SKU) -> 'POS' or 'Orders' from a summary frame.
 
-    Keyed per customer group so a table that carries raw CUSTNMBRs (e.g. the
+    Keyed per customer group so a table that carries raw Customers (e.g. the
     missing-projections table) can be labelled with the same source the forecast
     used for that SKU in that group. SKUs are '*'-stripped on both sides so a
     trailing-star SKU still matches. Works for either the by-SKU summary (single

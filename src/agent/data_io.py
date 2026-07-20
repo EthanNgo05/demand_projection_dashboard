@@ -161,7 +161,7 @@ def _clean(raw_df, P):
     older file lacks the Orders column (an all-NaN Orders column is added so
     the POS-then-Orders logic still runs without a KeyError).
     """
-    rename = {"'Demand'[DisplaySKU]": "SKU", "Custnmbr": "CUSTNMBR"}
+    rename = {"'Demand'[DisplaySKU]": "SKU", "Custnmbr": "Customer"}
     if "Sum of Quantity" in raw_df.columns:
         rename["Sum of Quantity"] = "Orders"
     df = raw_df.rename(columns=rename)
@@ -169,22 +169,22 @@ def _clean(raw_df, P):
     if "Orders" not in df.columns:
         df["Orders"] = np.nan  # legacy file without an Orders/Sum of Quantity col
 
-    df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
+    df = df[["SKU", "Description", "Customer", "WeekDate", "POS", "Orders", "Projection"]]
     # The fixed-width warehouse export space-pads its key columns (e.g.
     # 'BT1028      ', 'AMAZON-DS      '). Strip that surrounding whitespace here —
     # the single ingestion boundary both the dashboard and agent share — before
     # any key-based join or lookup runs. SKU padding made every SKU miss the
     # (stripped) list-price index (blank revenue risk) and the Plytix SKU sets
-    # (active-in / discontinued checks silently ran on nothing). CUSTNMBR padding
+    # (active-in / discontinued checks silently ran on nothing). Customer padding
     # made padded customers miss CUSTOMERS_TO_IGNORE and COMBINED_GROUPING, so a
     # group like AMAZON-DC fragmented across its padded/clean spellings instead of
-    # folding together. Strip CUSTNMBR *before* the ignore filter and grouping map.
+    # folding together. Strip Customer *before* the ignore filter and grouping map.
     df["SKU"] = df["SKU"].astype(str).str.strip()
-    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
-    df = df[~df["CUSTNMBR"].isin(P.CUSTOMERS_TO_IGNORE)]
+    df["Customer"] = df["Customer"].astype(str).str.strip()
+    df = df[~df["Customer"].isin(P.CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
     df["Customer Grouping"] = (
-        df["CUSTNMBR"].map(P.COMBINED_GROUPING).fillna(df["CUSTNMBR"])
+        df["Customer"].map(P.COMBINED_GROUPING).fillna(df["Customer"])
     )
     return df
 
@@ -271,17 +271,17 @@ def load_raw(path, P=None):
 WAREHOUSE_REGIONS = ["AU", "CA", "EU", "JP", "US"]
 
 INACTIVE_COLS = [
-    "SKU", "Location", "Region", "Active in", "Customer Grouping",
-    "CUSTNMBR", "First_WeekDate", "Last_WeekDate", "Original_Projection", "Source",
+    "SKU", "Region Code", "Region", "Active in", "Customer Grouping",
+    "Customer", "First_WeekDate", "Last_WeekDate", "Original_Projection", "Source",
 ]
 
 DISCONTINUED_COLS = [
-    "SKU", "SKU Status", "Region", "Customer Grouping", "CUSTNMBR",
+    "SKU", "SKU Status", "Region", "Region Code", "Customer Grouping", "Customer",
     "First_WeekDate", "Last_WeekDate", "Original_Projection",
 ]
 
 MISSING_POS_COLS = [
-    "SKU", "Location", "Region", "Active in", "CUSTNMBR",
+    "SKU", "Region Code", "Region", "Active in", "Customer",
     "First Missing Week", "Last Missing Week", "Missing Weeks",
 ]
 
@@ -418,13 +418,13 @@ def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
             m["Region"] = m["Customer Grouping"].map(
                 lambda g: P.region_for_group(g)
             )
-            m["Location"] = m["Customer Grouping"].map(
+            m["Region Code"] = m["Customer Grouping"].map(
                 lambda g: _region_code(P, g)
             )
-            m = m[m["Location"].notna()]
+            m = m[m["Region Code"].notna()]
             keep = [
                 loc not in _active_in_list(sku_active_in, sku)
-                for sku, loc in zip(m["SKU"], m["Location"])
+                for sku, loc in zip(m["SKU"], m["Region Code"])
             ]
             m = m[keep]
             m["WeekDate"] = pd.to_datetime(m["WeekDate"])
@@ -438,8 +438,8 @@ def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
                     (m["WeekDate"] >= lb) & (m["WeekDate"] <= lcw)
                     & (m["POS"].notna() | m.get("Orders", pd.Series(index=m.index)).notna())
                 )
-                live = m.loc[sig, ["SKU", "CUSTNMBR", "Location"]].drop_duplicates()
-                m = m.merge(live, on=["SKU", "CUSTNMBR", "Location"], how="inner")
+                live = m.loc[sig, ["SKU", "Customer", "Region Code"]].drop_duplicates()
+                m = m.merge(live, on=["SKU", "Customer", "Region Code"], how="inner")
             if not m.empty:
                 # Original projection over future weeks (this week onward) —
                 # averaged per week — the projected weekly volume being excluded
@@ -449,7 +449,7 @@ def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
                     m["Projection"], errors="coerce"
                 ).where(m["WeekDate"] >= _this_week_start())
                 g = m.groupby(
-                    ["SKU", "Location", "Region", "Customer Grouping", "CUSTNMBR"],
+                    ["SKU", "Region Code", "Region", "Customer Grouping", "Customer"],
                     as_index=False,
                 ).agg(
                     First_WeekDate=("WeekDate", "min"),
@@ -464,8 +464,8 @@ def compute_inactive_projections(df, active_sku_set, sku_active_in, P,
         return pd.DataFrame(columns=INACTIVE_COLS)
 
     out = pd.concat(frames, ignore_index=True)[INACTIVE_COLS]
-    out = out.drop_duplicates(subset=["SKU", "Location", "CUSTNMBR"], keep="first")
-    return out.sort_values(["SKU", "Location", "CUSTNMBR"]).reset_index(drop=True)
+    out = out.drop_duplicates(subset=["SKU", "Region Code", "Customer"], keep="first")
+    return out.sort_values(["SKU", "Region Code", "Customer"]).reset_index(drop=True)
 
 
 def compute_discontinued_products(plytix_df):
@@ -518,9 +518,13 @@ def compute_discontinued_projections(df, disc_status, P):
         return pd.DataFrame(columns=DISCONTINUED_COLS)
 
     m["Region"] = m["Customer Grouping"].map(lambda g: P.region_for_group(g))
+    m["Region Code"] = m["Customer Grouping"].map(lambda g: _region_code(P, g))
     m["_future_proj"] = pd.to_numeric(m["Projection"], errors="coerce")
+    # dropna=False: Region Code is None for non-warehouse regions (e.g. "Other");
+    # without it those discontinued SKUs would be silently dropped from the table.
     g = m.groupby(
-        ["SKU", "Region", "Customer Grouping", "CUSTNMBR"], as_index=False,
+        ["SKU", "Region", "Region Code", "Customer Grouping", "Customer"],
+        as_index=False, dropna=False,
     ).agg(
         First_WeekDate=("WeekDate", "min"),
         Last_WeekDate=("WeekDate", "max"),
@@ -528,7 +532,7 @@ def compute_discontinued_projections(df, disc_status, P):
     )
     g["SKU Status"] = g["SKU"].map(lambda s: disc_status.get(s))
     out = g[DISCONTINUED_COLS]
-    return out.sort_values(["SKU", "CUSTNMBR"]).reset_index(drop=True)
+    return out.sort_values(["SKU", "Customer"]).reset_index(drop=True)
 
 
 def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
@@ -572,13 +576,13 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     if m.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)
 
-    combos = m[["SKU", "CUSTNMBR", "Customer Grouping"]].drop_duplicates().copy()
-    combos["Location"] = combos["Customer Grouping"].map(lambda g: _region_code(P, g))
+    combos = m[["SKU", "Customer", "Customer Grouping"]].drop_duplicates().copy()
+    combos["Region Code"] = combos["Customer Grouping"].map(lambda g: _region_code(P, g))
     combos["Region"] = combos["Customer Grouping"].map(lambda g: P.region_for_group(g))
-    combos = combos[combos["Location"].notna()]
+    combos = combos[combos["Region Code"].notna()]
     combos = combos[[
         loc in _active_in_list(sku_active_in, sku)
-        for sku, loc in zip(combos["SKU"], combos["Location"])
+        for sku, loc in zip(combos["SKU"], combos["Region Code"])
     ]]
     if combos.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)
@@ -586,12 +590,12 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     # --- Last week each combo had ANY POS/Orders (full history, incl. future) --
     # A recorded 0 counts as data; only NaN/absent is "no data". Future weeks
     # carry booked orders, so a combo with data at/after the reference week is NOT
-    # missing. (SKU, CUSTNMBR, WeekDate) isn't unique, but the max data-bearing
+    # missing. (SKU, Customer, WeekDate) isn't unique, but the max data-bearing
     # week is unaffected by the duplicate grain.
     had = m[m["POS"].notna() | m["Orders"].notna()]
     combos["Last Data Week"] = pd.MultiIndex.from_frame(
-        combos[["SKU", "CUSTNMBR"]]
-    ).map(had.groupby(["SKU", "CUSTNMBR"])["WeekDate"].max())
+        combos[["SKU", "Customer"]]
+    ).map(had.groupby(["SKU", "Customer"])["WeekDate"].max())
 
     # --- Currently missing: no data at/after the last completed week -----------
     # Kept: combos whose most recent data is BEFORE last_complete_week, PLUS
@@ -614,7 +618,7 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     ).astype("Int64")
 
     out = missing[MISSING_POS_COLS]
-    return out.sort_values(["SKU", "CUSTNMBR"]).reset_index(drop=True)
+    return out.sort_values(["SKU", "Customer"]).reset_index(drop=True)
 
 
 class ExclusionResult(NamedTuple):
@@ -627,7 +631,7 @@ class ExclusionResult(NamedTuple):
     active_check_ran: bool              # Plytix had the 'Active in' columns
     disc_check_ran: bool                # Plytix had the 'SKU Status' column
     n_excluded_rows: int                # demand rows dropped by the active-in check
-    excluded_counts_by_key: pd.Series   # per SKU||CUSTNMBR dropped-row counts
+    excluded_counts_by_key: pd.Series   # per SKU||Customer dropped-row counts
     n_disc_rows: int                    # demand rows dropped as discontinued/inactive
     n_disc_skus: int                    # distinct SKUs dropped as discontinued/inactive
 
@@ -664,12 +668,12 @@ def apply_exclusions(df, plytix_df, P, anchors=None):
     if not inactive_df.empty:
         exclude_keys = {
             f"{str(s)}||{str(c)}"
-            for s, c in zip(inactive_df["SKU"], inactive_df["CUSTNMBR"])
+            for s, c in zip(inactive_df["SKU"], inactive_df["Customer"])
         }
-        key = df["SKU"].astype(str).str.rstrip("*") + "||" + df["CUSTNMBR"].astype(str)
+        key = df["SKU"].astype(str).str.rstrip("*") + "||" + df["Customer"].astype(str)
         drop_mask = key.isin(exclude_keys)
         n_excluded_rows = int(drop_mask.sum())
-        # Per SKU||CUSTNMBR demand-row counts, so a region-scoped excluded table
+        # Per SKU||Customer demand-row counts, so a region-scoped excluded table
         # can report accurate row totals.
         excluded_counts_by_key = key[drop_mask].value_counts()
         if n_excluded_rows:
@@ -722,10 +726,10 @@ REGION_PREFIXES = ("AU", "CA", "EU", "JP", "US")
 WAREHOUSE_DIRNAME = "raw_inputs/warehouse_projections"
 
 # Long-format columns produced when a wide warehouse grid is melted.
-WAREHOUSE_LONG_COLS = ["SKU", "CUSTNMBR", "WeekDate", "Projection", "Location"]
+WAREHOUSE_LONG_COLS = ["SKU", "Customer", "WeekDate", "Projection", "Region Code"]
 
 MISSING_COLS = [
-    "SKU", "Location", "Region", "Active in", "CUSTNMBR",
+    "SKU", "Region Code", "Region", "Active in", "Customer",
     "First_WeekDate", "Last_WeekDate",
 ]
 
@@ -807,13 +811,13 @@ def _warehouse_long_export_to_long(source, location, header_row):
         if "DisplaySKU" in s or s == "SKU":
             renames[c] = "SKU"
         elif s == "CUSTNMBR":
-            renames[c] = "CUSTNMBR"
+            renames[c] = "Customer"
         elif s == "WeekDate":
             renames[c] = "WeekDate"
         elif "Proj" in s:
             renames[c] = "Projection"
     df = df.rename(columns=renames)
-    needed = ["SKU", "CUSTNMBR", "WeekDate", "Projection"]
+    needed = ["SKU", "Customer", "WeekDate", "Projection"]
     missing_cols = [c for c in needed if c not in df.columns]
     if missing_cols:
         raise ValueError(
@@ -823,7 +827,7 @@ def _warehouse_long_export_to_long(source, location, header_row):
     df = df[needed].copy()
 
     df["SKU"] = df["SKU"].astype(str).str.strip().str.rstrip("*")
-    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
+    df["Customer"] = df["Customer"].astype(str).str.strip()
     # Timestamps *before* any cross-file week union — a mixed wide/long
     # snapshot must not end up with string-vs-Timestamp duplicate week keys.
     df["WeekDate"] = pd.to_datetime(df["WeekDate"], errors="coerce")
@@ -832,13 +836,13 @@ def _warehouse_long_export_to_long(source, location, header_row):
     # Footer notes / stray rows: no usable key -> not data.
     bad_key = (
         df["SKU"].isin(["", "nan", "None"])
-        | df["CUSTNMBR"].isin(["", "nan", "None"])
+        | df["Customer"].isin(["", "nan", "None"])
         | df["WeekDate"].isna()
     )
     df = df[~bad_key]
 
-    long_df = df.sort_values(["SKU", "CUSTNMBR", "WeekDate"]).reset_index(drop=True)
-    long_df["Location"] = location
+    long_df = df.sort_values(["SKU", "Customer", "WeekDate"]).reset_index(drop=True)
+    long_df["Region Code"] = location
     long_df = long_df[WAREHOUSE_LONG_COLS]
     # Tag for combine_warehouse_projections: this frame still needs its
     # missing cells reconstructed (attrs survive because combine reads the
@@ -848,7 +852,7 @@ def _warehouse_long_export_to_long(source, location, header_row):
 
 
 def warehouse_wide_to_long(source, name=None):
-    """Clean one warehouse export into a long frame with a Location column.
+    """Clean one warehouse export into a long frame with a Region Code column.
 
     ``source`` is a filesystem path or a file-like object (e.g. a BytesIO of an
     uploaded workbook); ``name`` supplies the filename used to detect the region
@@ -896,7 +900,7 @@ def warehouse_wide_to_long(source, name=None):
     raw = pd.DataFrame(ws.values)
 
     # 2) Row 0 = title row with week dates starting at column index 2
-    #    Row 1 = "SKU" / "CUSTNMBR" / "Proj..." labels
+    #    Row 1 = "SKU" / "Customer" / "Proj..." labels
     #    Row 2+ = actual data, until a blank row (end of data / start of footer)
     week_dates = raw.iloc[0, 2:].tolist()
     data = raw.iloc[2:].reset_index(drop=True)
@@ -917,15 +921,15 @@ def warehouse_wide_to_long(source, name=None):
     data[0] = data[0].ffill()
 
     # 3) Melt wide -> long
-    data.columns = ["SKU", "CUSTNMBR"] + week_dates
+    data.columns = ["SKU", "Customer"] + week_dates
     long_df = data.melt(
-        id_vars=["SKU", "CUSTNMBR"],
+        id_vars=["SKU", "Customer"],
         value_vars=week_dates,
         var_name="WeekDate",
         value_name="Projection",
     )
-    long_df = long_df.sort_values(["SKU", "CUSTNMBR", "WeekDate"]).reset_index(drop=True)
-    long_df["Location"] = location
+    long_df = long_df.sort_values(["SKU", "Customer", "WeekDate"]).reset_index(drop=True)
+    long_df["Region Code"] = location
     return long_df, location
 
 
@@ -933,21 +937,21 @@ def _reconstruct_missing_cells(long_df, weeks):
     """Rebuild the full pairs × weeks grid for one long-format export.
 
     A long export only lists observed values, so a missing projection is an
-    absent row. Recreate what the wide matrix showed: every (SKU, CUSTNMBR)
+    absent row. Recreate what the wide matrix showed: every (SKU, Customer)
     pair in the file gets a cell for every week in ``weeks``, NaN where the
     file had no row — NaN being exactly the "missing" signal downstream.
     Duplicate keys (e.g. a starred and unstarred variant of the same SKU that
     normalization collapsed) are summed.
     """
-    pairs = long_df[["SKU", "CUSTNMBR"]].drop_duplicates()
+    pairs = long_df[["SKU", "Customer"]].drop_duplicates()
     values = (
         long_df.dropna(subset=["Projection"])
-        .groupby(["SKU", "CUSTNMBR", "WeekDate"], as_index=False)["Projection"]
+        .groupby(["SKU", "Customer", "WeekDate"], as_index=False)["Projection"]
         .sum()
     )
     grid = pairs.merge(pd.DataFrame({"WeekDate": weeks}), how="cross")
-    grid = grid.merge(values, on=["SKU", "CUSTNMBR", "WeekDate"], how="left")
-    grid["Location"] = long_df["Location"].iloc[0]
+    grid = grid.merge(values, on=["SKU", "Customer", "WeekDate"], how="left")
+    grid["Region Code"] = long_df["Region Code"].iloc[0]
     return grid[WAREHOUSE_LONG_COLS]
 
 
@@ -995,7 +999,7 @@ def compute_missing_projections(projections, plytix_df, df, P):
     Mirrors active_missing_projections.py: from the combined warehouse grid
     (``projections``), keep the NaN projection cells, intersect with active
     products in a region that IS in their Plytix 'Active in' list, restrict to
-    the coming 15-week window, and roll up to one row per SKU×Location×customer
+    the coming 15-week window, and roll up to one row per SKU×Region Code×customer
     with the first/last missing week. A Region label (via the pipeline's
     region_for_group) is added from ``df``'s customer groupings so a
     by-customer-group view can scope to its own region, matching the sibling
@@ -1012,7 +1016,7 @@ def compute_missing_projections(projections, plytix_df, df, P):
     if missing.empty:
         return pd.DataFrame(columns=MISSING_COLS)
 
-    # Active (SKU, Location) pairs, restricted to the warehouse regions.
+    # Active (SKU, Region Code) pairs, restricted to the warehouse regions.
     pairs = [
         (sku, loc)
         for sku in active_sku_set
@@ -1021,9 +1025,9 @@ def compute_missing_projections(projections, plytix_df, df, P):
     ]
     if not pairs:
         return pd.DataFrame(columns=MISSING_COLS)
-    active_pairs = pd.DataFrame(pairs, columns=["SKU", "Location"]).drop_duplicates()
+    active_pairs = pd.DataFrame(pairs, columns=["SKU", "Region Code"]).drop_duplicates()
 
-    m = active_pairs.merge(missing, on=["SKU", "Location"], how="inner")
+    m = active_pairs.merge(missing, on=["SKU", "Region Code"], how="inner")
     if m.empty:
         return pd.DataFrame(columns=MISSING_COLS)
 
@@ -1035,15 +1039,15 @@ def compute_missing_projections(projections, plytix_df, df, P):
     if m.empty:
         return pd.DataFrame(columns=MISSING_COLS)
 
-    g = m.groupby(["SKU", "Location", "CUSTNMBR"], as_index=False).agg(
+    g = m.groupby(["SKU", "Region Code", "Customer"], as_index=False).agg(
         First_WeekDate=("WeekDate", "min"),
         Last_WeekDate=("WeekDate", "max"),
     )
     # Full (un-exploded) 'Active in' string per SKU, e.g. "US,CA,UK,SG,EU,AU".
     g["Active in"] = g["SKU"].map(lambda s: sku_active_in.get(s))
 
-    # Region label from the Location code, consistent with the sibling tables
-    # (e.g. Location "JP" -> "JP (NETDEPOT)"). Fall back to the raw code when a
+    # Region label from the region code, consistent with the sibling tables
+    # (e.g. code "JP" -> "JP (NETDEPOT)"). Fall back to the raw code when a
     # region has no customer group in the demand frame.
     code_to_label = {}
     if df is not None and not df.empty:
@@ -1051,8 +1055,8 @@ def compute_missing_projections(projections, plytix_df, df, P):
             code = _region_code(P, grp)
             if code is not None:
                 code_to_label[code] = P.region_for_group(grp)
-    g["Region"] = g["Location"].map(code_to_label).fillna(g["Location"])
+    g["Region"] = g["Region Code"].map(code_to_label).fillna(g["Region Code"])
 
     return g[MISSING_COLS].sort_values(
-        ["SKU", "Location", "CUSTNMBR"]
+        ["SKU", "Region Code", "Customer"]
     ).reset_index(drop=True)

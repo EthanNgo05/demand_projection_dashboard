@@ -552,7 +552,7 @@ def main():
                         tuple((f.name, f.getvalue()) for f in up_wh)
                     )
                 if warehouse_df is not None and not warehouse_df.empty:
-                    locs = ", ".join(sorted(warehouse_df["Location"].unique()))
+                    locs = ", ".join(sorted(warehouse_df["Region Code"].unique()))
                     st.success(f"{len(warehouse_df):,} projection rows ({locs})")
         elif wh_snapshots:
             # Toggle off: silently load the newest warehouse snapshot so the

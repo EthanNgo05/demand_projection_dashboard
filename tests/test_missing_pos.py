@@ -19,7 +19,7 @@ GONE_LAST = LCW - pd.Timedelta(weeks=3)    # last week the "gone silent" combo h
 
 def _row(sku, cust, week, pos=np.nan, orders=np.nan):
     return {
-        "SKU": sku, "Description": "d", "CUSTNMBR": cust, "WeekDate": week,
+        "SKU": sku, "Description": "d", "Customer": cust, "WeekDate": week,
         "POS": pos, "Orders": orders, "Projection": np.nan,
         "Customer Grouping": P.COMBINED_GROUPING.get(cust, cust),
     }
@@ -79,14 +79,14 @@ def test_region_restricted_to_active_in():
     out = data_io.compute_missing_pos_orders(_demand_df(), _plytix(), P, anchors=P.week_anchors(TODAY))
     # SKUGONE is US-only: its stale EU (AMAZON-EU) combo must not appear.
     gone = out[out["SKU"] == "SKUGONE"]
-    assert list(gone["Location"]) == ["US"]
-    assert "EU" not in set(out["Location"])
+    assert list(gone["Region Code"]) == ["US"]
+    assert "EU" not in set(out["Region Code"])
 
 
 def test_missing_weeks_counts_full_gap():
     out = data_io.compute_missing_pos_orders(_demand_df(), _plytix(), P, anchors=P.week_anchors(TODAY))
 
-    gone = out[(out["SKU"] == "SKUGONE") & (out["CUSTNMBR"] == "TARGET-HQ")].iloc[0]
+    gone = out[(out["SKU"] == "SKUGONE") & (out["Customer"] == "TARGET-HQ")].iloc[0]
     # Gap = week after GONE_LAST .. LCW inclusive = 3 weeks.
     assert gone["Missing Weeks"] == 3
     assert pd.Timestamp(gone["First Missing Week"]) == GONE_LAST + pd.Timedelta(weeks=1)

@@ -44,9 +44,9 @@ def test_ingest_honours_pinned_raw_path(sample_raw_path):
 
 def test_ingest_filters_ignored_customers(sample_cleaned_df):
     # Others - UK is in CUSTOMERS_TO_IGNORE and must be dropped by _clean
-    assert "Others - UK" not in set(sample_cleaned_df["CUSTNMBR"])
+    assert "Others - UK" not in set(sample_cleaned_df["Customer"])
     # grouping fold: AMAZON-DS rows map into the AMAZON-DC customer group
-    ds = sample_cleaned_df[sample_cleaned_df["CUSTNMBR"] == "AMAZON-DS"]
+    ds = sample_cleaned_df[sample_cleaned_df["Customer"] == "AMAZON-DS"]
     assert (ds["Customer Grouping"] == "AMAZON-DC").all()
 
 
@@ -72,10 +72,10 @@ def test_clean_strips_sku_whitespace():
 
 
 def test_clean_strips_custnmbr_whitespace_so_groups_fold():
-    """The export also space-pads CUSTNMBR (e.g. 'AMAZON-DS      '). Left padded,
-    it misses COMBINED_GROUPING, so AMAZON-DS never folds into the AMAZON-DC
-    group and the group fragments across padded/clean spellings. _clean must
-    strip CUSTNMBR before the ignore filter and the grouping map.
+    """The export also space-pads the customer column (e.g. 'AMAZON-DS      ').
+    Left padded, it misses COMBINED_GROUPING, so AMAZON-DS never folds into the
+    AMAZON-DC group and the group fragments across padded/clean spellings. _clean
+    must strip the Customer column before the ignore filter and the grouping map.
     """
     from agent import data_io
     from agent.model_loader import load_pipeline
@@ -88,7 +88,7 @@ def test_clean_strips_custnmbr_whitespace_so_groups_fold():
                  "POS", "Sum of Quantity", "Projection"],
     )
     cleaned = data_io._clean(raw, P)
-    assert cleaned["CUSTNMBR"].tolist() == ["AMAZON-DS"]
+    assert cleaned["Customer"].tolist() == ["AMAZON-DS"]
     assert (cleaned["Customer Grouping"] == "AMAZON-DC").all()
 
 

@@ -52,6 +52,7 @@ _CAP = 200          # max checkboxes rendered at once (keeps big fields snappy)
 _ADD_PLACEHOLDER = "➕ Add filter…"
 # Recognised week/date columns across the summary and data-quality tables.
 _DATE_COLS = ["First_WeekDate", "Last_WeekDate",
+              "First Projected Week", "Last Projected Week",
               "First Missing Week", "Last Missing Week"]
 
 
@@ -87,7 +88,7 @@ def _build_fields(df, key, P):
     if "SKU" in df.columns:
         add_checklist("SKU", df["SKU"])
 
-    cust_col = next((c for c in ("Customer Grouping", "CUSTNMBR")
+    cust_col = next((c for c in ("Customer Grouping", "Customer")
                      if c in df.columns), None)
     if cust_col:
         add_checklist("Customer", df[cust_col])
@@ -95,12 +96,12 @@ def _build_fields(df, key, P):
     if "Data Source" in df.columns:
         add_checklist("Data Source", df["Data Source"])
 
-    # Region: an explicit Region/Location column if present, else derived from
+    # Region: an explicit Region/Region Code column if present, else derived from
     # the customer grouping via the loaded pipeline (summary/KPI tables).
     if "Region" in df.columns:
         add_checklist("Region", df["Region"])
-    elif "Location" in df.columns:
-        add_checklist("Region", df["Location"])
+    elif "Region Code" in df.columns:
+        add_checklist("Region", df["Region Code"])
     elif P is not None and "Customer Grouping" in df.columns:
         add_checklist("Region",
                       df["Customer Grouping"].map(lambda g: str(P.region_for_group(g))))

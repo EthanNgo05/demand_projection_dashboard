@@ -24,7 +24,7 @@ def _demand_with_out_of_window_sku():
         rows.append(["CW9999", "other can", "NETDEPOT-JP", wk, 20.0, np.nan, 20,
                      "Others - JP"])
     return pd.DataFrame(rows, columns=[
-        "SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders",
+        "SKU", "Description", "Customer", "WeekDate", "POS", "Orders",
         "Projection", "Customer Grouping"])
 
 

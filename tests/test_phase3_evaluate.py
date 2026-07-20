@@ -33,7 +33,7 @@ def sample_results_state():
                 {
                     "SKU": sku,
                     "Description": f"Synth product {sku}",
-                    "CUSTNMBR": "CUST-1",
+                    "Customer": "CUST-1",
                     "Customer Grouping": "TEST-GROUP",
                     "WeekDate": weeks,
                     "POS": 80 + 25 * i + rng.normal(0, 5, len(weeks)),

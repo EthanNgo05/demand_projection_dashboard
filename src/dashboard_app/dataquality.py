@@ -72,9 +72,13 @@ def render_inactive_section(view, region, check_ran, inactive_df,
     )
 
     show = fdf[[
-        'SKU', 'Region', 'Active in', 'Customer Grouping',
+        'SKU', 'Region', 'Region Code', 'Active in', 'Customer Grouping',
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
-    ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
+    ]].rename(columns={
+        "First_WeekDate": "First Projected Week",
+        "Last_WeekDate": "Last Projected Week",
+        "Original_Projection": "Original Projection (future avg/wk)",
+    })
     render_filtered_table(show, "filter_inactive", style=False)
     st.download_button(
         "⬇️ Download the excluded (inactive-region) projections table",
@@ -111,10 +115,10 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
         )
         return
 
-    # Each CUSTNMBR folds to its forecast customer group (e.g. AMAZON-DS ->
+    # Each Customer folds to its forecast customer group (e.g. AMAZON-DS ->
     # AMAZON-DC); used both to scope a by-customer view and to look up the source.
     grouping = getattr(P, "COMBINED_GROUPING", {}) if P is not None else {}
-    row_group = missing_df["CUSTNMBR"].map(lambda c: grouping.get(c, c))
+    row_group = missing_df["Customer"].map(lambda c: grouping.get(c, c))
 
     # A by-customer-group view shows only that group's rows (not every customer
     # in the region); a per-region "All Customers" rollup shows every group in
@@ -151,7 +155,7 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
     )
 
     show = table_df[[
-        'SKU', 'Location', 'Active in', 'CUSTNMBR',
+        'SKU', 'Region', 'Region Code', 'Active in', 'Customer',
         'First_WeekDate', 'Last_WeekDate',
     ]].rename(columns={
         "First_WeekDate": "First Missing Week",
@@ -160,11 +164,11 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
     # Data source (POS/Orders) from the summary table, keyed by (customer, SKU).
     src_lookup = cust_source or {}
     show.insert(
-        show.columns.get_loc("CUSTNMBR") + 1,
+        show.columns.get_loc("Customer") + 1,
         "Data Source",
         [
             src_lookup.get((grouping.get(c, c), str(s).rstrip("*")))
-            for s, c in zip(show["SKU"], show["CUSTNMBR"])
+            for s, c in zip(show["SKU"], show["Customer"])
         ],
     )
     render_filtered_table(show, "filter_missing", P, style=False)
@@ -235,9 +239,13 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
     )
 
     disc = disc[[
-        'SKU', 'SKU Status', 'Region', 'Customer Grouping',
+        'SKU', 'SKU Status', 'Region', 'Region Code', 'Customer Grouping',
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
-    ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
+    ]].rename(columns={
+        "First_WeekDate": "First Projected Week",
+        "Last_WeekDate": "Last Projected Week",
+        "Original_Projection": "Original Projection (future avg/wk)",
+    })
 
     render_filtered_table(disc, "filter_discontinued", style=False)
     st.download_button(
@@ -292,7 +300,7 @@ def render_missing_pos_section(view, region, missing_pos_df, today_str):
         "look-back)."
     )
 
-    show = table_df.drop(columns=["Region"]).copy()
+    show = table_df.copy()
     show["First Missing Week"] = pd.to_datetime(show["First Missing Week"]).dt.date
     show["Last Missing Week"] = pd.to_datetime(show["Last Missing Week"]).dt.date
 

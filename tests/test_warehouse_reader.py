@@ -114,9 +114,9 @@ def test_wide_export_parses_merged_cells_and_footer(tmp_path):
     assert list(long_df.columns) == data_io.WAREHOUSE_LONG_COLS
     assert len(long_df) == 6  # 3 (SKU, cust) rows x 2 weeks
     # Merged SKU cell forward-filled onto CUSTB's row.
-    assert set(long_df[long_df["CUSTNMBR"] == "CUSTB"]["SKU"]) == {"SKU1"}
+    assert set(long_df[long_df["Customer"] == "CUSTB"]["SKU"]) == {"SKU1"}
     # Blank cells preserved as NaN — the "missing" signal.
-    row = long_df[(long_df["SKU"] == "SKU1") & (long_df["CUSTNMBR"] == "CUSTA")
+    row = long_df[(long_df["SKU"] == "SKU1") & (long_df["Customer"] == "CUSTA")
                   & (long_df["WeekDate"] == W2)]
     assert row["Projection"].isna().all()
     # Footer text never leaks in as data.
@@ -136,9 +136,9 @@ def test_long_export_absent_rows_become_nan(tmp_path):
     combined = data_io.combine_warehouse_projections([(path, path)])
 
     assert len(combined) == 4  # 2 pairs x 2 weeks
-    assert set(combined["Location"]) == {"US"}
+    assert set(combined["Region Code"]) == {"US"}
     missing = combined[combined["Projection"].isna()]
-    assert {(r.SKU, r.CUSTNMBR, r.WeekDate) for r in missing.itertuples()} == {
+    assert {(r.SKU, r.Customer, r.WeekDate) for r in missing.itertuples()} == {
         ("SKU1", "CUSTA", W2), ("SKU2", "CUSTB", W1),
     }
 
@@ -167,7 +167,7 @@ def test_long_export_strips_padding_and_star(tmp_path):
     long_df, _ = data_io.warehouse_wide_to_long(path)
 
     assert list(long_df["SKU"]) == ["SKU1"]
-    assert list(long_df["CUSTNMBR"]) == ["CUSTA"]
+    assert list(long_df["Customer"]) == ["CUSTA"]
 
 
 def test_week_union_spans_all_long_files(tmp_path):
@@ -183,7 +183,7 @@ def test_week_union_spans_all_long_files(tmp_path):
     )
     combined = data_io.combine_warehouse_projections([(us, us), (jp, jp)])
 
-    jp_w2 = combined[(combined["Location"] == "JP") & (combined["WeekDate"] == W2)]
+    jp_w2 = combined[(combined["Region Code"] == "JP") & (combined["WeekDate"] == W2)]
     assert len(jp_w2) == 1
     assert jp_w2["Projection"].isna().all()
 
@@ -199,7 +199,7 @@ def test_headers_only_long_file_contributes_nothing(tmp_path):
     )
     combined = data_io.combine_warehouse_projections([(empty, empty), (us, us)])
 
-    assert set(combined["Location"]) == {"US"}
+    assert set(combined["Region Code"]) == {"US"}
     assert len(combined) == 1
 
 
@@ -251,7 +251,7 @@ def test_missing_projections_end_to_end_from_long_export(tmp_path):
         projections, plytix_frame(["SKU1", "SKU2"]), df=None, P=None)
 
     assert list(missing["SKU"]) == ["SKU1"]
-    assert list(missing["Location"]) == ["US"]
+    assert list(missing["Region Code"]) == ["US"]
     assert missing["First_WeekDate"].iloc[0] == W2
     assert missing["Last_WeekDate"].iloc[0] == W3
 

@@ -9,7 +9,7 @@ import pandas as pd
 
 from agent.demand_profile import demand_profile
 
-COLS = ["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders",
+COLS = ["SKU", "Description", "Customer", "WeekDate", "POS", "Orders",
         "Projection", "Customer Grouping"]
 
 

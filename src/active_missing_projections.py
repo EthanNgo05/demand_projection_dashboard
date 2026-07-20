@@ -37,8 +37,8 @@ if __name__ == '__main__':
 
     sources = [(os.path.join(INPUT_PATH, f), f) for f in xlsx_files]
     projections = data_io.combine_warehouse_projections(sources)
-    for loc in sorted(projections["Location"].unique()):
-        print(f"Cleaned {loc}: {(projections['Location'] == loc).sum()} rows")
+    for loc in sorted(projections["Region Code"].unique()):
+        print(f"Cleaned {loc}: {(projections['Region Code'] == loc).sum()} rows")
 
     # 2) Active SKUs missing future projections in regions they ARE 'Active in'.
     #    df/P are only used to add a Region label (for the dashboard); the batch

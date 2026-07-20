@@ -1202,25 +1202,25 @@ if __name__ == "__main__":
     df = df.rename(
         columns={
             "'Demand'[DisplaySKU]": "SKU",
-            "Custnmbr": "CUSTNMBR",
+            "Custnmbr": "Customer",
             "Sum of Quantity": "Orders",
         }
     )
-    df = df[["SKU", "Description", "CUSTNMBR", "WeekDate", "POS", "Orders", "Projection"]]
-    # The fixed-width export space-pads SKU/CUSTNMBR; strip before any key-based
-    # lookup so SKUs match the list-price index and CUSTNMBRs fold via
+    df = df[["SKU", "Description", "Customer", "WeekDate", "POS", "Orders", "Projection"]]
+    # The fixed-width export space-pads SKU/Customer; strip before any key-based
+    # lookup so SKUs match the list-price index and customers fold via
     # COMBINED_GROUPING. Kept in sync with agent/data_io._clean (shared by the
     # dashboard + agent), which this __main__ block mirrors.
     df["SKU"] = df["SKU"].astype(str).str.strip()
-    df["CUSTNMBR"] = df["CUSTNMBR"].astype(str).str.strip()
-    df = df[~df['CUSTNMBR'].isin(CUSTOMERS_TO_IGNORE)]
+    df["Customer"] = df["Customer"].astype(str).str.strip()
+    df = df[~df['Customer'].isin(CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
 
     # Consolidated customer group. Customers absent from COMBINED_GROUPING fall
     # back to their own name (single-member group), so nothing is dropped.
-    df["Customer Grouping"] = df["CUSTNMBR"].map(COMBINED_GROUPING).fillna(df["CUSTNMBR"])
+    df["Customer Grouping"] = df["Customer"].map(COMBINED_GROUPING).fillna(df["Customer"])
     ungrouped = sorted(
-        df.loc[~df["CUSTNMBR"].isin(COMBINED_GROUPING), "CUSTNMBR"].dropna().unique()
+        df.loc[~df["Customer"].isin(COMBINED_GROUPING), "Customer"].dropna().unique()
     )
     if ungrouped:
         print(

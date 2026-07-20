@@ -113,8 +113,8 @@ def test_written_snapshot_round_trips_through_dashboard_reader(tmp_path):
     combined = data_io.combine_warehouse_projections(
         [(p, p) for p in snapshots["2026-07-14"]]
     )
-    assert set(combined["Location"]) == {"US", "JP"}
-    jp_w2 = combined[(combined["Location"] == "JP") & (combined["WeekDate"] == W2)]
+    assert set(combined["Region Code"]) == {"US", "JP"}
+    jp_w2 = combined[(combined["Region Code"] == "JP") & (combined["WeekDate"] == W2)]
     assert jp_w2["Projection"].isna().all()
-    us_vals = combined[combined["Location"] == "US"].dropna(subset=["Projection"])
+    us_vals = combined[combined["Region Code"] == "US"].dropna(subset=["Projection"])
     assert us_vals["Projection"].sum() == 7
