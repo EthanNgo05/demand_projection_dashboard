@@ -13,7 +13,7 @@ from dashboard_app.compute import (
     summary_to_excel,
 )
 from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart
-from dashboard_app.tables import style_summary, search_filter
+from dashboard_app.tables import render_filtered_table
 
 
 def _render_kpis(summary, agg, anchors):
@@ -116,7 +116,7 @@ def _render_kpis(summary, agg, anchors):
 
 
 def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows,
-                                anchors):
+                                anchors, P=None):
     """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
 
     Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
@@ -310,10 +310,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         table = combined.sort_values(["SKU", "Customer Grouping"]).reset_index(drop=True)
         st.caption("Each SKU broken out by customer group.")
 
-    st.dataframe(
-        style_summary(search_filter(table, key="search_best_mix")),
-        width="stretch", hide_index=True,
-    )
+    render_filtered_table(table, "filter_best_mix", P, style=True)
     st.download_button(
         "⬇️ Download the combined best-model table",
         data=summary_to_excel(table),

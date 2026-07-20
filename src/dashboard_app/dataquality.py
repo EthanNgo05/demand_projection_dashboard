@@ -4,7 +4,7 @@ import streamlit as st
 
 from dashboard_app.config import ALL_CUSTOMERS_VIEW, region_from_view
 from dashboard_app.datasources import _this_week_start
-from dashboard_app.tables import search_filter
+from dashboard_app.tables import render_filtered_table
 from dashboard_app.compute import summary_to_excel
 
 
@@ -75,10 +75,7 @@ def render_inactive_section(view, region, check_ran, inactive_df,
         'SKU', 'Region', 'Active in', 'Customer Grouping',
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
     ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
-    st.dataframe(
-        search_filter(show, key="search_inactive"),
-        width="stretch", hide_index=True,
-    )
+    render_filtered_table(show, "filter_inactive", style=False)
     st.download_button(
         "⬇️ Download the excluded (inactive-region) projections table",
         data=summary_to_excel(show, sheet_name="inactive_projections"),
@@ -170,10 +167,7 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
             for s, c in zip(show["SKU"], show["CUSTNMBR"])
         ],
     )
-    st.dataframe(
-        search_filter(show, key="search_missing"),
-        width="stretch", hide_index=True,
-    )
+    render_filtered_table(show, "filter_missing", P, style=False)
     st.download_button(
         "⬇️ Download the missing-projections table",
         data=summary_to_excel(show, sheet_name="missing_projections"),
@@ -245,10 +239,7 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
         'First_WeekDate', 'Last_WeekDate', 'Original_Projection',
     ]].rename(columns={"Original_Projection": "Original Projection (future avg/wk)"})
 
-    st.dataframe(
-        search_filter(disc, key="search_discontinued"),
-        width="stretch", hide_index=True,
-    )
+    render_filtered_table(disc, "filter_discontinued", style=False)
     st.download_button(
         "⬇️ Download the discontinued/inactive projections table",
         data=summary_to_excel(disc, sheet_name="discontinued_projections"),
@@ -305,10 +296,7 @@ def render_missing_pos_section(view, region, missing_pos_df, today_str):
     show["First Missing Week"] = pd.to_datetime(show["First Missing Week"]).dt.date
     show["Last Missing Week"] = pd.to_datetime(show["Last Missing Week"]).dt.date
 
-    st.dataframe(
-        search_filter(show, key="search_missing_pos"),
-        width="stretch", hide_index=True,
-    )
+    render_filtered_table(show, "filter_missing_pos", style=False)
     st.download_button(
         "⬇️ Download the missing POS/Orders table",
         data=summary_to_excel(show, sheet_name="missing_pos_orders"),

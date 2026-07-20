@@ -117,7 +117,7 @@ from dashboard_app.charts import (  # noqa: F401
     _base_layout, _clip_to_range, aggregate_chart, chart_range_control, sku_chart,
 )
 from dashboard_app.tables import (  # noqa: F401
-    render_filtered_table, search_filter, style_summary,
+    render_filtered_table, style_summary,
 )
 from dashboard_app.datasources import (  # noqa: F401
     DISCONTINUED_COLS, INACTIVE_COLS, MISSING_COLS, MISSING_POS_COLS, WAREHOUSE_REGIONS,
@@ -808,7 +808,7 @@ def main():
     # stitched per-group best-model table and stops.
     if view == BEST_MODEL_COMBINED_VIEW:
         _render_best_model_combined(
-            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw)
+            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P
         )
         st.stop()
 
