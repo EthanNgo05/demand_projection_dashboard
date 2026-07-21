@@ -342,9 +342,13 @@ def main():
                 "Manually override data",
                 value=False,
                 key="data_override",
-                help="Off: always load the newest snapshot, Plytix feed, and "
-                     "warehouse files. On: pick specific files or upload your "
-                     "own in the boxes that appear below.",
+                help="""
+        **Off (recommended)**:
+        Automatically loads the latest data snapshot, Plytix feed, and warehouse files.
+
+        **On**:
+        Lets you choose specific files from previous snapshots or upload your own files for analysis.
+        """,
             )
         with col_btn:
             do_refresh = False
@@ -655,9 +659,26 @@ def main():
             [ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, "By region"],
             index=0,
             format_func=lambda s: SCOPE_LABELS.get(s, s),
-            help="“Optimal Projections (Combined)” forecasts each customer group "
-                 "with its own most-accurate model (from the model-analysis "
-                 "recommendations) and stitches them into one table.",
+            help="""
+            Choose how forecasts are grouped before modeling.
+
+            **Executive Overview**
+            Forecasts all customer groups as one combined demand series using the forecasting model selected in the sidebar.
+
+            **Optimal Projections**
+            Forecasts each customer group with its own most-accurate model (determined by model analysis), then combines the results into a single table. Requires the model analysis pipeline to have been run for all customer groups.
+
+            **By Region**
+            Forecasts only the selected fulfillment region (or customer group within that region) using the forecasting model selected in the sidebar.
+
+            **Summary:**
+
+            • Executive Overview: One model across all customers.
+
+            • Optimal Projections: Best model for each customer group, combined into one view.
+
+            • By Region: One model applied only to the selected customer group.
+            """,
         )
         if scope == ALL_CUSTOMERS_VIEW:
             view = ALL_CUSTOMERS_VIEW
@@ -698,9 +719,13 @@ def main():
             "Reasoning LLM",
             list(LLM_PROVIDERS.keys()),
             key="agent_llm_provider",
-            help="Which LLM writes the summary + anomaly flags. Anthropic "
-                 "calls the Claude API (needs ANTHROPIC_API_KEY in .env); Local "
-                 "uses the OpenAI-compatible server in LOCAL_LLM_* (.env).",
+            help="""
+    Select which large language model (LLM) generates the forecast summary and anomaly analysis.
+
+    **Anthropic (Claude)** uses Anthropic's Claude API and requires an `ANTHROPIC_API_KEY`.
+
+    **Local (Gemma)** runs Google's Gemma model locally and does not require an external API.
+    """,
         )
         # Anthropic needs a key; without one, block the run and steer the user
         # to Local rather than silently degrading to it behind the scenes.
