@@ -108,7 +108,7 @@ def _render_kpis(summary, agg, anchors):
     if n_orders:
         st.caption(
             f"⚑ {n_orders} of {n_skus} SKUs had no POS in the window and "
-            "were forecast from Orders (see the Data Source column)."
+            "were forecast from Orders."
         )
     if PRICE_COL in summary.columns:
         n_noprice = int(summary.drop_duplicates("SKU")[PRICE_COL].isna().sum())

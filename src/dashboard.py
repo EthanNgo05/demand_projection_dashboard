@@ -674,13 +674,13 @@ def main():
             help="""
             Choose how forecasts are grouped before modeling.
 
-            **Executive Overview**
+            **Executive Overview:**
             Forecasts all customer groups as one combined demand series using the forecasting model selected in the sidebar.
 
-            **Optimal Projections**
+            **Optimal Projections:**
             Forecasts each customer group with its own most-accurate model (determined by model analysis), then combines the results into a single table. Requires the model analysis pipeline to have been run for all customer groups.
 
-            **By Region**
+            **By Region:**
             Forecasts only the selected fulfillment region (or customer group within that region) using the forecasting model selected in the sidebar.
 
             **Summary:**
@@ -734,9 +734,9 @@ def main():
             help="""
     Select which large language model (LLM) generates the forecast summary and anomaly analysis.
 
-    **Anthropic (Claude)** uses Anthropic's Claude API and requires an `ANTHROPIC_API_KEY`.
+    **Anthropic (Claude):** uses Anthropic's Claude API and requires an `ANTHROPIC_API_KEY`.
 
-    **Local (Gemma)** runs Google's Gemma model locally and does not require an external API.
+    **Local (Gemma):** runs Google's Gemma model locally and does not require an external API.
     """,
         )
         # Anthropic needs a key; without one, block the run and steer the user
