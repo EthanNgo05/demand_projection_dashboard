@@ -331,11 +331,6 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         table = combined.sort_values(["SKU", "Customer Grouping"]).reset_index(drop=True)
         st.caption("Each SKU broken out by customer group.")
 
-    # Drop the per-model outlier/promo bookkeeping columns — noise in this view.
-    table = table.drop(
-        columns=["Promo Weeks Uplifted", "Outlier Weeks Cleaned"], errors="ignore"
-    )
-
     # Display copy: mark the All-History average with a '*' where the value is
     # really the 8-Week Moving Average model's 8-week run-rate (that model has no
     # all-history average). The numeric `table` is kept for the Excel download;
