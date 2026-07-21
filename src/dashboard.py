@@ -265,7 +265,15 @@ def main():
             "Forecasting model", list(MODEL_OPTIONS.keys()),
             key="model_choice", on_change=_on_model_change,
             format_func=model_display,
-            help="Switching recomputes everything with the selected pipeline.",
+            help="""
+        **Forecasting models**
+
+        - **8-Week Moving Average** – Simple baseline model that forecasts using the average demand over the previous 8 weeks.
+        - **Holt's (Double) Exponential Smoothing** – Standard time series forecasting model that captures both level and trend.
+        - **Holt-Winters (Triple) Exponential Smoothing** – Extends Holt's method by also modeling seasonality, making it well suited for recurring demand patterns.
+        - **XGBoost** – Machine learning model that can capture complex relationships and nonlinear patterns in demand data. Best when sufficient historical data and predictive features are available.
+        - **TSB (Teunter-Syntetos-Babai)** – Designed for intermittent demand, where products have many zero-demand periods with occasional sales.
+        """,
         )
 
     P = load_pipeline(pipeline_path())
