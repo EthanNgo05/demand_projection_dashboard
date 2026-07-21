@@ -137,7 +137,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     page title is already rendered by main() before this branch, so we start at the
     section subheader to avoid showing it twice.
     """
-    st.subheader("Optimal Projections (Combined)")
+    st.subheader("Optimized Projections")
     st.caption(
         "Each customer group is forecast with its own most-accurate model "
         "(from the latest model-analysis recommendations) and stitched into one "
@@ -213,7 +213,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     st.caption(f"{int(counts.sum())} groups:\n{parts}")
 
     _, lcw, ffw = anchors
-    view_label = "Optimal Projections (Combined)"
+    view_label = "Optimized Projections"
 
     # Chart-only anchors: the passed-in `anchors` come from the sidebar model's
     # week_anchors, whose lookback start (lb) is as short as 8 weeks (8-Week

@@ -65,7 +65,7 @@ MODEL_USED_COL = "Model Used"
 # what the planner sees, never the ID.
 SCOPE_LABELS = {
     ALL_CUSTOMERS_VIEW: "Executive Overview",
-    BEST_MODEL_COMBINED_VIEW: "Optimal Projections (Combined)",
+    BEST_MODEL_COMBINED_VIEW: "Optimized Projections",
     "By region": "By Region",
 }
 

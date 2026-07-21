@@ -77,7 +77,7 @@ def _confirm_run_all_dialog(provider):
     st.warning(
         "It runs in the background and can take **up to 1 hour**. You can keep "
         "using the dashboard while it runs; each view's recommendation updates as "
-        "it finishes, and the **Optimal Projections (Combined)** view fills in as "
+        "it finishes, and the **Optimized Projections** view fills in as "
         "groups complete."
     )
     left, right = st.columns(2)

@@ -668,7 +668,7 @@ def main():
         by_region = list_views(df)
         scope = st.radio(
             "Scope",
-            [ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, "By region"],
+            [ALL_CUSTOMERS_VIEW, "By region", BEST_MODEL_COMBINED_VIEW],
             index=0, key="scope",
             format_func=lambda s: SCOPE_LABELS.get(s, s),
             help="""
@@ -677,7 +677,7 @@ def main():
             **Executive Overview:**
             Forecasts all customer groups as one combined demand series using the forecasting model selected in the sidebar.
 
-            **Optimal Projections:**
+            **Optimized Projections:**
             Forecasts each customer group with its own most-accurate model (determined by model analysis), then combines the results into a single table. Requires the model analysis pipeline to have been run for all customer groups.
 
             **By Region:**
@@ -687,7 +687,7 @@ def main():
 
             • Executive Overview: One model across all customers.
 
-            • Optimal Projections: Best model for each customer group, combined into one view.
+            • Optimized Projections: Best model for each customer group, combined into one view.
 
             • By Region: One model applied only to the selected customer group.
             """,
