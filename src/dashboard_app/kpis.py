@@ -262,12 +262,18 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
                       date_range=sku_range),
             width="stretch",
         )
-        group_names = sorted(rows["Customer Grouping"].astype(str))
-        group_lines = "\n".join(f"- {g}" for g in group_names)
+        # One line per group, annotated with the best model used for that group
+        # (rows carries one row per Customer Grouping, each with MODEL_USED_COL).
+        group_models = sorted(
+            zip(rows["Customer Grouping"].astype(str),
+                rows[MODEL_USED_COL].astype(str)),
+            key=lambda gm: gm[0],
+        )
+        group_lines = "\n".join(f"- {g} — {m}" for g, m in group_models)
         st.caption(
             f"Totals across every group carrying this SKU "
-            f"({len(group_names)} group{'s' if len(group_names) != 1 else ''}):\n"
-            f"{group_lines}"
+            f"({len(group_models)} group{'s' if len(group_models) != 1 else ''}), "
+            f"with the model used for each:\n{group_lines}"
         )
     with cR:
         # Metrics aggregate the SKU's per-group rows: forecast/risk totals sum;
