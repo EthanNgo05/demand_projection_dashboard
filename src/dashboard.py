@@ -161,6 +161,16 @@ def main():
         page_title="Demand Projections", page_icon="📦", layout="wide"
     )
 
+    # Keep the reasoning-LLM choice across reruns where the sidebar radio isn't
+    # re-rendered — the refresh buttons st.rerun() before the script reaches the
+    # radio (see the "Sync" / "Check for new data" buttons above the model
+    # analysis section). Streamlit garbage-collects an unrendered keyed widget's
+    # state, which would snap the radio back to its first option (Anthropic) and
+    # spuriously surface the "No ANTHROPIC_API_KEY" warning even when the user
+    # picked Local. Re-registering the key here preserves the actual selection.
+    if "agent_llm_provider" in st.session_state:
+        st.session_state["agent_llm_provider"] = st.session_state["agent_llm_provider"]
+
     # Widen the sidebar a touch (Streamlit's default is ~244-260px). Adjust
     # SIDEBAR_WIDTH_PX to taste; users can still drag the divider to resize.
     SIDEBAR_WIDTH_PX = 340
