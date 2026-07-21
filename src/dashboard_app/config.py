@@ -38,9 +38,9 @@ DEFAULT_MODEL = next(iter(MODEL_OPTIONS), None)
 # model IDs (the agent's best_model, agent/config.py, agent_summary_*.json), so
 # we only prettify what the planner sees — never the stored identifier.
 MODEL_DISPLAY = {
-    "Holt's (double) exponential smoothing": "Holt's (Double) Exponential Smoothing",
-    "Holt-Winters (triple) exponential smoothing": "Holt-Winters (Triple) Exponential Smoothing",
-    "TSB (intermittent demand)": "TSB (Intermittent Demand)",
+    "Holt's (double) exponential smoothing": "Holt's Exponential Smoothing",
+    "Holt-Winters (triple) exponential smoothing": "Holt-Winters Exponential Smoothing",
+    "TSB (intermittent demand)": "TSB",
 }
 
 
