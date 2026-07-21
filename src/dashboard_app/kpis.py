@@ -166,8 +166,8 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     else:
         result = st.session_state.get("bestmix_result")
 
-    combined, weekly_all, agg_all, excluded = (
-        result if result is not None else (None, None, None, [])
+    combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded = (
+        result if result is not None else (None, None, None, None, None, [])
     )
 
     generated_at = st.session_state.get("bestmix_generated_at")
@@ -239,6 +239,27 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         "Actual demand uses each SKU's forecast source (POS or Orders); where a "
         "SKU is forecast from different sources across groups, the most recent "
         "group's source labels the actual-demand line."
+    )
+
+    # ----- Per-customer detail ----------------------------------------------
+    # One customer group's total weekly demand (same shape as the aggregate
+    # chart, drawn from that group's un-summed per-group frames).
+    st.markdown("### Customer detail")
+    customers = sorted(combined["Customer Grouping"].astype(str).unique())
+    customer = st.selectbox(
+        "Customer", customers, help="Type to search", key="best_customer"
+    )
+    agg_c = agg_by_group[agg_by_group["Customer Grouping"].astype(str) == customer]
+    wk_c = weekly_by_group[weekly_by_group["Customer Grouping"].astype(str) == customer]
+    summary_c = combined[combined["Customer Grouping"].astype(str) == customer]
+    cust_range = chart_range_control(agg_c, wk_c, lcw, key="range_cust_best")
+    st.plotly_chart(
+        aggregate_chart(
+            agg_c, summary_c, wk_c,
+            (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw),
+            customer, date_range=cust_range,
+        ),
+        width="stretch",
     )
 
     # ----- Per-SKU detail ---------------------------------------------------

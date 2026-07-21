@@ -267,14 +267,18 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
     null — history too short to score any model), are left OUT of the table and
     returned separately so the caller can list them.
 
-    Returns ``(table, weekly_all, agg_all, excluded)`` where ``table`` is a
-    DataFrame (SUMMARY_COLUMNS + MODEL_USED_COL) or None when no group resolved /
-    produced rows; ``weekly_all`` / ``agg_all`` are the per-group forecast and
-    SKU-week aggregate frames stitched together and summed by (SKU, WeekDate) so
-    the view can draw the total-demand and per-SKU charts (None alongside a None
-    table); and ``excluded`` is the sorted list of group names with no best model.
-    Groups are disjoint customer subsets, so summing by (SKU, WeekDate) is a plain
-    total — no double counting — and the actuals match the Executive Overview.
+    Returns ``(table, weekly_all, agg_all, weekly_by_group, agg_by_group,
+    excluded)`` where ``table`` is a DataFrame (SUMMARY_COLUMNS + MODEL_USED_COL)
+    or None when no group resolved / produced rows; ``weekly_all`` / ``agg_all``
+    are the per-group forecast and SKU-week aggregate frames stitched together and
+    summed by (SKU, WeekDate) so the view can draw the total-demand and per-SKU
+    charts; ``weekly_by_group`` / ``agg_by_group`` are the SAME per-group frames
+    stitched together but NOT summed — each row keeps its ``Customer Grouping`` so
+    the view can draw one customer group's total on demand (all four frames are
+    None alongside a None table); and ``excluded`` is the sorted list of group
+    names with no best model. Groups are disjoint customer subsets, so summing by
+    (SKU, WeekDate) is a plain total — no double counting — and the actuals match
+    the Executive Overview.
     """
     groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
 
@@ -289,7 +293,7 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         else:
             resolved[group] = best
     if not resolved:
-        return None, None, None, excluded
+        return None, None, None, None, None, excluded
 
     # Second pass: forecast each resolved group with its own model (autofit when
     # supported). Alongside each group's summary we keep its weekly forecast and
@@ -297,6 +301,10 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
     frames = []
     weekly_frames = []
     agg_frames = []
+    # Same per-group frames, tagged with the group and NOT summed away — feed the
+    # per-customer "Customer detail" chart.
+    weekly_by_group_frames = []
+    agg_by_group_frames = []
     n = len(resolved)
     for i, (group, (label, path)) in enumerate(resolved.items()):
         sub = df[df["Customer Grouping"] == group]
@@ -321,11 +329,15 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
             ag = agg[["SKU", "WeekDate", "POS", "Orders", "Projection"]].copy()
             ag["WeekDate"] = pd.to_datetime(ag["WeekDate"])
             agg_frames.append(ag)
+            # Tagged copies for the per-customer chart (kept separate so the
+            # summed weekly_all/agg_all above are unaffected).
+            weekly_by_group_frames.append(wk.assign(**{"Customer Grouping": group}))
+            agg_by_group_frames.append(ag.assign(**{"Customer Grouping": group}))
         if progress_cb is not None:
             progress_cb(i + 1, n, group)
 
     if not frames:
-        return None, None, None, excluded
+        return None, None, None, None, None, excluded
     combined = pd.concat(frames, ignore_index=True)
 
     # Consolidate the descriptive-average columns into a single
@@ -360,7 +372,9 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         .groupby(["SKU", "WeekDate"], as_index=False)[["POS", "Orders", "Projection"]]
         .sum(min_count=1)
     )
-    return combined, weekly_all, agg_all, excluded
+    weekly_by_group = pd.concat(weekly_by_group_frames, ignore_index=True)
+    agg_by_group = pd.concat(agg_by_group_frames, ignore_index=True)
+    return combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded
 
 
 def _agent_summary_path(view):
