@@ -1,5 +1,6 @@
 """Subprocess-backed manual refresh (demand / warehouse / agent batch)."""
 import os
+import re
 import sys
 import time
 import logging
@@ -15,6 +16,30 @@ from dashboard_app.config import HERE, REPO_ROOT
 from dashboard_app import datasources
 
 logger = logging.getLogger("demand_dashboard")
+
+
+def _bg_creationflags():
+    """Windows flags for a background child that shows NO console window.
+
+    ``CREATE_NO_WINDOW`` gives the child a *hidden* console (rather than none at
+    all, as ``DETACHED_PROCESS`` would); any grandchildren it spawns — e.g. the
+    agent batch's process-pool workers — inherit that hidden console instead of
+    each allocating a fresh visible terminal window. ``CREATE_NEW_PROCESS_GROUP``
+    keeps the child off the parent's Ctrl-C group. Non-Windows: no flags.
+    """
+    if os.name == "nt":
+        return subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    return 0
+
+
+def _child_env(**overrides):
+    """Child environment with UTF-8 stdout/stderr so logs are decodable.
+
+    Without ``PYTHONIOENCODING`` the child writes its log in the Windows locale
+    code page (cp1252), where characters like '×' become byte 0xd7 that a UTF-8
+    reader can't decode. Pinning UTF-8 keeps the log consistent with our readers.
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", **overrides}
 
 
 # --------------------------------------------------------------------------- #
@@ -156,14 +181,10 @@ def _launch_refresh(lock_path, script, extra_args, env_overrides, header):
         f.write(now)
 
     try:
-        env = {**os.environ, **env_overrides}
-        # Detach on Windows so the pull outlives this Streamlit run/rerun and
-        # isn't tied to the parent's console.
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = (
-                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
+        env = _child_env(**env_overrides)
+        # Run hidden on Windows so the pull outlives this Streamlit run/rerun
+        # without flashing a console window (see _bg_creationflags).
+        creationflags = _bg_creationflags()
         logf = open(_refresh_log_path(), "a", encoding="utf-8")
         try:
             logf.write(f"\n===== {header} started {now} =====\n")
@@ -277,13 +298,93 @@ def _batch_result_line():
 
     Lets the completion toast report the outcome without the batch signalling
     back into this process. Best-effort: any read error just yields None.
+
+    ``errors="replace"`` keeps legacy cp1252 logs (written before the child was
+    pinned to UTF-8) from raising UnicodeDecodeError while iterating every line;
+    the 'Done:' line itself is pure ASCII, so it is never affected.
     """
     try:
-        with open(_batch_log_path(), encoding="utf-8") as f:
+        with open(_batch_log_path(), encoding="utf-8", errors="replace") as f:
             done = [ln.strip() for ln in f if ln.strip().startswith("Done:")]
         return done[-1] if done else None
     except OSError:
         return None
+
+
+def batch_progress():
+    """(done, total) from the batch log's latest '[N/M]' line, or None.
+
+    The batch prints one '  [k/total] <view> -> …' line per finished view, so the
+    highest k seen is how many views are done. Best-effort and tolerant of legacy
+    (non-UTF-8) logs; returns None if no progress line is present yet.
+    """
+    try:
+        done = total = None
+        with open(_batch_log_path(), encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                m = re.search(r"\[(\d+)/(\d+)\]", ln)
+                if m:
+                    done, total = int(m.group(1)), int(m.group(2))
+        if total:
+            return done, total
+    except OSError:
+        pass
+    return None
+
+
+def batch_failures():
+    """[(view, error), …] for the most recent batch run, or [] if none.
+
+    The batch prints a 'Failures:' block after its final 'Done:' line, one
+    '  <view>: <error>' per line. We read the block belonging to the LATEST run
+    (after the last 'Done:'), so a retry that clears a view drops it from the
+    list next time. View names contain no ': ', so the first ': ' splits view
+    from error. Tolerant of legacy (non-UTF-8) logs.
+    """
+    try:
+        with open(_batch_log_path(), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    done_idx = max(
+        (i for i, ln in enumerate(lines) if ln.strip().startswith("Done:")),
+        default=None,
+    )
+    if done_idx is None:
+        return []
+    out = []
+    in_block = False
+    for ln in lines[done_idx + 1:]:
+        if ln.strip() == "Failures:":
+            in_block = True
+            continue
+        if in_block and ln.startswith("  ") and ": " in ln:
+            view, err = ln.strip().split(": ", 1)
+            out.append((view, err))
+        elif in_block and ln.strip() and not ln.startswith("  "):
+            break  # reached the next run's header / unrelated content
+    return out
+
+
+def batch_result_message():
+    """A friendly, non-technical completion sentence for the toast, or None.
+
+    Translates the raw 'Done: N ok, M failed …' log line into planner-facing
+    wording. Returns None only when there is no result line yet (caller supplies
+    its own fallback).
+    """
+    line = _batch_result_line()
+    if not line:
+        return None
+    m = re.search(r"Done:\s*(\d+)\s*ok,\s*(\d+)\s*failed", line)
+    if not m:
+        return "Recommendations finished."
+    ok, failed = int(m.group(1)), int(m.group(2))
+    total = ok + failed
+    if failed == 0:
+        return f"✅ Finished — recommendations updated for all {total} views."
+    return (f"Finished — {ok} of {total} views updated; "
+            f"{failed} need another try (listed below).")
 
 
 def batch_in_progress():
@@ -317,14 +418,16 @@ def batch_in_progress():
     return True, started
 
 
-def start_agent_batch(provider):
+def start_agent_batch(provider, views=None):
     """Launch `python -m agent.batch` in the background. Returns (ok, message).
 
     Reuses THIS interpreter/venv and inherits the environment; ``provider`` pins
-    the reasoning LLM (LLM_PROVIDER) for the run. The lock is written BEFORE
-    launching so a double-click can't spawn two batches. Output is appended to
-    logs/<date>/logs_agent_batch.txt; the Popen handle is stored in session_state
-    so this session detects completion without waiting for the stale timeout.
+    the reasoning LLM (LLM_PROVIDER) for the run. Pass ``views`` (a list of view
+    names) to re-run ONLY those — the "Retry failed views" path — instead of the
+    full ~60-view batch. The lock is written BEFORE launching so a double-click
+    can't spawn two batches. Output is appended to today's batch log; the Popen
+    handle is stored in session_state so this session detects completion without
+    waiting for the stale timeout.
     """
     running, started = batch_in_progress()
     if running:
@@ -337,21 +440,21 @@ def start_agent_batch(provider):
         f.write(now)
 
     try:
-        env = {**os.environ, "LLM_PROVIDER": provider}
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = (
-                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
+        env = _child_env(LLM_PROVIDER=provider)
+        creationflags = _bg_creationflags()
+        cmd = [sys.executable, "-m", "agent.batch", "--provider", provider]
+        if views:
+            cmd += ["--views", *views]
+        scope = f"{len(views)} view(s)" if views else "all views"
         logf = open(_batch_log_path(), "a", encoding="utf-8")
         try:
-            logf.write(f"\n===== Agent batch (all views) started {now} =====\n")
+            logf.write(f"\n===== Agent batch ({scope}) started {now} =====\n")
             logf.flush()
             # `-m agent.batch` resolves because cwd=HERE is src/ (agent is a
             # package under src/). Provider is also passed as a flag so a stale
             # env can't override it.
             proc = subprocess.Popen(
-                [sys.executable, "-m", "agent.batch", "--provider", provider],
+                cmd,
                 cwd=HERE,
                 env=env,
                 stdout=logf,
@@ -369,5 +472,6 @@ def start_agent_batch(provider):
 
     st.session_state["agent_batch_proc"] = proc
     st.session_state["agent_batch_started"] = now
-    logger.info("Agent batch launched (%s, provider=%s)", now, provider)
+    logger.info("Agent batch launched (%s, provider=%s, scope=%s)",
+                now, provider, scope)
     return True, now

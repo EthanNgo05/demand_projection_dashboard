@@ -140,7 +140,8 @@ from dashboard_app.refresh import (  # noqa: F401
     BATCH_STALE_SECONDS, EXTRACT_SCRIPT, REFRESH_STALE_SECONDS, WAREHOUSE_EXTRACT_SCRIPT,
     _batch_lock_path, _batch_log_path, _batch_result_line, _clear_lock, _launch_refresh,
     _refresh_lock_path, _refresh_log_path, _refresh_state, _wh_refresh_lock_path,
-    _wh_snapshot_complete_since, batch_in_progress, refresh_in_progress, start_agent_batch,
+    _wh_snapshot_complete_since, batch_failures, batch_in_progress, batch_progress,
+    batch_result_message, refresh_in_progress, start_agent_batch,
     start_refresh, start_warehouse_refresh, warehouse_refresh_in_progress,
 )
 from dashboard_app.agent_summary import (  # noqa: F401
@@ -703,21 +704,29 @@ def main():
         # the recommendation it produces); only the global all-views run and the
         # reasoning-LLM selector stay here in the sidebar.
 
-        # All-views run (same work as `python -m agent.batch`). Detached
-        # background process; while it runs the button becomes a status check.
+        # All-views run (same work as `python -m agent.batch`). Runs hidden in
+        # the background; while it runs the button becomes a status check.
         batch_running, batch_started = batch_in_progress()
         if batch_running:
-            st.info(f"⏳ Recommending models for all views… started "
-                    f"{batch_started or '?'}. Runs in the background — "
-                    "see logs/<date>/logs_agent_batch.txt.")
+            prog = batch_progress()
+            if prog:
+                done, total = prog
+                st.info(f"⏳ Recommending the best model for every view — "
+                        f"{done} of {total} done. This runs in the background, "
+                        "so you can keep using the dashboard.")
+            else:
+                st.info("⏳ Recommending the best model for every view — getting "
+                        "started. This runs in the background, so you can keep "
+                        "using the dashboard.")
             if st.button("Check progress", key="check_agent_batch"):
                 st.rerun()
         else:
             # A just-finished run (this session): surface its outcome once.
             proc = st.session_state.get("agent_batch_proc")
             if proc is not None and proc.poll() is not None:
-                line = _batch_result_line() or "Model analysis finished (all views)."
-                st.session_state["_batch_toast"] = line
+                st.session_state["_batch_toast"] = (
+                    batch_result_message() or "Recommendations finished."
+                )
                 st.session_state.pop("agent_batch_proc", None)
             run_all = st.button(
                 "Recommend models (all views)",
@@ -729,6 +738,25 @@ def main():
             )
             if run_all:
                 _confirm_run_all_dialog(LLM_PROVIDERS[provider_label])
+
+            # If the last run left any views un-updated, name them and offer a
+            # targeted retry (re-runs ONLY those, not the whole batch).
+            failures = batch_failures()
+            if failures:
+                names = [v for v, _ in failures]
+                st.warning(
+                    "These views couldn't be updated last time:\n"
+                    + "\n".join(f"- {n}" for n in names)
+                )
+                if st.button("Retry failed views", key="retry_agent_failed",
+                             disabled=anthropic_no_key):
+                    ok, msg = start_agent_batch(
+                        LLM_PROVIDERS[provider_label], views=names
+                    )
+                    st.session_state["_batch_toast"] = (
+                        f"Retrying {len(names)} view(s)…" if ok else f"⚠️ {msg}"
+                    )
+                    st.rerun()
 
     # Surface batch start/finish toasts once (set from the dialog / poll above).
     if "_batch_toast" in st.session_state:

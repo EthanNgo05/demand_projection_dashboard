@@ -87,7 +87,10 @@ def _confirm_run_all_dialog(provider):
                     type="primary", width="stretch"):
         ok, msg = start_agent_batch(provider)
         if ok:
-            st.session_state["_batch_toast"] = f"Model analysis started ({msg})."
+            st.session_state["_batch_toast"] = (
+                "Started — recommending the best model for every view. "
+                "This can take up to an hour."
+            )
         else:
             st.session_state["_batch_toast"] = f"⚠️ {msg}"
         st.rerun()

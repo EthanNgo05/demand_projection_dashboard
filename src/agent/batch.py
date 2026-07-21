@@ -118,6 +118,9 @@ def main(argv=None) -> int:
     ap.add_argument("--provider", choices=["anthropic", "local"], default=None,
                     help="LLM provider for the reasoning nodes (overrides "
                          "LLM_PROVIDER); ignored with --no-llm.")
+    ap.add_argument("--views", nargs="+", default=None,
+                    help="Run only these views (default: all). Used by the "
+                         "dashboard's 'Retry failed views' button.")
     args = ap.parse_args(argv)
 
     if args.provider:
@@ -138,6 +141,19 @@ def main(argv=None) -> int:
 
     P = default_pipeline()
     views = enumerate_views(cleaned, P)
+    if args.views:
+        # Retry / subset run: keep only the requested views that still exist
+        # (a view can vanish between runs if the underlying data changed).
+        wanted = set(args.views)
+        views = [v for v in views if v in wanted]
+        missing = wanted - set(views)
+        if missing:
+            print(f"Skipping {len(missing)} unknown view(s): "
+                  + ", ".join(sorted(missing)))
+        if not views:
+            print("Batch aborted: none of the requested views exist.",
+                  file=sys.stderr)
+            return 1
     print(f"Precomputing {len(views)} view(s) with {args.workers} worker(s)"
           + (" [no-llm]" if args.no_llm else ""))
 
