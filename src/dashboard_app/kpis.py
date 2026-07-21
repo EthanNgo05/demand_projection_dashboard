@@ -4,7 +4,7 @@ import streamlit as st
 
 from dashboard_app.config import (
     PRICE_COL, RISK_COL, fmt_dollar, MODEL_USED_COL, BEST_MODEL_COMBINED_VIEW,
-    model_display,
+    ALL_CUSTOMERS_VIEW, model_display,
 )
 from dashboard_app.summaries import (
     resolve_avg_col, avg_window_phrase, historical_window, _format_generated_at,
@@ -17,13 +17,18 @@ from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart
 from dashboard_app.tables import render_filtered_table
 
 
-def _render_kpis(summary, agg, anchors):
+def _render_kpis(summary, agg, anchors, stacked=False):
     """Render the 7-metric KPI row shared by every view.
 
     Uses only ``summary`` + the SKU-week ``agg`` + the week ``anchors``. SKU
     counts use ``nunique`` (not row count) so the Optimal Projections combined
     view — which carries one row per (SKU, Customer Grouping) — reports distinct
     SKUs; for single-model views SKU is unique per row, so this is unchanged.
+
+    ``stacked`` lays the seven metrics out vertically (one per line) instead of
+    across a 7-column row, so they fit a narrow side column like the SKU/Customer
+    detail charts. The trailing informational captions are shown only in the wide
+    row layout.
     """
     lb, lcw, ffw = anchors
     # Avg. weekly demand = the mean of the TOTAL weekly demand actually plotted
@@ -55,7 +60,9 @@ def _render_kpis(summary, agg, anchors):
     n_orders = int(summary.loc[summary["Data Source"] == "Orders", "SKU"].nunique()) \
         if "Data Source" in summary.columns else 0
 
-    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+    # Wide layout: seven side-by-side columns. Stacked: render straight into the
+    # current container (st) so each metric sits on its own line.
+    k1, k2, k3, k4, k5, k6, k7 = [st] * 7 if stacked else st.columns(7)
     k1.metric(
         "SKUs Forecasted", f"{n_skus:,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
@@ -105,12 +112,12 @@ def _render_kpis(summary, agg, anchors):
             "Projected Revenue (avg/wk)", "—",
             help="Load a list_prices_*.xlsx (sidebar) to enable projection value.",
         )
-    if n_orders:
+    if not stacked and n_orders:
         st.caption(
             f"⚑ {n_orders} of {n_skus} SKUs had no POS in the window and "
             "were forecast from Orders."
         )
-    if PRICE_COL in summary.columns:
+    if not stacked and PRICE_COL in summary.columns:
         n_noprice = int(summary.drop_duplicates("SKU")[PRICE_COL].isna().sum())
         if n_noprice:
             st.caption(
@@ -252,25 +259,51 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     agg_c = agg_by_group[agg_by_group["Customer Grouping"].astype(str) == customer]
     wk_c = weekly_by_group[weekly_by_group["Customer Grouping"].astype(str) == customer]
     summary_c = combined[combined["Customer Grouping"].astype(str) == customer]
-    # Same seven metrics as the top of the view, scoped to this customer group.
-    # Use the section's original `anchors` (not the widened chart range) so the
-    # historical-demand window lines up with the combined KPI row.
-    _render_kpis(summary_c, agg_c, anchors)
-    cust_range = chart_range_control(agg_c, wk_c, lcw, key="range_cust_best")
-    st.plotly_chart(
-        aggregate_chart(
-            agg_c, summary_c, wk_c,
-            (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw),
-            customer, date_range=cust_range,
-        ),
-        width="stretch",
-    )
+    ccL, ccR = st.columns([3, 1])
+    with ccL:
+        cust_range = chart_range_control(agg_c, wk_c, lcw, key="range_cust_best")
+        st.plotly_chart(
+            aggregate_chart(
+                agg_c, summary_c, wk_c,
+                (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw),
+                customer, date_range=cust_range,
+            ),
+            width="stretch",
+        )
+    with ccR:
+        # Same seven metrics as the top of the view, scoped to this customer group
+        # and stacked to fit the side column (like the SKU detail chart). Use the
+        # section's original `anchors` (not the widened chart range) so the
+        # historical-demand window lines up with the combined KPI row.
+        _render_kpis(summary_c, agg_c, anchors, stacked=True)
 
     # ----- Per-SKU detail ---------------------------------------------------
     st.markdown("### SKU detail")
-    skus = sorted(combined["SKU"].astype(str).unique())
-    sku = st.selectbox("SKU", skus, help="Type to search", key="best_sku")
-    rows = combined[combined["SKU"].astype(str) == sku]
+    c_sku, c_cust = st.columns(2)
+    with c_sku:
+        skus = sorted(combined["SKU"].astype(str).unique())
+        sku = st.selectbox("SKU", skus, help="Type to search", key="best_sku")
+    sku_rows_all = combined[combined["SKU"].astype(str) == sku]
+    # Customer-group filter: default keeps the combined total across every group
+    # carrying this SKU (the original behaviour); pick a group to narrow the chart
+    # and metrics to just that group. Options depend on the selected SKU.
+    sku_groups = sorted(sku_rows_all["Customer Grouping"].astype(str).unique())
+    with c_cust:
+        cust_pick = st.selectbox(
+            "Customer group", [ALL_CUSTOMERS_VIEW] + sku_groups,
+            key="best_sku_cust",
+            help="Keep the combined total, or narrow to one customer group.",
+        )
+    if cust_pick == ALL_CUSTOMERS_VIEW:
+        rows = sku_rows_all
+        sku_agg, sku_weekly = agg_all, weekly_all
+    else:
+        rows = sku_rows_all[sku_rows_all["Customer Grouping"].astype(str) == cust_pick]
+        sku_agg = agg_by_group[agg_by_group["Customer Grouping"].astype(str) == cust_pick]
+        sku_weekly = weekly_by_group[
+            weekly_by_group["Customer Grouping"].astype(str) == cust_pick
+        ]
+
     row0 = rows.iloc[0]
     desc = row0["Description"] if isinstance(row0["Description"], str) else ""
     # Resolve one source for the SKU's chart (same last-wins rule as source_map).
@@ -281,9 +314,9 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
 
     cL, cR = st.columns([3, 1])
     with cL:
-        sku_range = chart_range_control(agg_all, weekly_all, lcw, key="range_sku_best")
+        sku_range = chart_range_control(sku_agg, sku_weekly, lcw, key="range_sku_best")
         st.plotly_chart(
-            sku_chart(sku, desc, source, agg_all, weekly_all, chart_anchors,
+            sku_chart(sku, desc, source, sku_agg, sku_weekly, chart_anchors,
                       date_range=sku_range),
             width="stretch",
         )
@@ -295,18 +328,22 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
             key=lambda gm: gm[0],
         )
         group_lines = "\n".join(f"- {g} — {m}" for g, m in group_models)
-        st.caption(
-            f"Totals across every group carrying this SKU "
-            f"({len(group_models)} group{'s' if len(group_models) != 1 else ''}), "
-            f"with the model used for each:\n{group_lines}"
-        )
+        if cust_pick == ALL_CUSTOMERS_VIEW:
+            st.caption(
+                f"Totals across every group carrying this SKU "
+                f"({len(group_models)} group{'s' if len(group_models) != 1 else ''}), "
+                f"with the model used for each:\n{group_lines}"
+            )
+        else:
+            st.caption(f"Customer group **{cust_pick}** only:\n{group_lines}")
     with cR:
         # Metrics aggregate the SKU's per-group rows: forecast/risk totals sum;
         # the historical avg/wk is derived from the stitched actuals (do NOT sum
-        # the per-SKU average column across groups — it would over-count).
+        # the per-SKU average column across groups — it would over-count). When a
+        # single group is picked, `rows` is one row so every sum collapses to it.
         st.metric("Data Source", f"{source} (mixed)" if mixed_source else source)
         sku_hist = historical_window(
-            agg_all[agg_all["SKU"].astype(str) == sku], combined, anchors
+            sku_agg[sku_agg["SKU"].astype(str) == sku], rows, anchors
         )
         sku_weekly_tot = sku_hist.groupby("WeekDate")["demand"].sum(min_count=1)
         st.metric(
