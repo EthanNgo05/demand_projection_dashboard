@@ -205,8 +205,17 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     parts = "\n".join(f"- {m} ×{c}" for m, c in counts.items())
     st.caption(f"{int(counts.sum())} groups:\n{parts}")
 
-    _, lcw, _ = anchors
+    _, lcw, ffw = anchors
     view_label = "Optimal Projections (Combined)"
+
+    # Chart-only anchors: the passed-in `anchors` come from the sidebar model's
+    # week_anchors, whose lookback start (lb) is as short as 8 weeks (8-Week
+    # Moving Average). That model choice is irrelevant here, so widen the charts'
+    # history floor to the earliest available week — otherwise the date-range
+    # picker can only narrow within an ~8-week window. KPIs keep the original
+    # `anchors` so their numbers don't shift.
+    chart_lb = pd.to_datetime(agg_all["WeekDate"]).min()
+    chart_anchors = (chart_lb, lcw, ffw)
 
     # ----- KPIs -------------------------------------------------------------
     # Same seven metrics as every other view. The combined frame carries one row
@@ -222,7 +231,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     with agg_ctrl:
         agg_range = chart_range_control(agg_all, weekly_all, lcw, key="range_agg_best")
     st.plotly_chart(
-        aggregate_chart(agg_all, combined, weekly_all, anchors, view_label,
+        aggregate_chart(agg_all, combined, weekly_all, chart_anchors, view_label,
                         date_range=agg_range),
         width="stretch",
     )
@@ -249,14 +258,16 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     with cL:
         sku_range = chart_range_control(agg_all, weekly_all, lcw, key="range_sku_best")
         st.plotly_chart(
-            sku_chart(sku, desc, source, agg_all, weekly_all, anchors,
+            sku_chart(sku, desc, source, agg_all, weekly_all, chart_anchors,
                       date_range=sku_range),
             width="stretch",
         )
+        group_names = sorted(rows["Customer Grouping"].astype(str))
+        group_lines = "\n".join(f"- {g}" for g in group_names)
         st.caption(
             f"Totals across every group carrying this SKU "
-            f"({len(rows)} group{'s' if len(rows) != 1 else ''}: "
-            f"{', '.join(rows['Customer Grouping'].astype(str))})."
+            f"({len(group_names)} group{'s' if len(group_names) != 1 else ''}):\n"
+            f"{group_lines}"
         )
     with cR:
         # Metrics aggregate the SKU's per-group rows: forecast/risk totals sum;

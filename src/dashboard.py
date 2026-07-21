@@ -261,10 +261,17 @@ def main():
             st.session_state["model_choice"] = pending_model
             _on_model_change()
 
+        # The Optimal Projections view forecasts each group with its own
+        # best model, so the sidebar model choice does nothing there. Grey the
+        # radio out (it keeps its stored value) so users aren't misled. Scope is
+        # read from the persisted key set by the Scope radio further down; on the
+        # first run the key is absent (-> enabled), which matches the default
+        # Executive Overview scope.
+        _combined_view = st.session_state.get("scope") == BEST_MODEL_COMBINED_VIEW
         st.radio(
             "Forecasting model", list(MODEL_OPTIONS.keys()),
             key="model_choice", on_change=_on_model_change,
-            format_func=model_display,
+            format_func=model_display, disabled=_combined_view,
             help="""
         **Forecasting models**
 
@@ -275,6 +282,11 @@ def main():
         - **TSB (Teunter-Syntetos-Babai)** – Designed for intermittent demand, where products have many zero-demand periods with occasional sales.
         """,
         )
+        if _combined_view:
+            st.caption(
+                "Not used in Optimal Projections — each customer group uses its "
+                "own best model."
+            )
 
     P = load_pipeline(pipeline_path())
     st.title("📦 Demand Projection Dashboard")
@@ -657,7 +669,7 @@ def main():
         scope = st.radio(
             "Scope",
             [ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, "By region"],
-            index=0,
+            index=0, key="scope",
             format_func=lambda s: SCOPE_LABELS.get(s, s),
             help="""
             Choose how forecasts are grouped before modeling.
