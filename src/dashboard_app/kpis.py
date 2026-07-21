@@ -252,6 +252,10 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     agg_c = agg_by_group[agg_by_group["Customer Grouping"].astype(str) == customer]
     wk_c = weekly_by_group[weekly_by_group["Customer Grouping"].astype(str) == customer]
     summary_c = combined[combined["Customer Grouping"].astype(str) == customer]
+    # Same seven metrics as the top of the view, scoped to this customer group.
+    # Use the section's original `anchors` (not the widened chart range) so the
+    # historical-demand window lines up with the combined KPI row.
+    _render_kpis(summary_c, agg_c, anchors)
     cust_range = chart_range_control(agg_c, wk_c, lcw, key="range_cust_best")
     st.plotly_chart(
         aggregate_chart(
