@@ -2,8 +2,7 @@
 import pandas as pd
 import streamlit as st
 
-from dashboard_app.config import PRICE_COL, RISK_COL, fmt_dollar
-from dashboard_app.summaries import resolve_avg_col
+from dashboard_app.config import MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar
 
 
 # --------------------------------------------------------------------------- #
@@ -17,12 +16,12 @@ def style_summary(summary_df):
         "Updated Projection Average", "Projection Difference",
     ] if c in df.columns]
     fmt = {c: "{:,.0f}" for c in int_cols}
-    avg_col = resolve_avg_col(df)
-    # Only number-format a numeric average column. The Optimal Projections
-    # combined view pre-formats this column to strings (with a trailing '*' on
-    # 8-week-sourced rows), which must pass through untouched.
-    if avg_col in df.columns and pd.api.types.is_numeric_dtype(df[avg_col]):
-        fmt[avg_col] = "{:,.1f}"
+    # Format every descriptive-average column to one decimal. Single-group views
+    # carry one; the Optimal Projections combined view carries two (All-History
+    # and 8-Week POS/Orders Average).
+    for c in df.columns:
+        if c.endswith("POS/Orders Average") and pd.api.types.is_numeric_dtype(df[c]):
+            fmt[c] = "{:,.1f}"
     if PRICE_COL in df.columns:
         fmt[PRICE_COL] = lambda v: fmt_dollar(v, decimals=2)
     if RISK_COL in df.columns:
@@ -73,10 +72,10 @@ def _set_many(wkey, options, value):
 def _build_fields(df, key, P):
     """Whitelist of filterable fields for ``df``, in a fixed order.
 
-    Only SKU / Customer / Data Source / Region / Date range / Active In are ever
-    offered, and only when the underlying column exists (and, for checklists,
-    varies). Each field is a dict describing how to read options and build a
-    mask; ``kind`` is ``checklist``, ``active_in`` or ``date``.
+    Only SKU / Customer / Data Source / Model Used / Region / Date range /
+    Active In are ever offered, and only when the underlying column exists (and,
+    for checklists, varies). Each field is a dict describing how to read options
+    and build a mask; ``kind`` is ``checklist``, ``active_in`` or ``date``.
     """
     fields = []
 
@@ -98,6 +97,11 @@ def _build_fields(df, key, P):
 
     if "Data Source" in df.columns:
         add_checklist("Data Source", df["Data Source"])
+
+    # Model Used: only present on the Optimized Projections table, where each
+    # customer group carries its own backtest-winning model.
+    if MODEL_USED_COL in df.columns:
+        add_checklist("Model Used", df[MODEL_USED_COL])
 
     # Region: an explicit Region/Region Code column if present, else derived from
     # the customer grouping via the loaded pipeline (summary/KPI tables).
@@ -269,8 +273,8 @@ def filter_table(df, key, P=None):
     — a searchable checkbox dropdown (or a date-range picker) plus a ✕ to remove
     it. Excel semantics (OR within a field, AND across fields) with
     cross-filtering, so the active dropdowns only offer values that still yield
-    rows. Only the whitelist SKU / Customer / Data Source / Region / Date range /
-    Active In is offered. ``key`` namespaces the widgets.
+    rows. Only the whitelist SKU / Customer / Data Source / Model Used / Region /
+    Date range / Active In is offered. ``key`` namespaces the widgets.
     """
     fields = _build_fields(df, key, P)
     if not fields:

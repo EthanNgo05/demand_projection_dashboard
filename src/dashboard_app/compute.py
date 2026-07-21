@@ -252,6 +252,63 @@ def _best_model_for_group(group):
     return label, path
 
 
+ALL_HIST_AVG_COL = "All-History POS/Orders Average"
+EIGHT_WK_AVG_COL = "8-Week POS/Orders Average"
+
+
+def _descriptive_averages(agg_by_group, today_ts):
+    """Per-(Customer Grouping, SKU) all-history and 8-week demand averages.
+
+    Computed straight from the stitched per-group SKU-week aggregates so BOTH
+    averages exist for every group regardless of which model won its backtest.
+    Definitions mirror the model files so the numbers agree:
+
+    * source per SKU = POS if the SKU has ANY POS in the window, else Orders
+      (SKUs with neither are skipped) -- the POS-then-Orders fallback the models use;
+    * average = total demand / weeks-in-span, where the span runs from the SKU's
+      first observation in the window through the last completed week (post-launch
+      gaps count as real zeros). Over the 8-week window this reproduces
+      ``regression.fit_regression``'s ``mean_val = y.sum() / weeks_since_first``.
+
+    Discontinued SKUs (name ending in '*') are dropped, matching the models.
+    Returns a frame: Customer Grouping, SKU, ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL.
+    """
+    # In-progress week is excluded; the historical window ends last completed week.
+    days_since_sunday = (today_ts.weekday() + 1) % 7          # Sun=0 ... Sat=6
+    current_week_start = today_ts - pd.Timedelta(days=days_since_sunday)
+    last_complete_week = current_week_start - pd.Timedelta(weeks=1)
+    eight_wk_start = last_complete_week - pd.Timedelta(weeks=7)   # 8 weeks inclusive
+    hist_start = today_ts - pd.DateOffset(years=3)   # matches HISTORY_YEARS (all history)
+
+    A = agg_by_group.copy()
+    A["SKU"] = A["SKU"].astype(str)
+    A = A[~A["SKU"].str.endswith("*")]
+    A["WeekDate"] = pd.to_datetime(A["WeekDate"])
+
+    def _avg(start, out_col):
+        win = A[(A["WeekDate"] >= start) & (A["WeekDate"] <= last_complete_week)]
+        rows = []
+        for (grp, sku), g in win.groupby(["Customer Grouping", "SKU"], sort=False):
+            pos = g[g["POS"].notna()]
+            if not pos.empty:
+                vals, weeks = pos["POS"], pos["WeekDate"]
+            else:
+                orders = g[g["Orders"].notna()]
+                if orders.empty:
+                    continue  # no POS and no Orders -> nothing to average
+                vals, weeks = orders["Orders"], orders["WeekDate"]
+            weeks_span = int(round((last_complete_week - weeks.min()).days / 7)) + 1
+            rows.append({
+                "Customer Grouping": grp, "SKU": sku,
+                out_col: round(vals.sum() / max(weeks_span, 1), 1),
+            })
+        return pd.DataFrame(rows, columns=["Customer Grouping", "SKU", out_col])
+
+    all_hist = _avg(hist_start, ALL_HIST_AVG_COL)
+    eight_wk = _avg(eight_wk_start, EIGHT_WK_AVG_COL)
+    return all_hist.merge(eight_wk, on=["Customer Grouping", "SKU"], how="outer")
+
+
 def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
                              progress_cb=None):
     """Per-(SKU, Customer Grouping) summary using each group's BEST model.
@@ -340,19 +397,47 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         return None, None, None, None, None, excluded
     combined = pd.concat(frames, ignore_index=True)
 
-    # Consolidate the descriptive-average columns into a single
-    # "All-History POS/Orders Average". The 8-Week Moving Average model reports
-    # an "8 Week POS/Orders Average" while the other models report all-history,
-    # so a plain concat leaves two half-empty columns. Fill the all-history NaNs
-    # (only the 8-week-model rows) from the 8-week value and drop the 8-week
-    # column; the render layer marks those coalesced rows with a '*'.
-    eight_wk, all_hist = "8 Week POS/Orders Average", "All-History POS/Orders Average"
-    if eight_wk in combined.columns:
-        if all_hist in combined.columns:
-            combined[all_hist] = combined[all_hist].fillna(combined[eight_wk])
-        else:
-            combined = combined.rename(columns={eight_wk: all_hist})
-        combined = combined.drop(columns=[eight_wk], errors="ignore")
+    # Give every group BOTH descriptive averages regardless of its winning model.
+    # Each model reports only one: the 8-Week Moving Average model reports an
+    # "8 Week POS/Orders Average" (a recent run-rate), the others report
+    # all-history. Compute both centrally from the stitched per-group aggregates
+    # so the two columns are always populated and comparable.
+    avgs = _descriptive_averages(
+        pd.concat(agg_by_group_frames, ignore_index=True), today_ts
+    )
+    combined = combined.drop(columns=["8 Week POS/Orders Average"], errors="ignore")
+    combined = combined.merge(
+        avgs.rename(columns={
+            ALL_HIST_AVG_COL: "_central_all_hist",
+            EIGHT_WK_AVG_COL: "_central_8wk",
+        }),
+        on=["SKU", "Customer Grouping"], how="left",
+    )
+    # All-History: keep each model's own reported value; fill only the gaps (the
+    # 8-week-model groups, which never compute an all-history average) so existing
+    # non-8-week numbers are unchanged.
+    if ALL_HIST_AVG_COL in combined.columns:
+        combined[ALL_HIST_AVG_COL] = combined[ALL_HIST_AVG_COL].fillna(
+            combined["_central_all_hist"]
+        )
+    else:
+        combined[ALL_HIST_AVG_COL] = combined["_central_all_hist"]
+    # 8-Week: the central value for every group (it equals the 8-Week Moving
+    # Average model's own figure on the groups it won, so nothing shifts there).
+    # A SKU with history but no POS/Orders in the last 8 weeks has no run-rate to
+    # compute; its recent average is a genuine 0 (absent week = zero, matching the
+    # models' gap-fill), so fill rather than leave a blank.
+    combined[EIGHT_WK_AVG_COL] = combined["_central_8wk"].fillna(0.0)
+    combined = combined.drop(columns=["_central_all_hist", "_central_8wk"])
+
+    # Slot both averages right after "Weeks with data" (All-History then 8-Week),
+    # immediately ahead of "Updated Projection Average", for a stable layout.
+    if "Weeks with data" in combined.columns:
+        cols = [c for c in combined.columns
+                if c not in (ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL)]
+        pos = cols.index("Weeks with data") + 1
+        cols[pos:pos] = [ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL]
+        combined = combined[cols]
 
     # Surface the model used right after the customer group for readability.
     if "Customer Grouping" in combined.columns:
