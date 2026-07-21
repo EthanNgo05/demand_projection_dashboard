@@ -33,13 +33,18 @@ def _bg_creationflags():
 
 
 def _child_env(**overrides):
-    """Child environment with UTF-8 stdout/stderr so logs are decodable.
+    """Child environment for a background subprocess whose log we read live.
 
-    Without ``PYTHONIOENCODING`` the child writes its log in the Windows locale
-    code page (cp1252), where characters like '×' become byte 0xd7 that a UTF-8
-    reader can't decode. Pinning UTF-8 keeps the log consistent with our readers.
+    - ``PYTHONIOENCODING=utf-8``: without it the child writes its log in the
+      Windows locale code page (cp1252), where characters like '×' become byte
+      0xd7 that a UTF-8 reader can't decode.
+    - ``PYTHONUNBUFFERED=1``: a redirected-to-file stdout is block-buffered by
+      default, so per-view progress lines wouldn't reach the log until the child
+      exits (leaving "Check progress" stuck on "getting started"). Unbuffering
+      flushes each line as it's printed so the progress reader sees it live.
     """
-    return {**os.environ, "PYTHONIOENCODING": "utf-8", **overrides}
+    return {**os.environ, "PYTHONIOENCODING": "utf-8",
+            "PYTHONUNBUFFERED": "1", **overrides}
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +337,26 @@ def batch_progress():
     return None
 
 
+def batch_elapsed_suffix(started):
+    """" Started 2:05 PM, running 12 min." for the run banner, or "".
+
+    ``started`` is the "%Y-%m-%d %H:%M:%S" start string batch_in_progress
+    returns; yields "" if it's missing or unparseable so the banner degrades
+    cleanly to no timing text.
+    """
+    if not started:
+        return ""
+    try:
+        start = pd.Timestamp(started)
+    except (ValueError, TypeError):
+        return ""
+    hour = start.strftime("%I").lstrip("0") or "12"          # 2, not 02
+    clock = start.strftime(f"{hour}:%M %p")
+    mins = max(int((pd.Timestamp.now() - start).total_seconds() // 60), 0)
+    run = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60}m"
+    return f" Started {clock}, running {run}."
+
+
 def batch_failures():
     """[(view, error), …] for the most recent batch run, or [] if none.
 
@@ -387,20 +412,111 @@ def batch_result_message():
             f"{failed} need another try (listed below).")
 
 
+def _batch_run_finished(started):
+    """True once the run whose header carries ``started`` has logged a 'Done:'.
+
+    A cross-session completion signal that doesn't need this session's Popen
+    handle: the child prints 'Done:' as it exits, which flushes to the log. We
+    match on the exact ``started`` timestamp so a *later*, still-running batch
+    isn't reported finished just because an earlier run's 'Done:' sits above it.
+    """
+    if not started:
+        return False
+    try:
+        with open(_batch_log_path(), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+    hdr = None
+    for i, ln in enumerate(lines):  # last header matching this run
+        if ln.startswith("=====") and f"started {started}" in ln:
+            hdr = i
+    if hdr is None:
+        return False
+    return any(ln.strip().startswith("Done:") for ln in lines[hdr + 1:])
+
+
+def _read_lock(lock_path):
+    """(started_str, pid_or_None) from the batch lock; ('', None) on any error.
+
+    Line 1 is the start timestamp (written before launch); line 2, if present,
+    is the child PID (written just after launch). Older single-line locks have
+    no PID and read back as pid=None.
+    """
+    try:
+        with open(lock_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return "", None
+    started = lines[0].strip() if lines else ""
+    pid = None
+    if len(lines) > 1 and lines[1].strip().isdigit():
+        pid = int(lines[1].strip())
+    return started, pid
+
+
+def _pid_running_batch(pid):
+    """Whether ``pid`` is a live agent.batch process: True / False / None.
+
+    None means "can't tell" (psutil unavailable) — callers keep the run marked
+    running and defer to the log 'Done:' check and the stale timeout. We confirm
+    the command line is the batch to guard against the OS reusing the PID for an
+    unrelated process after the batch exits.
+    """
+    if not pid:
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        proc = psutil.Process(int(pid))
+    except psutil.NoSuchProcess:
+        return False            # definitely gone
+    except (ValueError, TypeError, psutil.Error):
+        return None             # can't tell
+    try:
+        return "agent.batch" in " ".join(proc.cmdline())
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True             # exists but cmdline unreadable -> assume alive
+
+
 def batch_in_progress():
     """(running, started_str): is the all-views batch active, and when it began.
 
-    Self-healing like _refresh_state, but completion is detected two ways:
-      * the Popen handle we kept this session has exited (prompt, same-session), or
-      * the lock is older than BATCH_STALE_SECONDS (cross-restart / crash fallback).
+    Self-healing like _refresh_state; completion/crash is detected four ways:
+      * the Popen handle we kept this session has exited (prompt, same-session),
+      * the log shows this run's 'Done:' line (clean finish, cross-session),
+      * the batch PID is no longer a live agent.batch process (crash or finish,
+        cross-session), or
+      * the lock is older than BATCH_STALE_SECONDS (last-ditch fallback).
     """
     lock_path = _batch_lock_path()
     if not os.path.exists(lock_path):
         return False, None
     lock_mtime = os.path.getmtime(lock_path)
 
+    started, pid = _read_lock(lock_path)
+
     proc = st.session_state.get("agent_batch_proc")
     if proc is not None and proc.poll() is not None:
+        _clear_lock(lock_path)
+        return False, None
+
+    # Cross-session: this session may not hold the Popen handle (browser refresh,
+    # another session, or the nightly job). Trust the log's 'Done:' so the status
+    # flips to finished promptly instead of waiting out the stale timeout.
+    if _batch_run_finished(started):
+        _clear_lock(lock_path)
+        return False, None
+
+    # Cross-session crash/finish: the recorded PID is no longer a running batch.
+    # (False = confidently gone; None = unknown, leave it to the other checks.)
+    if _pid_running_batch(pid) is False:
+        logger.info("Agent-batch process %s is no longer running; clearing lock.",
+                    pid)
         _clear_lock(lock_path)
         return False, None
 
@@ -410,11 +526,6 @@ def batch_in_progress():
         _clear_lock(lock_path)
         return False, None
 
-    try:
-        with open(lock_path, encoding="utf-8") as f:
-            started = f.read().strip()
-    except OSError:
-        started = ""
     return True, started
 
 
@@ -425,9 +536,10 @@ def start_agent_batch(provider, views=None):
     the reasoning LLM (LLM_PROVIDER) for the run. Pass ``views`` (a list of view
     names) to re-run ONLY those — the "Retry failed views" path — instead of the
     full ~60-view batch. The lock is written BEFORE launching so a double-click
-    can't spawn two batches. Output is appended to today's batch log; the Popen
-    handle is stored in session_state so this session detects completion without
-    waiting for the stale timeout.
+    can't spawn two batches, then rewritten with the child PID so ANY session can
+    check whether the batch is still alive. Output is appended to today's batch
+    log; the Popen handle is stored in session_state so this session detects
+    completion without waiting for the stale timeout.
     """
     running, started = batch_in_progress()
     if running:
@@ -470,8 +582,16 @@ def start_agent_batch(provider, views=None):
         logger.exception("Failed to launch agent batch")
         return False, f"Could not start agent batch: {exc}"
 
+    # Record the PID (line 2) so any session can check liveness / crash without
+    # this session's Popen handle. Best-effort — liveness gracefully degrades.
+    try:
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write(f"{now}\n{proc.pid}\n")
+    except OSError:
+        pass
+
     st.session_state["agent_batch_proc"] = proc
     st.session_state["agent_batch_started"] = now
-    logger.info("Agent batch launched (%s, provider=%s, scope=%s)",
-                now, provider, scope)
+    logger.info("Agent batch launched (%s, provider=%s, scope=%s, pid=%s)",
+                now, provider, scope, proc.pid)
     return True, now

@@ -140,7 +140,8 @@ from dashboard_app.refresh import (  # noqa: F401
     BATCH_STALE_SECONDS, EXTRACT_SCRIPT, REFRESH_STALE_SECONDS, WAREHOUSE_EXTRACT_SCRIPT,
     _batch_lock_path, _batch_log_path, _batch_result_line, _clear_lock, _launch_refresh,
     _refresh_lock_path, _refresh_log_path, _refresh_state, _wh_refresh_lock_path,
-    _wh_snapshot_complete_since, batch_failures, batch_in_progress, batch_progress,
+    _wh_snapshot_complete_since, batch_elapsed_suffix, batch_failures,
+    batch_in_progress, batch_progress,
     batch_result_message, refresh_in_progress, start_agent_batch,
     start_refresh, start_warehouse_refresh, warehouse_refresh_in_progress,
 )
@@ -708,16 +709,17 @@ def main():
         # the background; while it runs the button becomes a status check.
         batch_running, batch_started = batch_in_progress()
         if batch_running:
+            elapsed = batch_elapsed_suffix(batch_started)
             prog = batch_progress()
             if prog:
                 done, total = prog
                 st.info(f"⏳ Recommending the best model for every view — "
-                        f"{done} of {total} done. This runs in the background, "
-                        "so you can keep using the dashboard.")
+                        f"{done} of {total} done.{elapsed} This runs in the "
+                        "background, so you can keep using the dashboard.")
             else:
-                st.info("⏳ Recommending the best model for every view — getting "
-                        "started. This runs in the background, so you can keep "
-                        "using the dashboard.")
+                st.info(f"⏳ Recommending the best model for every view — getting "
+                        f"started.{elapsed} This runs in the background, so you "
+                        "can keep using the dashboard.")
             if st.button("Check progress", key="check_agent_batch"):
                 st.rerun()
         else:

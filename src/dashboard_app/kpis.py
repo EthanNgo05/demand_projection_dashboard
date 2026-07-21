@@ -4,6 +4,7 @@ import streamlit as st
 
 from dashboard_app.config import (
     PRICE_COL, RISK_COL, fmt_dollar, MODEL_USED_COL, BEST_MODEL_COMBINED_VIEW,
+    model_display,
 )
 from dashboard_app.summaries import (
     resolve_avg_col, avg_window_phrase, historical_window, _format_generated_at,
@@ -48,7 +49,10 @@ def _render_kpis(summary, agg, anchors):
         (summary[PRICE_COL] * summary["Updated Projection Average"]).sum()
         if has_price else None
     )
-    n_orders = int((summary.get("Data Source") == "Orders").sum()) \
+    # Count DISTINCT Orders SKUs, not rows: the Optimal Projections combined
+    # table carries one row per (SKU, Customer Grouping), so a row-sum would
+    # count an Orders SKU once per group and blow past n_skus (distinct SKUs).
+    n_orders = int(summary.loc[summary["Data Source"] == "Orders", "SKU"].nunique()) \
         if "Data Source" in summary.columns else 0
 
     k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
@@ -310,7 +314,39 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         table = combined.sort_values(["SKU", "Customer Grouping"]).reset_index(drop=True)
         st.caption("Each SKU broken out by customer group.")
 
-    render_filtered_table(table, "filter_best_mix", P, style=True)
+    # Drop the per-model outlier/promo bookkeeping columns — noise in this view.
+    table = table.drop(
+        columns=["Promo Weeks Uplifted", "Outlier Weeks Cleaned"], errors="ignore"
+    )
+
+    # Display copy: mark the All-History average with a '*' where the value is
+    # really the 8-Week Moving Average model's 8-week run-rate (that model has no
+    # all-history average). The numeric `table` is kept for the Excel download;
+    # its "Model Used" column already identifies those groups there.
+    display_table = table
+    avg_col = "All-History POS/Orders Average"
+    eight_wk_label = model_display("8-Week Moving Average")
+    if avg_col in table.columns and MODEL_USED_COL in table.columns:
+        is_8wk = table[MODEL_USED_COL] == eight_wk_label
+
+        def _fmt_avg(v, star):
+            if pd.isna(v):
+                return ""
+            return f"{v:,.1f}*" if star else f"{v:,.1f}"
+
+        display_table = table.copy()
+        display_table[avg_col] = [
+            _fmt_avg(v, s) for v, s in zip(table[avg_col], is_8wk)
+        ]
+
+    render_filtered_table(display_table, "filter_best_mix", P, style=True)
+    if avg_col in table.columns and MODEL_USED_COL in table.columns \
+            and (table[MODEL_USED_COL] == eight_wk_label).any():
+        st.caption(
+            f"\\* This group is forecast by the {eight_wk_label} model, so its "
+            f"{avg_col} is that model's recent 8-week run-rate rather than an "
+            "all-history average."
+        )
     st.download_button(
         "⬇️ Download the combined best-model table",
         data=summary_to_excel(table),

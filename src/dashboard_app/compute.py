@@ -327,6 +327,21 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
     if not frames:
         return None, None, None, excluded
     combined = pd.concat(frames, ignore_index=True)
+
+    # Consolidate the descriptive-average columns into a single
+    # "All-History POS/Orders Average". The 8-Week Moving Average model reports
+    # an "8 Week POS/Orders Average" while the other models report all-history,
+    # so a plain concat leaves two half-empty columns. Fill the all-history NaNs
+    # (only the 8-week-model rows) from the 8-week value and drop the 8-week
+    # column; the render layer marks those coalesced rows with a '*'.
+    eight_wk, all_hist = "8 Week POS/Orders Average", "All-History POS/Orders Average"
+    if eight_wk in combined.columns:
+        if all_hist in combined.columns:
+            combined[all_hist] = combined[all_hist].fillna(combined[eight_wk])
+        else:
+            combined = combined.rename(columns={eight_wk: all_hist})
+        combined = combined.drop(columns=[eight_wk], errors="ignore")
+
     # Surface the model used right after the customer group for readability.
     if "Customer Grouping" in combined.columns:
         cols = [c for c in combined.columns if c != MODEL_USED_COL]

@@ -18,7 +18,10 @@ def style_summary(summary_df):
     ] if c in df.columns]
     fmt = {c: "{:,.0f}" for c in int_cols}
     avg_col = resolve_avg_col(df)
-    if avg_col in df.columns:
+    # Only number-format a numeric average column. The Optimal Projections
+    # combined view pre-formats this column to strings (with a trailing '*' on
+    # 8-week-sourced rows), which must pass through untouched.
+    if avg_col in df.columns and pd.api.types.is_numeric_dtype(df[avg_col]):
         fmt[avg_col] = "{:,.1f}"
     if PRICE_COL in df.columns:
         fmt[PRICE_COL] = lambda v: fmt_dollar(v, decimals=2)

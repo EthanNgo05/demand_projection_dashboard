@@ -178,6 +178,11 @@ def main(argv=None) -> int:
     started = time.time()
     ok = fail = 0
     failures = []
+    # Emit the total up front so the dashboard's progress reader (batch_progress)
+    # shows "0 of N done" immediately, instead of sitting on "getting started"
+    # until the first (slow) view finishes. flush is belt-and-suspenders — the
+    # child already runs with PYTHONUNBUFFERED=1.
+    print(f"  [0/{len(views)}] starting…", flush=True)
     try:
         with ProcessPoolExecutor(
             max_workers=max(1, args.workers),
