@@ -170,16 +170,20 @@ def test_smoothing_params_survive_model_round_trip():
 
 @needs_data
 def test_exceptions_view_renders():
-    """Selecting the Exceptions scope renders its own (model-agnostic) table
-    without error — the routing branch and render_exceptions wiring both work."""
+    """Selecting the Exceptions scope renders its own (model-agnostic) view
+    without error — the routing branch and render_exceptions wiring both work,
+    including the All Exceptions / Key SKUs tabs."""
     import dashboard
 
     at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
     assert not at.exception
     at.radio(key="scope").set_value(dashboard.EXCEPTIONS_VIEW).run()
     assert not at.exception
-    # It draws its own subheader and the two severity-threshold inputs.
+    # It draws its own subheader and both tabs.
     assert any("Exceptions" == s.value for s in at.subheader)
+    tab_labels = {t.label for t in at.tabs}
+    assert {"All Exceptions", "Key SKUs"} <= tab_labels
+    # The severity-threshold inputs live in the All Exceptions tab.
     assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min $ impact / wk"}
 
 

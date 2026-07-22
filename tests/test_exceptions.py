@@ -13,7 +13,7 @@ import pytest
 from dashboard_app.config import DEFAULT_MODEL, MODEL_OPTIONS, PRICE_COL
 from dashboard_app.pipeline import load_pipeline
 from dashboard_app.exceptions import (
-    DIRECTION_COL, FLAG_COL, GAP_COL, IMPACT_COL, OVER, PCT_COL, PROJ_COL,
+    DIRECTION_COL, FLAG_COL, GAP_COL, IMPACT_COL, ON_PLAN, OVER, PCT_COL, PROJ_COL,
     RECENT_COL, UNDER, _apply_thresholds, compute_exceptions,
 )
 
@@ -72,10 +72,39 @@ def _by_sku(frame):
 
 def test_flags_the_right_skus(sample_df, P):
     out = compute_exceptions(sample_df, TODAY, PRICES, P)
-    # NOGAP (recent == proj) is dropped; everything else with a gap is flagged.
+    # Every SKU with any signal is retained (incl. on-plan NOGAP, for the key
+    # watchlist); only rows with neither sales nor a plan are dropped.
     assert set(out["SKU"]) == {
-        "UNDER-CLEAR", "OVER-CLEAR", "NOPLAN", "DEADPLAN", "TRIVIAL", "NOPRICE"
+        "UNDER-CLEAR", "OVER-CLEAR", "NOPLAN", "DEADPLAN", "TRIVIAL", "NOGAP", "NOPRICE"
     }
+
+
+def test_direction_is_three_way(sample_df, P):
+    out = _by_sku(compute_exceptions(sample_df, TODAY, PRICES, P))
+    assert out.loc["UNDER-CLEAR", DIRECTION_COL] == UNDER
+    assert out.loc["DEADPLAN", DIRECTION_COL] == OVER
+    assert out.loc["NOGAP", DIRECTION_COL] == ON_PLAN
+    # The All-Exceptions tab operates on the diverging subset — on-plan excluded.
+    diverging = out[out[DIRECTION_COL] != ON_PLAN]
+    assert "NOGAP" not in set(diverging.index)
+
+
+def test_key_sku_filtering_keeps_on_plan(sample_df, P):
+    out = compute_exceptions(sample_df, TODAY, PRICES, P)
+    key = {"UNDER-CLEAR", "NOGAP", "DOES-NOT-EXIST"}
+    key_frame = out[out["SKU"].isin(key)]
+    # Both present key SKUs are kept, including the on-plan one (watchlist shows
+    # every key SKU regardless of divergence); the unknown SKU simply isn't there.
+    assert set(key_frame["SKU"]) == {"UNDER-CLEAR", "NOGAP"}
+
+
+def test_read_key_skus_round_trip(tmp_path):
+    from agent.data_io import read_key_skus
+
+    p = tmp_path / "key_skus_2026-07-22.xlsx"
+    pd.DataFrame({"SKU": [" A1 ", "B2", "A1", None]}).to_excel(p, index=False)
+    # Stripped, de-duplicated, NaN dropped.
+    assert read_key_skus(str(p)) == frozenset({"A1", "B2"})
 
 
 def test_gap_pct_and_impact(sample_df, P):

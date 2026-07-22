@@ -138,6 +138,34 @@ def discover_price_file(P=None):
     return max(matches, key=os.path.getmtime) if matches else None
 
 
+def key_skus_glob():
+    """Glob for the key-SKU list files (written by extract_key_skus.py).
+
+    Anchored to the repo root like the list-price glob so every caller scans the
+    same ``raw_inputs/key_skus`` folder regardless of the working directory.
+    """
+    return os.path.join(HERE, "raw_inputs", "key_skus", "key_skus_*.xlsx")
+
+
+def discover_key_skus_file():
+    """Newest key-SKU list file, or None if none has been extracted yet."""
+    matches = glob.glob(key_skus_glob())
+    return max(matches, key=os.path.getmtime) if matches else None
+
+
+def read_key_skus(path):
+    """Read a key-SKU list file into a ``frozenset`` of cleaned SKU strings.
+
+    The file is the single-column sheet extract_key_skus.py writes; SKUs are
+    stripped to match the cleaned demand frame's already-stripped ``SKU`` column.
+    """
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    if "SKU" not in df.columns:
+        raise ValueError(f"{os.path.basename(path)} has no 'SKU' column")
+    return frozenset(df["SKU"].dropna().astype(str).str.strip())
+
+
 def _date_from_name(name):
     m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(name))
     return m.group(1) if m else None

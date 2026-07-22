@@ -15,12 +15,15 @@ Recent run-rate and the forward window come from the same helpers the models use
 (`_descriptive_averages`, the pipeline's `week_anchors`/`aggregate_to_sku_week`),
 so the numbers agree with what the other views show.
 """
+import os
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from dashboard_app.compute import EIGHT_WK_AVG_COL, _descriptive_averages
 from dashboard_app.config import PRICE_COL
+from dashboard_app.datasources import discover_key_skus_file, load_key_skus
 from dashboard_app.tables import render_filtered_table
 
 # Display column names for the exceptions table. RECENT_COL / PROJ_COL reuse the
@@ -37,6 +40,11 @@ DIRECTION_COL = "Direction"
 
 UNDER = "Under-projected (stockout risk)"   # recent >> plan: selling faster than planned
 OVER = "Over-projected (overstock risk)"    # recent << plan: planned but not selling
+ON_PLAN = "On-plan"                         # recent ≈ plan (no material gap)
+
+# Short status labels for the Key SKUs watchlist (the long section headers above
+# are used to title the All-Exceptions Under/Over sections).
+STATUS_SHORT = {UNDER: "Under-projected", OVER: "Over-projected", ON_PLAN: "On-plan"}
 
 # Session-signature tag kept distinct from the view ID string so a rename of the
 # user-facing label never silently reuses another view's cache entry.
@@ -45,6 +53,16 @@ EXCEPTIONS_VIEW_SIG = "exceptions-v1"
 _DISPLAY_COLS = [
     "SKU", "Description", "Customer Grouping", "Region", "Data Source",
     RECENT_COL, PROJ_COL, GAP_COL, PCT_COL, IMPACT_COL, FLAG_COL, PRICE_COL,
+]
+
+# The Key SKUs watchlist table: the exact columns the planning team asked for
+# (in order), with a Status column for the direction and the projection column
+# relabelled "Current System Projection".
+STATUS_COL = "Status"
+KEY_PROJ_COL = "Current System Projection"
+KEY_DISPLAY_COLS = [
+    "SKU", "Description", "Customer Grouping", "Region", STATUS_COL, "Data Source",
+    RECENT_COL, KEY_PROJ_COL, PRICE_COL, IMPACT_COL, PCT_COL,
 ]
 
 
@@ -147,14 +165,19 @@ def compute_exceptions(df, today_ts, prices, P):
     # "no recent sales" is a full over-projection: recent 0 vs a real plan = -100%.
     frame.loc[(frame[RECENT_COL] == 0) & (frame["_proj"] > 0), "_pct"] = -1.0
 
-    # Drop rows with no signal either way (nothing planned and nothing selling)
-    # and rows with no gap to flag.
+    # Drop rows with no signal either way (nothing planned and nothing selling).
+    # On-plan rows (gap == 0) are KEPT: the All-Exceptions tab filters them out,
+    # but the Key SKUs watchlist shows every key SKU including those tracking plan.
     frame = frame[(frame[RECENT_COL] != 0) | (frame["_proj"] != 0)]
-    frame = frame[frame["_gap"] != 0]
     if frame.empty:
         return empty
 
-    frame[DIRECTION_COL] = np.where(frame["_gap"] > 0, UNDER, OVER)
+    # Three-way status by the sign of the (rounded) gap. Rounding keeps a sub-unit
+    # difference from reading as a spurious under/over.
+    rounded_gap = frame["_gap"].round()
+    frame[DIRECTION_COL] = np.select(
+        [rounded_gap > 0, rounded_gap < 0], [UNDER, OVER], default=ON_PLAN
+    )
 
     # Revenue impact of the gap, valued at list price (blank price → blank impact).
     price_map = prices if prices is not None else {}
@@ -220,6 +243,84 @@ def _section(frame, direction, key, P):
     render_filtered_table(sub[_DISPLAY_COLS], key, P, style=True)
 
 
+def _render_all_exceptions_tab(frame, P):
+    """The All-Exceptions tab: severity thresholds + Under/Over sections over the
+    diverging rows (on-plan rows are excluded here)."""
+    diverging = frame[frame[DIRECTION_COL] != ON_PLAN]
+    if diverging.empty:
+        st.info("No exceptions found — every SKU's recent sell-through tracks its projection.")
+        return
+
+    # Severity thresholds (both filters; defaults hide sub-50% moves, $ off).
+    c1, c2, _ = st.columns([1, 1, 2])
+    min_pct = c1.number_input(
+        "Min % deviation", min_value=0, max_value=1000, value=50, step=10,
+        help="Hide SKUs whose recent run-rate is within this % of the projection.",
+    ) / 100.0
+    min_dollar = c2.number_input(
+        "Min $ impact / wk", min_value=0, max_value=1_000_000, value=0, step=100,
+        help="Hide SKUs whose weekly revenue impact is below this (0 = off). "
+             "SKUs with no list price are always kept.",
+    )
+
+    flagged = _apply_thresholds(diverging, min_pct, min_dollar)
+    total_active = frame["SKU"].nunique()
+    st.caption(
+        f"{flagged['SKU'].nunique():,} SKUs flagged of {total_active:,} scanned "
+        f"(≥{int(min_pct * 100)}% deviation"
+        + (f" and ≥${min_dollar:,}/wk impact" if min_dollar else "") + ")."
+    )
+
+    if flagged.empty:
+        st.info("No exceptions at the current thresholds — try lowering them.")
+        return
+
+    _section(flagged, UNDER, "exc_under", P)
+    st.divider()
+    _section(flagged, OVER, "exc_over", P)
+
+
+def _render_key_skus_tab(frame, P):
+    """The Key SKUs watchlist tab: every key SKU (from extract_key_skus.py) with
+    its status, no threshold filtering — a always-on watchlist of important items."""
+    path = discover_key_skus_file()
+    if not path:
+        st.info(
+            "No key-SKU list found yet. Run `python src/extract_key_skus.py` "
+            "(or wait for the nightly refresh) to populate this tab."
+        )
+        return
+    key_skus = load_key_skus(path, os.path.getmtime(path))
+    if not key_skus:
+        st.info("The key-SKU list is empty.")
+        return
+
+    key_frame = frame[frame["SKU"].isin(key_skus)].copy()
+    present = set(key_frame["SKU"])
+    missing = sorted(key_skus - present)
+    st.caption(
+        f"Showing all {len(present):,} of {len(key_skus):,} key SKUs present in the "
+        f"current demand data"
+        + (f" ({len(missing):,} not found)" if missing else "") + "."
+    )
+    if key_frame.empty:
+        st.info("None of the key SKUs appear in the current demand data.")
+        return
+
+    key_frame[STATUS_COL] = key_frame[DIRECTION_COL].map(STATUS_SHORT).fillna(
+        key_frame[DIRECTION_COL]
+    )
+    disp = (
+        key_frame.rename(columns={PROJ_COL: KEY_PROJ_COL})
+        .sort_values("_sort", ascending=False)
+    )
+    render_filtered_table(disp[KEY_DISPLAY_COLS], "exc_key", P, style=True)
+
+    if missing:
+        with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):
+            st.markdown("\n".join(f"- {s}" for s in missing))
+
+
 def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors, P=None):
     """Render the EXCEPTIONS_VIEW. Mirrors _render_best_model_combined's call
     signature so main() can dispatch it the same way; the page title is already
@@ -247,30 +348,8 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
         st.info("No exceptions found — every SKU's recent sell-through tracks its projection.")
         return
 
-    # Severity thresholds (both filters; defaults hide sub-50% moves, $ off).
-    c1, c2, _ = st.columns([1, 1, 2])
-    min_pct = c1.number_input(
-        "Min % deviation", min_value=0, max_value=1000, value=50, step=10,
-        help="Hide SKUs whose recent run-rate is within this % of the projection.",
-    ) / 100.0
-    min_dollar = c2.number_input(
-        "Min $ impact / wk", min_value=0, max_value=1_000_000, value=0, step=100,
-        help="Hide SKUs whose weekly revenue impact is below this (0 = off). "
-             "SKUs with no list price are always kept.",
-    )
-
-    flagged = _apply_thresholds(frame, min_pct, min_dollar)
-    total_active = frame["SKU"].nunique()
-    st.caption(
-        f"{flagged['SKU'].nunique():,} SKUs flagged of {total_active:,} scanned "
-        f"(≥{int(min_pct * 100)}% deviation"
-        + (f" and ≥${min_dollar:,}/wk impact" if min_dollar else "") + ")."
-    )
-
-    if flagged.empty:
-        st.info("No exceptions at the current thresholds — try lowering them.")
-        return
-
-    _section(flagged, UNDER, "exc_under", P)
-    st.divider()
-    _section(flagged, OVER, "exc_over", P)
+    tab_all, tab_key = st.tabs(["All Exceptions", "Key SKUs"])
+    with tab_all:
+        _render_all_exceptions_tab(frame, P)
+    with tab_key:
+        _render_key_skus_tab(frame, P)

@@ -124,11 +124,11 @@ from dashboard_app.datasources import (  # noqa: F401
     _active_in_list, _clean, _date_from_name, _raw_dir, _region_code, _this_week_start,
     compute_active_products, compute_discontinued_products,
     compute_discontinued_projections, compute_inactive_projections,
-    compute_missing_pos_orders, compute_missing_projections, discover_price_file,
-    discover_raw_files, fetch_plytix_from_url, load_prices_from_bytes,
-    load_prices_from_path, load_raw_from_bytes, load_raw_from_path,
-    load_warehouse_from_paths, load_warehouse_from_uploads, price_glob, raw_glob,
-    read_plytix_from_bytes, read_plytix_from_path,
+    compute_missing_pos_orders, compute_missing_projections, discover_key_skus_file,
+    discover_price_file, discover_raw_files, fetch_plytix_from_url, load_key_skus,
+    load_prices_from_bytes, load_prices_from_path, load_raw_from_bytes,
+    load_raw_from_path, load_warehouse_from_paths, load_warehouse_from_uploads,
+    price_glob, raw_glob, read_plytix_from_bytes, read_plytix_from_path,
 )
 from dashboard_app.compute import (  # noqa: F401
     _agent_summaries_generated_at, _agent_summaries_mtime, _agent_summary_path,

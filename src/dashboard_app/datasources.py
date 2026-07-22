@@ -31,6 +31,18 @@ def discover_price_file():
     return data_io.discover_price_file(load_pipeline(pipeline_path()))
 
 
+def discover_key_skus_file():
+    """Newest key-SKU list file (extract_key_skus.py output), or None."""
+    return data_io.discover_key_skus_file()
+
+
+@st.cache_data(show_spinner=False)
+def load_key_skus(path, _mtime):
+    """Cached read of the key-SKU list into a frozenset of SKU strings. ``_mtime``
+    is part of the cache key so a freshly extracted list invalidates the cache."""
+    return data_io.read_key_skus(path)
+
+
 _date_from_name = data_io._date_from_name
 
 

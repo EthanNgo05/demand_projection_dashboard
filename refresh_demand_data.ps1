@@ -11,6 +11,9 @@
          five regional AU/CA/EU/JP/US_warehouse_projections_<date>.xlsx files
          (raw_inputs/warehouse_projections) that drive the missing-projections
          table.
+      3. src/extract_key_skus.py (a few seconds) writes
+         raw_inputs/key_skus/key_skus_<date>.xlsx — the "key item" watchlist
+         the Exceptions view's Key SKUs tab reads.
 
     The dashboard then serves the pre-computed files instantly — nobody waits.
 
@@ -19,9 +22,9 @@
     renames and customer remaps. The dashboard's refresh buttons run the fast
     incremental demand pull / the same warehouse pull on demand.
 
-    The warehouse pull runs even if the demand pull failed (they are
-    independent data sets), and the script exits with the worst of the two exit
-    codes so Task Scheduler flags a failure in either (Last Run Result).
+    The warehouse and key-SKU pulls run even if the demand pull failed (they are
+    independent data sets), and the script exits with the worst of all the exit
+    codes so Task Scheduler flags a failure in any of them (Last Run Result).
 
     Register it with Windows Task Scheduler (see the schtasks command in the
     project notes). It logs each run, with timestamps, to
@@ -45,6 +48,7 @@ if ([string]::IsNullOrWhiteSpace($Python)) {
 
 $DemandScript    = Join-Path $Root 'src\extract_demand_details.py'
 $WarehouseScript = Join-Path $Root 'src\extract_warehouse_projections.py'
+$KeySkusScript   = Join-Path $Root 'src\extract_key_skus.py'
 
 # Logs are organized by day: logs/<yyyy-MM-dd>/logs_refresh.txt
 $Today  = Get-Date -Format 'yyyy-MM-dd'
@@ -75,6 +79,18 @@ $warehouseCode = $LASTEXITCODE
 $Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 Add-Content -Path $Log -Value "===== scheduled warehouse refresh finished $Stamp (exit $warehouseCode) ====="
 
+# Key-SKU list (the Exceptions view's watchlist): another independent, fast pull,
+# so it runs regardless of the demand/warehouse outcomes. Writes
+# raw_inputs/key_skus/key_skus_<date>.xlsx atomically.
+$Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+Add-Content -Path $Log -Value "`n===== scheduled key-SKU refresh started $Stamp ====="
+
+& $Python $KeySkusScript *>&1 | Tee-Object -FilePath $Log -Append
+$keySkusCode = $LASTEXITCODE
+
+$Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+Add-Content -Path $Log -Value "===== scheduled key-SKU refresh finished $Stamp (exit $keySkusCode) ====="
+
 # Precompute every view's agent summary in parallel, off the request path, so
 # the dashboard serves agent results (best model + backtest + narrative)
 # instantly instead of running the slow multi-model backtest live. Reads the
@@ -97,4 +113,7 @@ if ($demandCode -eq 0) {
 }
 
 # Worst exit code wins, so Task Scheduler flags a failure in any pull/step.
-exit ([Math]::Max([Math]::Max([int]$demandCode, [int]$warehouseCode), [int]$agentCode))
+exit ([Math]::Max(
+    [Math]::Max([Math]::Max([int]$demandCode, [int]$warehouseCode), [int]$keySkusCode),
+    [int]$agentCode
+))
