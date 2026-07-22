@@ -65,6 +65,16 @@ KEY_DISPLAY_COLS = [
     RECENT_COL, PROJ_COL, PRICE_COL, IMPACT_COL, PCT_COL, FLAG_COL,
 ]
 
+# Per-column widths for the exception tables. Without these, st.dataframe
+# auto-sizes columns and the long free-text Description hogs width, squeezing
+# the trailing Note column so its text clips with no way to expand it (Streamlit
+# TextColumn can't wrap). Bounding Description and widening Note keeps both
+# readable. Reused for both the All-Exceptions and Key SKUs tables.
+_COLUMN_CONFIG = {
+    "Description": st.column_config.TextColumn(width="medium"),
+    FLAG_COL: st.column_config.TextColumn(width="medium"),
+}
+
 
 def _forward_projection_avg(agg_by_group, first_forecast_week, last_forecast_week):
     """Per-(Customer Grouping, SKU) mean of the system Projection over the 15
@@ -246,7 +256,7 @@ def _section(frame, direction, key, P, cols=None, empty_msg=None):
         st.caption(empty_msg or "No SKUs flagged in this section at the current thresholds.")
         return
     st.caption(f"{len(sub):,} SKUs flagged.")
-    render_filtered_table(sub[cols], key, P, style=True)
+    render_filtered_table(sub[cols], key, P, style=True, column_config=_COLUMN_CONFIG)
 
 
 def _render_all_exceptions_tab(frame, P):
@@ -331,7 +341,8 @@ def _render_key_skus_tab(frame, P):
     )
     if not on_plan.empty:
         with st.expander(f"On-plan key SKUs ({on_plan['SKU'].nunique():,})"):
-            render_filtered_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P, style=True)
+            render_filtered_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
+                                   style=True, column_config=_COLUMN_CONFIG)
 
     if missing:
         with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):

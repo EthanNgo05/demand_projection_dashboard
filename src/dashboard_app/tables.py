@@ -372,7 +372,7 @@ def filter_table(df, key, P=None):
 
 
 @st.fragment
-def render_filtered_table(df, key, P=None, *, style=True):
+def render_filtered_table(df, key, P=None, *, style=True, column_config=None):
     """Render the add-filter chips + the table in an isolated fragment.
 
     The fragment scopes a filter click to just this block, so filtering never
@@ -380,9 +380,11 @@ def render_filtered_table(df, key, P=None, *, style=True):
     applies the summary formatting/colouring (summary & KPI tables); pass
     ``style=False`` for the data-quality tables, which render plainly. ``df``
     (the unfiltered frame) is captured as a fragment arg and reused each rerun.
+    ``column_config`` is forwarded to ``st.dataframe`` so callers can pin
+    per-column widths (e.g. widen a free-text column so its text isn't clipped).
     """
     filtered = filter_table(df, key, P)
     st.dataframe(
         style_summary(filtered) if style else filtered,
-        width="stretch", hide_index=True,
+        width="stretch", hide_index=True, column_config=column_config,
     )
