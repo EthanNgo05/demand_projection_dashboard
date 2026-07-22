@@ -737,7 +737,13 @@ def main():
     # provider selector switches the reasoning nodes between the Claude API and
     # a local OpenAI-compatible server; agent/llm.py re-reads LLM_PROVIDER from
     # the env at call time, so setting it here just before invoke() is enough.
-    with st.sidebar:
+    # The Exceptions view is model-agnostic (pure actuals-vs-plan; no forecast is
+    # fit), so the whole model-analysis apparatus — reasoning-LLM selector, the
+    # all-views recommendation run, and any "No ANTHROPIC_API_KEY" warning — is
+    # irrelevant there and would only confuse. Skip it entirely for that view.
+    anthropic_no_key = False
+    if view != EXCEPTIONS_VIEW:
+      with st.sidebar:
         st.header("Model analysis")
         provider_label = st.radio(
             "Reasoning LLM",
@@ -828,7 +834,7 @@ def main():
     # single-model view, so it has no button here — it reads every group's
     # recommendation and points to the sidebar's all-views run instead.
     run_agent = False
-    if view != BEST_MODEL_COMBINED_VIEW:
+    if view not in (BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW):
         run_agent = st.button(
             "Recommend best model",
             key="run_agent_summary",
