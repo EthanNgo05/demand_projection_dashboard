@@ -545,9 +545,12 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     signal at or after the last completed week. This surfaces prolonged stockouts
     and gone-silent channels the forecast would otherwise carry quietly.
 
-    Unlike the sibling checks this looks over FULL history (no window): the gap is
-    measured from the week after the combo's last data week (or, for combos that
-    never had any POS/Orders, from the earliest week the snapshot reaches).
+    Scope is the TRAILING 12 MONTHS: a combo only surfaces if it sold within the
+    past year (last_complete_week - 1yr) and has SINCE gone silent. Two categories
+    are deliberately excluded because there is no recent demand to be "missing" —
+    combos that never had any POS/Orders (never part of the assortment) and
+    long-dead combos whose last sale is more than a year old. The gap is measured
+    from the week after the combo's last data week through the last completed week.
 
     Returns a table (columns = MISSING_POS_COLS), empty if none. Returns None if
     the Plytix export lacks the columns the check needs (an older list-price file)
@@ -597,21 +600,25 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
         combos[["SKU", "Customer"]]
     ).map(had.groupby(["SKU", "Customer"])["WeekDate"].max())
 
-    # --- Currently missing: no data at/after the last completed week -----------
-    # Kept: combos whose most recent data is BEFORE last_complete_week, PLUS
-    # combos that never had any POS/Orders (Last Data Week is NaT -> False).
-    missing = combos[~(combos["Last Data Week"] >= last_complete_week)].copy()
+    # --- Currently missing, but sold within the past year ----------------------
+    # Kept: combos whose most recent data is BEFORE last_complete_week AND no older
+    # than one year. The trailing-12-month floor drops long-dead combos and, since
+    # NaT >= one_year_ago is False, never-had-data combos too — both are combos with
+    # no recent demand to be "missing", not actionable gone-silent channels.
+    one_year_ago = last_complete_week - pd.DateOffset(years=1)
+    missing = combos[
+        ~(combos["Last Data Week"] >= last_complete_week)   # currently silent
+        & (combos["Last Data Week"] >= one_year_ago)         # but sold within the past year
+    ].copy()
     if missing.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)
 
     # --- Build the report -----------------------------------------------------
     # Gap runs from the week AFTER the last data week through the last completed
-    # week. Never-had-data combos start at the earliest week the snapshot reaches.
+    # week. Every surviving combo has a real (non-NaT) last data week within the
+    # past year, so no earliest-week fallback is needed.
     missing["Active in"] = missing["SKU"].map(lambda s: sku_active_in.get(s))
-    earliest_week = m["WeekDate"].min()
-    missing["First Missing Week"] = (
-        (missing["Last Data Week"] + pd.Timedelta(weeks=1)).fillna(earliest_week)
-    )
+    missing["First Missing Week"] = missing["Last Data Week"] + pd.Timedelta(weeks=1)
     missing["Last Missing Week"] = last_complete_week
     missing["Missing Weeks"] = (
         (last_complete_week - missing["First Missing Week"]).dt.days // 7 + 1
