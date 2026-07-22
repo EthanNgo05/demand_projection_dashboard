@@ -243,12 +243,13 @@ def _apply_thresholds(frame, min_pct, min_dollar):
     return frame[pct_pass & dollar_pass]
 
 
-def _download_button(table, slug, today_str):
+def _download_button(table, slug, label, today_str):
     """Excel download of an exceptions table, matching the data-quality tables'
-    download design. ``slug`` names both the file and the widget key (unique per
-    section); the full section is exported (unfiltered, like the other views)."""
+    download design. ``label`` is the button text (names which table it is);
+    ``slug`` names both the file and the widget key (unique per section); the
+    full section is exported (unfiltered, like the other views)."""
     st.download_button(
-        "⬇️ Download this table (Excel)",
+        f"⬇️ Download {label}",
         data=summary_to_excel(table, sheet_name=slug[:31]),
         file_name=f"{slug}_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -256,11 +257,11 @@ def _download_button(table, slug, today_str):
     )
 
 
-def _section(frame, direction, key, P, today_str, slug, cols=None, empty_msg=None):
+def _section(frame, direction, key, P, today_str, slug, label, cols=None, empty_msg=None):
     """Render one direction's ranked, filterable table (worst first). ``cols``
     selects the column set (All-Exceptions vs Key SKUs); ``empty_msg`` overrides
-    the placeholder caption when the section has no rows; ``slug`` names the
-    download file/sheet."""
+    the placeholder caption when the section has no rows; ``slug``/``label`` name
+    the download file and button."""
     cols = cols if cols is not None else _DISPLAY_COLS
     sub = frame[frame[DIRECTION_COL] == direction].sort_values(
         "_sort", ascending=False
@@ -271,7 +272,7 @@ def _section(frame, direction, key, P, today_str, slug, cols=None, empty_msg=Non
         return
     st.caption(f"{len(sub):,} SKUs flagged.")
     render_filtered_table(sub[cols], key, P, style=True, column_config=_COLUMN_CONFIG)
-    _download_button(sub[cols], slug, today_str)
+    _download_button(sub[cols], slug, label, today_str)
 
 
 def _render_all_exceptions_tab(frame, P, today_str):
@@ -307,10 +308,12 @@ def _render_all_exceptions_tab(frame, P, today_str):
         return
 
     _section(flagged, UNDER, "exc_under", P, today_str,
-             slug="exceptions_under-projected")
+             slug="exceptions_under-projected",
+             label="Understocked Exceptions table")
     st.divider()
     _section(flagged, OVER, "exc_over", P, today_str,
-             slug="exceptions_over-projected")
+             slug="exceptions_over-projected",
+             label="Overstocked Exceptions table")
 
 
 def _render_key_skus_tab(frame, P, today_str):
@@ -346,12 +349,12 @@ def _render_key_skus_tab(frame, P, today_str):
 
     # Split into the two planning actions, same layout as the All-Exceptions tab.
     _section(key_frame, UNDER, "exc_key_under", P, today_str,
-             slug="key_skus_under-projected", cols=KEY_DISPLAY_COLS,
-             empty_msg="No under-projected key SKUs.")
+             slug="key_skus_under-projected", label="Understocked Key SKUs table",
+             cols=KEY_DISPLAY_COLS, empty_msg="No under-projected key SKUs.")
     st.divider()
     _section(key_frame, OVER, "exc_key_over", P, today_str,
-             slug="key_skus_over-projected", cols=KEY_DISPLAY_COLS,
-             empty_msg="No over-projected key SKUs.")
+             slug="key_skus_over-projected", label="Overstocked Key SKUs table",
+             cols=KEY_DISPLAY_COLS, empty_msg="No over-projected key SKUs.")
 
     # On-plan key SKUs belong to neither table; keep them in a collapsed section
     # so the watchlist still accounts for every key SKU.
@@ -362,7 +365,8 @@ def _render_key_skus_tab(frame, P, today_str):
         with st.expander(f"On-plan key SKUs ({on_plan['SKU'].nunique():,})"):
             render_filtered_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
                                    style=True, column_config=_COLUMN_CONFIG)
-            _download_button(on_plan[KEY_DISPLAY_COLS], "key_skus_on-plan", today_str)
+            _download_button(on_plan[KEY_DISPLAY_COLS], "key_skus_on-plan",
+                             "On-plan Key SKUs table", today_str)
 
     if missing:
         with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):
