@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from dashboard_app.compute import EIGHT_WK_AVG_COL, _descriptive_averages
+from dashboard_app.compute import EIGHT_WK_AVG_COL, _descriptive_averages, summary_to_excel
 from dashboard_app.config import PRICE_COL, RISK_COL
 from dashboard_app.datasources import discover_key_skus_file, load_key_skus
 from dashboard_app.tables import render_filtered_table
@@ -243,10 +243,24 @@ def _apply_thresholds(frame, min_pct, min_dollar):
     return frame[pct_pass & dollar_pass]
 
 
-def _section(frame, direction, key, P, cols=None, empty_msg=None):
+def _download_button(table, slug, today_str):
+    """Excel download of an exceptions table, matching the data-quality tables'
+    download design. ``slug`` names both the file and the widget key (unique per
+    section); the full section is exported (unfiltered, like the other views)."""
+    st.download_button(
+        "⬇️ Download this table (Excel)",
+        data=summary_to_excel(table, sheet_name=slug[:31]),
+        file_name=f"{slug}_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"dl_{slug}",
+    )
+
+
+def _section(frame, direction, key, P, today_str, slug, cols=None, empty_msg=None):
     """Render one direction's ranked, filterable table (worst first). ``cols``
     selects the column set (All-Exceptions vs Key SKUs); ``empty_msg`` overrides
-    the placeholder caption when the section has no rows."""
+    the placeholder caption when the section has no rows; ``slug`` names the
+    download file/sheet."""
     cols = cols if cols is not None else _DISPLAY_COLS
     sub = frame[frame[DIRECTION_COL] == direction].sort_values(
         "_sort", ascending=False
@@ -257,9 +271,10 @@ def _section(frame, direction, key, P, cols=None, empty_msg=None):
         return
     st.caption(f"{len(sub):,} SKUs flagged.")
     render_filtered_table(sub[cols], key, P, style=True, column_config=_COLUMN_CONFIG)
+    _download_button(sub[cols], slug, today_str)
 
 
-def _render_all_exceptions_tab(frame, P):
+def _render_all_exceptions_tab(frame, P, today_str):
     """The All-Exceptions tab: severity thresholds + Under/Over sections over the
     diverging rows (on-plan rows are excluded here)."""
     diverging = frame[frame[DIRECTION_COL] != ON_PLAN]
@@ -291,12 +306,14 @@ def _render_all_exceptions_tab(frame, P):
         st.info("No exceptions at the current thresholds — try lowering them.")
         return
 
-    _section(flagged, UNDER, "exc_under", P)
+    _section(flagged, UNDER, "exc_under", P, today_str,
+             slug="exceptions_under-projected")
     st.divider()
-    _section(flagged, OVER, "exc_over", P)
+    _section(flagged, OVER, "exc_over", P, today_str,
+             slug="exceptions_over-projected")
 
 
-def _render_key_skus_tab(frame, P):
+def _render_key_skus_tab(frame, P, today_str):
     """The Key SKUs watchlist tab: every key SKU (from extract_key_skus.py) with
     its status, no threshold filtering — a always-on watchlist of important items."""
     path = discover_key_skus_file()
@@ -328,10 +345,12 @@ def _render_key_skus_tab(frame, P):
     )
 
     # Split into the two planning actions, same layout as the All-Exceptions tab.
-    _section(key_frame, UNDER, "exc_key_under", P, cols=KEY_DISPLAY_COLS,
+    _section(key_frame, UNDER, "exc_key_under", P, today_str,
+             slug="key_skus_under-projected", cols=KEY_DISPLAY_COLS,
              empty_msg="No under-projected key SKUs.")
     st.divider()
-    _section(key_frame, OVER, "exc_key_over", P, cols=KEY_DISPLAY_COLS,
+    _section(key_frame, OVER, "exc_key_over", P, today_str,
+             slug="key_skus_over-projected", cols=KEY_DISPLAY_COLS,
              empty_msg="No over-projected key SKUs.")
 
     # On-plan key SKUs belong to neither table; keep them in a collapsed section
@@ -343,6 +362,7 @@ def _render_key_skus_tab(frame, P):
         with st.expander(f"On-plan key SKUs ({on_plan['SKU'].nunique():,})"):
             render_filtered_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
                                    style=True, column_config=_COLUMN_CONFIG)
+            _download_button(on_plan[KEY_DISPLAY_COLS], "key_skus_on-plan", today_str)
 
     if missing:
         with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):
@@ -384,6 +404,6 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
 
     tab_key, tab_all = st.tabs(["Key SKUs", "All Exceptions"])
     with tab_key:
-        _render_key_skus_tab(frame, P)
+        _render_key_skus_tab(frame, P, today_str)
     with tab_all:
-        _render_all_exceptions_tab(frame, P)
+        _render_all_exceptions_tab(frame, P, today_str)
