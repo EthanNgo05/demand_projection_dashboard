@@ -268,10 +268,10 @@ def render_missing_pos_section(view, region, missing_pos_df, today_str):
     HEADER = "### SKUs missing POS/Orders data in locations they are active in"
     st.markdown(HEADER)
     st.caption(
-        "Note: this table only surfaces combos that sold within the past year "
+        "Note: this table only surfaces combos that sold within the past 3 months "
         "and have since gone silent. It deliberately excludes customer/SKU "
         "combinations that were never part of the assortment (no POS or Orders "
-        "ever) and long-dead combinations that haven't sold in over a year."
+        "ever) and long-dead combinations that haven't sold in over 3 months."
     )
     if missing_pos_df is None:
         st.info(
@@ -302,8 +302,8 @@ def render_missing_pos_section(view, region, missing_pos_df, today_str):
     scope_note = f" for {region}" if region_scoped else ""
     st.caption(
         f"Flagged{scope_note}: {n_skus:,} distinct active SKUs (Parts included) "
-        "that sold in a location they're active in within the past year but have "
-        "since stopped receiving POS/Orders data (trailing-12-month look-back)."
+        "that sold in a location they're active in within the past 3 months but have "
+        "since stopped receiving POS/Orders data (trailing-3-month look-back)."
     )
 
     show = table_df.copy()

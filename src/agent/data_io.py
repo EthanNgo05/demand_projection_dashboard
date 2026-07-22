@@ -282,6 +282,7 @@ DISCONTINUED_COLS = [
 
 MISSING_POS_COLS = [
     "SKU", "Region Code", "Region", "Active in", "Customer",
+    "Data Source", "Last Value",
     "First Missing Week", "Last Missing Week", "Missing Weeks",
 ]
 
@@ -545,12 +546,13 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     signal at or after the last completed week. This surfaces prolonged stockouts
     and gone-silent channels the forecast would otherwise carry quietly.
 
-    Scope is the TRAILING 12 MONTHS: a combo only surfaces if it sold within the
-    past year (last_complete_week - 1yr) and has SINCE gone silent. Two categories
-    are deliberately excluded because there is no recent demand to be "missing" —
-    combos that never had any POS/Orders (never part of the assortment) and
-    long-dead combos whose last sale is more than a year old. The gap is measured
-    from the week after the combo's last data week through the last completed week.
+    Scope is the TRAILING 3 MONTHS: a combo only surfaces if it sold within the
+    past 3 months (last_complete_week - 3mo) and has SINCE gone silent. Two
+    categories are deliberately excluded because there is no recent demand to be
+    "missing" — combos that never had any POS/Orders (never part of the assortment)
+    and long-dead combos whose last sale is more than 3 months old. The gap is
+    measured from the week after the combo's last data week through the last
+    completed week.
 
     Returns a table (columns = MISSING_POS_COLS), empty if none. Returns None if
     the Plytix export lacks the columns the check needs (an older list-price file)
@@ -590,25 +592,35 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     if combos.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)
 
-    # --- Last week each combo had ANY POS/Orders (full history, incl. future) --
-    # A recorded 0 counts as data; only NaN/absent is "no data". Future weeks
-    # carry booked orders, so a combo with data at/after the reference week is NOT
-    # missing. (SKU, Customer, WeekDate) isn't unique, but the max data-bearing
-    # week is unaffected by the duplicate grain.
-    had = m[m["POS"].notna() | m["Orders"].notna()]
-    combos["Last Data Week"] = pd.MultiIndex.from_frame(
-        combos[["SKU", "Customer"]]
-    ).map(had.groupby(["SKU", "Customer"])["WeekDate"].max())
+    # --- Each combo's last data-bearing week + the POS/Orders recorded on it ----
+    # A recorded 0 counts as data; only NaN/absent is "no data". (SKU, Customer,
+    # WeekDate) isn't unique, so sum the duplicate-grain rows within each week
+    # (min_count=1 keeps an all-NaN week as NaN, not 0), then take each combo's
+    # latest data-bearing week and the values booked on it. Future weeks carry
+    # booked orders, so a combo with data at/after the reference week is NOT missing.
+    weekly = (
+        m.groupby(["SKU", "Customer", "WeekDate"], as_index=False)[["POS", "Orders"]]
+        .sum(min_count=1)
+    )
+    weekly = weekly[weekly["POS"].notna() | weekly["Orders"].notna()]
+    last_rows = (
+        weekly.loc[weekly.groupby(["SKU", "Customer"])["WeekDate"].idxmax()]
+        .set_index(["SKU", "Customer"])
+    )
+    key = pd.MultiIndex.from_frame(combos[["SKU", "Customer"]])
+    combos["Last Data Week"] = key.map(last_rows["WeekDate"])
+    combos["_last_pos"] = key.map(last_rows["POS"])
+    combos["_last_orders"] = key.map(last_rows["Orders"])
 
-    # --- Currently missing, but sold within the past year ----------------------
+    # --- Currently missing, but sold within the past 3 months ------------------
     # Kept: combos whose most recent data is BEFORE last_complete_week AND no older
-    # than one year. The trailing-12-month floor drops long-dead combos and, since
-    # NaT >= one_year_ago is False, never-had-data combos too — both are combos with
-    # no recent demand to be "missing", not actionable gone-silent channels.
-    one_year_ago = last_complete_week - pd.DateOffset(years=1)
+    # than 3 months. The trailing-3-month floor drops long-dead combos and, since
+    # NaT >= three_months_ago is False, never-had-data combos too — both are combos
+    # with no recent demand to be "missing", not actionable gone-silent channels.
+    three_months_ago = last_complete_week - pd.DateOffset(months=3)
     missing = combos[
         ~(combos["Last Data Week"] >= last_complete_week)   # currently silent
-        & (combos["Last Data Week"] >= one_year_ago)         # but sold within the past year
+        & (combos["Last Data Week"] >= three_months_ago)     # but sold within the past 3 months
     ].copy()
     if missing.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)
@@ -616,8 +628,15 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     # --- Build the report -----------------------------------------------------
     # Gap runs from the week AFTER the last data week through the last completed
     # week. Every surviving combo has a real (non-NaT) last data week within the
-    # past year, so no earliest-week fallback is needed.
+    # past 3 months, so no earliest-week fallback is needed.
     missing["Active in"] = missing["SKU"].map(lambda s: sku_active_in.get(s))
+    # POS-then-Orders: the last data point's source is POS if it recorded any POS,
+    # else Orders; Last Value is the quantity booked on that final data week.
+    missing["Data Source"] = missing["_last_pos"].notna().map({True: "POS", False: "Orders"})
+    missing["Last Value"] = (
+        missing["_last_pos"].where(missing["_last_pos"].notna(), missing["_last_orders"])
+        .round(0).astype("Int64")
+    )
     missing["First Missing Week"] = missing["Last Data Week"] + pd.Timedelta(weeks=1)
     missing["Last Missing Week"] = last_complete_week
     missing["Missing Weeks"] = (
