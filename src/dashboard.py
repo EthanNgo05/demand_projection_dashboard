@@ -1126,9 +1126,9 @@ def main():
             f"{window_label} Historical Demand (avg/wk)",
             f"{row[avg_col]:,.1f}",
         )
-        sysv = row.get("Initial Projection Average")
+        sysv = row.get("Current Projection Average")
         st.metric(
-            "Initial Forecast (avg/wk)",
+            "Current Forecast (avg/wk)",
             "—" if pd.isna(sysv) else f"{sysv:,.0f}",
         )
         st.metric(

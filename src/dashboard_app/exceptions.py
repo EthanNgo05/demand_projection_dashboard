@@ -28,15 +28,15 @@ from dashboard_app.tables import render_filtered_table
 
 # Display column names for the exceptions table. These deliberately reuse the
 # names style_summary already formats/colours so the table matches the other
-# summary tables: RECENT_COL → 1-decimal run-rate; PROJ_COL ("Initial Projection
+# summary tables: RECENT_COL → 1-decimal run-rate; PROJ_COL ("Current Projection
 # Average") → comma'd integer; GAP_COL ("Projection Difference") and IMPACT_COL
 # ("Revenue Risk (avg/wk)") → integer/$ formatting AND green(+)/red(−) colouring.
 RECENT_COL = EIGHT_WK_AVG_COL            # "8-Week POS/Orders Average"
-PROJ_COL = "Initial Projection Average"  # system (datawarehouse) projection, forward 15-wk avg
-GAP_COL = "Projection Difference"        # 8-Week Avg − Initial Projection Average
-PCT_COL = "% Deviation"                  # 100 × Projection Difference / Initial Projection Average
+PROJ_COL = "Current Projection Average"  # system (datawarehouse) projection, forward 15-wk avg
+GAP_COL = "Projection Difference"        # 8-Week Avg − Current Projection Average
+PCT_COL = "% Deviation"                  # 100 × Projection Difference / Current Projection Average
 IMPACT_COL = RISK_COL                    # "Revenue Risk (avg/wk)" = Projection Difference × list price
-FLAG_COL = "Flag"
+FLAG_COL = "Note"                        # data annotation: "No forecasts given" / "No recent sales" / blank
 DIRECTION_COL = "Direction"
 
 UNDER = "Under-projected (stockout risk)"   # recent >> plan: selling faster than planned
@@ -62,7 +62,7 @@ _DISPLAY_COLS = [
 STATUS_COL = "Status"
 KEY_DISPLAY_COLS = [
     "SKU", "Description", "Customer Grouping", "Region", STATUS_COL, "Data Source",
-    RECENT_COL, PROJ_COL, PRICE_COL, IMPACT_COL, PCT_COL,
+    RECENT_COL, PROJ_COL, PRICE_COL, IMPACT_COL, PCT_COL, FLAG_COL,
 ]
 
 
@@ -163,9 +163,9 @@ def compute_exceptions(df, today_ts, prices, P):
 
     # Flags for the two edge cases that make % undefined or degenerate.
     frame[FLAG_COL] = ""
-    frame.loc[proj_missing | (frame["_proj"] == 0), FLAG_COL] = "no plan"
-    frame.loc[(frame[RECENT_COL] == 0) & (frame["_proj"] > 0), FLAG_COL] = "no recent sales"
-    # "no recent sales" is a full over-projection: recent 0 vs a real plan = -100%.
+    frame.loc[proj_missing | (frame["_proj"] == 0), FLAG_COL] = "No forecasts given"
+    frame.loc[(frame[RECENT_COL] == 0) & (frame["_proj"] > 0), FLAG_COL] = "No recent sales"
+    # "No recent sales" is a full over-projection: recent 0 vs a real plan = -100%.
     frame.loc[(frame[RECENT_COL] == 0) & (frame["_proj"] > 0), "_pct"] = -1.0
 
     # Drop rows with no signal either way (nothing planned and nothing selling).
@@ -224,8 +224,8 @@ def compute_exceptions(df, today_ts, prices, P):
 
 def _apply_thresholds(frame, min_pct, min_dollar):
     """Keep only material exceptions. A row passes the % gate if its |%| meets the
-    threshold OR its % is undefined ("no plan" — inherently extreme); it passes the
-    $ gate if its |impact| meets the threshold OR is unknown (no list price)."""
+    threshold OR its % is undefined ("No forecasts given" — inherently extreme); it
+    passes the $ gate if its |impact| meets the threshold OR is unknown (no price)."""
     pct_abs = frame[PCT_COL].abs()
     pct_pass = pct_abs.isna() | (pct_abs >= min_pct * 100)
     imp_abs = frame[IMPACT_COL].abs()
@@ -233,17 +233,20 @@ def _apply_thresholds(frame, min_pct, min_dollar):
     return frame[pct_pass & dollar_pass]
 
 
-def _section(frame, direction, key, P):
-    """Render one direction's ranked, filterable table (worst first)."""
+def _section(frame, direction, key, P, cols=None, empty_msg=None):
+    """Render one direction's ranked, filterable table (worst first). ``cols``
+    selects the column set (All-Exceptions vs Key SKUs); ``empty_msg`` overrides
+    the placeholder caption when the section has no rows."""
+    cols = cols if cols is not None else _DISPLAY_COLS
     sub = frame[frame[DIRECTION_COL] == direction].sort_values(
         "_sort", ascending=False
     )
     st.markdown(f"#### {direction}")
     if sub.empty:
-        st.caption("No SKUs flagged in this section at the current thresholds.")
+        st.caption(empty_msg or "No SKUs flagged in this section at the current thresholds.")
         return
     st.caption(f"{len(sub):,} SKUs flagged.")
-    render_filtered_table(sub[_DISPLAY_COLS], key, P, style=True)
+    render_filtered_table(sub[cols], key, P, style=True)
 
 
 def _render_all_exceptions_tab(frame, P):
@@ -313,8 +316,22 @@ def _render_key_skus_tab(frame, P):
     key_frame[STATUS_COL] = key_frame[DIRECTION_COL].map(STATUS_SHORT).fillna(
         key_frame[DIRECTION_COL]
     )
-    disp = key_frame.sort_values("_sort", ascending=False)
-    render_filtered_table(disp[KEY_DISPLAY_COLS], "exc_key", P, style=True)
+
+    # Split into the two planning actions, same layout as the All-Exceptions tab.
+    _section(key_frame, UNDER, "exc_key_under", P, cols=KEY_DISPLAY_COLS,
+             empty_msg="No under-projected key SKUs.")
+    st.divider()
+    _section(key_frame, OVER, "exc_key_over", P, cols=KEY_DISPLAY_COLS,
+             empty_msg="No over-projected key SKUs.")
+
+    # On-plan key SKUs belong to neither table; keep them in a collapsed section
+    # so the watchlist still accounts for every key SKU.
+    on_plan = key_frame[key_frame[DIRECTION_COL] == ON_PLAN].sort_values(
+        "_sort", ascending=False
+    )
+    if not on_plan.empty:
+        with st.expander(f"On-plan key SKUs ({on_plan['SKU'].nunique():,})"):
+            render_filtered_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P, style=True)
 
     if missing:
         with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):
@@ -333,8 +350,8 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
         "(stockout risk); over-projected = planned but not selling (overstock risk)."
     )
     st.caption(
-        "**Projection Difference** = 8-Week POS/Orders Average - Initial Projection "
-        "Average.  **% Deviation** = 100 x Projection Difference / Initial Projection "
+        "**Projection Difference** = 8-Week POS/Orders Average - Current Projection "
+        "Average.  **% Deviation** = 100 x Projection Difference / Current Projection "
         "Average (blank when there is no projection).  **Revenue Risk (avg/wk)** = "
         "Projection Difference x List Price."
     )
@@ -354,8 +371,8 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
         st.info("No exceptions found — every SKU's recent sell-through tracks its projection.")
         return
 
-    tab_all, tab_key = st.tabs(["All Exceptions", "Key SKUs"])
-    with tab_all:
-        _render_all_exceptions_tab(frame, P)
+    tab_key, tab_all = st.tabs(["Key SKUs", "All Exceptions"])
     with tab_key:
         _render_key_skus_tab(frame, P)
+    with tab_all:
+        _render_all_exceptions_tab(frame, P)

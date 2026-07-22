@@ -43,7 +43,7 @@ def _render_kpis(summary, agg, anchors, stacked=False):
     weekly_totals = hist_demand.groupby("WeekDate")["demand"].sum(min_count=1)
     total_avg = float(weekly_totals.mean()) if not weekly_totals.empty else 0.0
     total_updated = summary["Updated Projection Average"].sum()
-    total_initial = summary["Initial Projection Average"].sum()
+    total_initial = summary["Current Projection Average"].sum()
     diff = total_updated - total_initial
     # Total Projection Value = Σ (list price × updated weekly-avg forecast) over
     # priced SKUs. Unpriced SKUs map to NaN and are skipped, so this covers the
@@ -74,7 +74,7 @@ def _render_kpis(summary, agg, anchors, stacked=False):
              f"chart's actual-demand line.",
     )
     k3.metric(
-        "Initial Forecast (avg/wk)", f"{total_initial:,.0f}",
+        "Current Forecast (avg/wk)", f"{total_initial:,.0f}",
         help="Mean of the existing system projection over the forecast horizon "
              "(the 15 future weeks) — the average of the chart's original-"
              "projection line over the forecast window.",
@@ -350,9 +350,9 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
             "Historical Demand (avg/wk)",
             f"{float(sku_weekly_tot.mean()) if not sku_weekly_tot.empty else 0.0:,.1f}",
         )
-        sysv = rows["Initial Projection Average"].sum(min_count=1)
+        sysv = rows["Current Projection Average"].sum(min_count=1)
         st.metric(
-            "Initial Forecast (avg/wk)",
+            "Current Forecast (avg/wk)",
             "—" if pd.isna(sysv) else f"{sysv:,.0f}",
         )
         updated = rows["Updated Projection Average"].sum()

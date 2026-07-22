@@ -161,7 +161,7 @@ ALL_CUSTOMERS_LABEL = "ALL CUSTOMERS"
 DISPLAY_NAMES = {
     "weeks_with_data": "Weeks with data",
     "8_week_pos_avg": "8 Week POS/Orders Average",
-    "initial_projection_avg": "Initial Projection Average",
+    "initial_projection_avg": "Current Projection Average",
     "updated_projection_avg": "Updated Projection Average",
     "projection_difference": "Projection Difference",
     "list_price_usd": "List Price (USD)",
@@ -177,7 +177,7 @@ SUMMARY_COLUMNS = [
     "Weeks with data",
     "8 Week POS/Orders Average",
     "Updated Projection Average",
-    "Initial Projection Average",
+    "Current Projection Average",
     "Projection Difference",
     "List Price (USD)",
     "Revenue Risk (avg/wk)",
@@ -446,7 +446,7 @@ def fit_regression(df, today, grouping_label, breakdown_df=None, list_prices=Non
     # SAME 15 forecast weeks the updated average uses -- from the current
     # in-progress week (first_forecast_week) through the 15th forecast week
     # (forecast_weeks[-1]). Scoping to the forward horizon (not the historical
-    # window) makes "Initial Forecast" and "Updated Forecast" apples-to-apples --
+    # window) makes "Current Forecast" and "Updated Forecast" apples-to-apples --
     # both are forward projections over the same weeks -- so "Projection
     # Difference" / "Revenue Risk" agree in sign with the forecast-vs-original
     # comparison shown on the chart. This matches the Holt/XGBoost pipelines.

@@ -12,7 +12,7 @@ def style_summary(summary_df):
     """Format numbers and colour the up/down columns (up green / down red)."""
     df = summary_df.copy()
     int_cols = [c for c in [
-        "Weeks with data", "Initial Projection Average",
+        "Weeks with data", "Current Projection Average",
         "Updated Projection Average", "Projection Difference",
     ] if c in df.columns]
     fmt = {c: "{:,.0f}" for c in int_cols}

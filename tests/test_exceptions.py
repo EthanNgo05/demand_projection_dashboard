@@ -127,13 +127,13 @@ def test_edge_cases(sample_df, P):
     out = _by_sku(compute_exceptions(sample_df, TODAY, PRICES, P))
 
     # No plan of record: proj treated as 0, % undefined, still under-projected.
-    assert out.loc["NOPLAN", FLAG_COL] == "no plan"
+    assert out.loc["NOPLAN", FLAG_COL] == "No forecasts given"
     assert out.loc["NOPLAN", PROJ_COL] == 0
     assert pd.isna(out.loc["NOPLAN", PCT_COL])
     assert out.loc["NOPLAN", DIRECTION_COL] == UNDER
 
     # Planned but nothing selling recently: recent 0, a full -100% over-projection.
-    assert out.loc["DEADPLAN", FLAG_COL] == "no recent sales"
+    assert out.loc["DEADPLAN", FLAG_COL] == "No recent sales"
     assert out.loc["DEADPLAN", RECENT_COL] == 0.0
     assert out.loc["DEADPLAN", PCT_COL] == -100.0
     assert out.loc["DEADPLAN", DIRECTION_COL] == OVER
