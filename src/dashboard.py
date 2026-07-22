@@ -180,14 +180,39 @@ def main():
     st.markdown(
         f"""
         <style>
-        /* Make the top-of-page view segmented control read as a full-width
-           button bar: the four pills share the row equally. Scoped to the
-           segmented-control widget (stButtonGroup) so ordinary buttons and
-           st.columns button rows are unaffected. Harmless no-op if a future
-           Streamlit renames the test id. */
-        div[data-testid="stButtonGroup"] {{ width: 100%; }}
-        div[data-testid="stButtonGroup"] > div {{ display: flex; width: 100%; gap: 0.25rem; }}
-        div[data-testid="stButtonGroup"] button {{ flex: 1 1 0; }}
+        /* Render the top-of-page view segmented control as a tab strip: the four
+           options read as left-aligned folder-style tabs sitting on a shared
+           baseline, with the active tab marked by a blue underline + bold label.
+           Scoped to the segmented-control widget (stButtonGroup) so ordinary
+           buttons and st.columns button rows are unaffected. Harmless no-op if a
+           future Streamlit renames the test id (the active/inactive suffixes are
+           stBaseButton-segmented_control[Active]). */
+        div[data-testid="stButtonGroup"] {{
+            width: 100%;
+            border-bottom: 1px solid rgba(148,163,184,0.35);  /* shared tab baseline */
+            margin-bottom: 0.75rem;
+        }}
+        div[data-testid="stButtonGroup"] > div {{ display: flex; gap: 0.25rem; }}
+        div[data-testid="stButtonGroup"] button {{
+            background: transparent !important;
+            border: none !important;
+            border-bottom: 2px solid transparent !important;  /* reserve underline space */
+            border-radius: 0 !important;
+            margin-bottom: -1px;              /* overlap the baseline */
+            padding: 0.4rem 1rem;
+            color: rgba(148,163,184,1);       /* muted inactive label */
+            font-weight: 500;
+        }}
+        div[data-testid="stButtonGroup"] button:hover {{
+            color: inherit !important;
+            border-bottom-color: rgba(148,163,184,0.5) !important;
+        }}
+        /* Active tab: brand-blue underline + emphasis (matches C_ACTUAL). */
+        div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] {{
+            color: inherit !important;
+            font-weight: 700;
+            border-bottom-color: #2563eb !important;
+        }}
 
         /* Replace Streamlit's top-right "running" status graphic — which cycles
            through animated sport figures (runner, cyclist, swimmer…) — with a
