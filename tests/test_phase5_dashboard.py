@@ -146,7 +146,8 @@ def test_smoothing_params_survive_model_round_trip():
     assert not at.exception
 
     # Select Holt -> autofit runs and stores tuned params for this view.
-    at.radio(key="model_choice").set_value(HOLT).run()
+    # The model widget is now a top-of-page dropdown (selectbox), not a radio.
+    at.selectbox(key="model_choice").set_value(HOLT).run()
     assert not at.exception
     assert "autofit_params" in at.session_state, (
         "autofit did not run on first Holt selection"
@@ -154,9 +155,9 @@ def test_smoothing_params_survive_model_round_trip():
     assert at.session_state["autofit_params"]["model"] == dashboard.MODEL_OPTIONS[HOLT]
 
     # Leave to another model, then come back to Holt.
-    at.radio(key="model_choice").set_value(OTHER).run()
+    at.selectbox(key="model_choice").set_value(OTHER).run()
     assert not at.exception
-    at.radio(key="model_choice").set_value(HOLT).run()
+    at.selectbox(key="model_choice").set_value(HOLT).run()
     assert not at.exception
 
     # Returning to Holt must re-establish autofit params for this view; otherwise
@@ -177,7 +178,10 @@ def test_exceptions_view_renders():
 
     at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
     assert not at.exception
-    at.radio(key="scope").set_value(dashboard.EXCEPTIONS_VIEW).run()
+    # "scope" is now a top-of-page segmented control, which AppTest has no direct
+    # accessor for; drive it through session state (the key is unchanged).
+    at.session_state["scope"] = dashboard.EXCEPTIONS_VIEW
+    at.run()
     assert not at.exception
     # It draws its own subheader and both tabs.
     assert any("Exceptions" == s.value for s in at.subheader)

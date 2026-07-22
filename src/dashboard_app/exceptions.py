@@ -391,8 +391,8 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     st.caption("How each column is calculated:")
     st.markdown(
         "- **Projection Difference** = (8-Week POS/Orders Average) − (Current Projection Average)\n"
-        "- **% Deviation** = (Projection Difference / Current Projection Average) × 100 "
-        "(blank when there is no projection)\n"
+        "- **% Deviation** = (Projection Difference / Current Projection Average) × 100\n"
+        "  - Blank when there is no projection\n"
         "- **Revenue Risk (avg/wk)** = Projection Difference × List Price"
     )
 

@@ -163,33 +163,31 @@ from dashboard_app.dataquality import (  # noqa: F401
 
 def main():
     st.set_page_config(
-        page_title="Demand Projections", page_icon="📦", layout="wide"
+        page_title="Demand Projections", page_icon="📦", layout="wide",
+        initial_sidebar_state="collapsed",
     )
 
-    # Keep the reasoning-LLM choice across reruns where the sidebar radio isn't
-    # re-rendered — the refresh buttons st.rerun() before the script reaches the
-    # radio (see the "Sync" / "Check for new data" buttons above the model
-    # analysis section). Streamlit garbage-collects an unrendered keyed widget's
-    # state, which would snap the radio back to its first option (Anthropic) and
-    # spuriously surface the "No ANTHROPIC_API_KEY" warning even when the user
-    # picked Local. Re-registering the key here preserves the actual selection.
+    # Keep the reasoning-LLM choice across reruns where its radio isn't
+    # re-rendered — a refresh button st.rerun()s before the script reaches the
+    # radio, and the Exceptions view never renders it at all. Streamlit
+    # garbage-collects an unrendered keyed widget's state, which would snap the
+    # radio back to its first option (Anthropic) and spuriously surface the
+    # "No ANTHROPIC_API_KEY" warning even when the user picked Local.
+    # Re-registering the key here preserves the actual selection.
     if "agent_llm_provider" in st.session_state:
         st.session_state["agent_llm_provider"] = st.session_state["agent_llm_provider"]
 
-    # Widen the sidebar a touch (Streamlit's default is ~244-260px). Adjust
-    # SIDEBAR_WIDTH_PX to taste; users can still drag the divider to resize.
-    SIDEBAR_WIDTH_PX = 340
     st.markdown(
         f"""
         <style>
-        /* Only widen the sidebar while it's expanded. Scoping to
-           aria-expanded="true" lets Streamlit's collapse animation drive the
-           width to 0 when hidden, so the main content reclaims the full width
-           instead of the min-width pinning it open. */
-        section[data-testid="stSidebar"][aria-expanded="true"] {{
-            width: {SIDEBAR_WIDTH_PX}px !important;
-            min-width: {SIDEBAR_WIDTH_PX}px !important;
-        }}
+        /* Make the top-of-page view segmented control read as a full-width
+           button bar: the four pills share the row equally. Scoped to the
+           segmented-control widget (stButtonGroup) so ordinary buttons and
+           st.columns button rows are unaffected. Harmless no-op if a future
+           Streamlit renames the test id. */
+        div[data-testid="stButtonGroup"] {{ width: 100%; }}
+        div[data-testid="stButtonGroup"] > div {{ display: flex; width: 100%; gap: 0.25rem; }}
+        div[data-testid="stButtonGroup"] button {{ flex: 1 1 0; }}
 
         /* Replace Streamlit's top-right "running" status graphic — which cycles
            through animated sport figures (runner, cyclist, swimmer…) — with a
@@ -222,60 +220,52 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ----- Model toggle ------------------------------------------------------
-    # Rendered first so every downstream helper (raw-file discovery, cleaning,
-    # forecasting) sees the chosen pipeline on this same run.
-    with st.sidebar:
-        st.header("Model")
-        if not MODEL_OPTIONS:
-            st.error(
-                "No forecasting pipeline found — expected "
-                "models/exponential_smoothing.py, models/holt_winters.py, "
-                "models/xgboost.py, models/tsb.py or models/regression.py next "
-                "to dashboard.py (or set DEMAND_PIPELINE)."
-            )
-            st.stop()
+    # ----- Model selection logic (the widget renders later, in the top panel) -
+    # This runs BEFORE load_pipeline() below so the chosen pipeline loads on the
+    # same run: pipeline_path() reads st.session_state["model_choice"], and the
+    # pending-model switch must write that key before the selectbox is
+    # instantiated (Streamlit forbids setting a widget-keyed value once its
+    # widget exists this run). The selectbox itself is rendered into the top
+    # control panel further down, and only for the single-model views
+    # (Executive Overview / By Region).
+    if not MODEL_OPTIONS:
+        st.error(
+            "No forecasting pipeline found — expected "
+            "models/exponential_smoothing.py, models/holt_winters.py, "
+            "models/xgboost.py, models/tsb.py or models/regression.py next "
+            "to dashboard.py (or set DEMAND_PIPELINE)."
+        )
+        st.stop()
 
-        def _on_model_change():
-            # Autofitted parameters belong to the previous model; drop them so
-            # the new pipeline re-autofits (or falls back to its file defaults).
-            # A structural change also recomputes automatically via the compute
-            # gate.
-            #
-            # Drop the "autofit_tried" marker too: it and autofit_params are one
-            # logical fact ("we have a backtest result for this model/view/
-            # snapshot"). Clearing only the params leaves the marker asserting we
-            # already tried, so returning to a smoothing model would SKIP the
-            # backtest and silently fall back to file-default α/β/φ — changing
-            # the forecast for an unchanged view. Keep the two in lock-step.
-            st.session_state.pop("autofit_params", None)
-            st.session_state.pop("autofit_tried", None)
+    def _on_model_change():
+        # Autofitted parameters belong to the previous model; drop them so
+        # the new pipeline re-autofits (or falls back to its file defaults).
+        # A structural change also recomputes automatically via the compute
+        # gate.
+        #
+        # Drop the "autofit_tried" marker too: it and autofit_params are one
+        # logical fact ("we have a backtest result for this model/view/
+        # snapshot"). Clearing only the params leaves the marker asserting we
+        # already tried, so returning to a smoothing model would SKIP the
+        # backtest and silently fall back to file-default α/β/φ — changing
+        # the forecast for an unchanged view. Keep the two in lock-step.
+        st.session_state.pop("autofit_params", None)
+        st.session_state.pop("autofit_tried", None)
 
-        # After "Run Agent Summary" picks a best model, switch the toggle to it
-        # so the screen shows that model. The switch is stashed as a pending key
-        # (the button handler runs *after* this widget) and applied here, before
-        # the radio is instantiated — Streamlit forbids writing a widget-keyed
-        # value once its widget exists this run. We replicate _on_model_change's
-        # side effects since applying it programmatically doesn't fire on_change.
-        pending_model = st.session_state.pop("_pending_model_choice", None)
-        if pending_model in MODEL_OPTIONS and pending_model != st.session_state.get(
-            "model_choice"
-        ):
-            st.session_state["model_choice"] = pending_model
-            _on_model_change()
+    # After "Recommend best model" picks a winner, switch the model selector to
+    # it so the screen shows that model. The switch is stashed as a pending key
+    # (the button handler runs *after* the widget) and applied here, before the
+    # selectbox is instantiated. We replicate _on_model_change's side effects
+    # since applying it programmatically doesn't fire on_change.
+    pending_model = st.session_state.pop("_pending_model_choice", None)
+    if pending_model in MODEL_OPTIONS and pending_model != st.session_state.get(
+        "model_choice"
+    ):
+        st.session_state["model_choice"] = pending_model
+        _on_model_change()
 
-        # The Optimal Projections view forecasts each group with its own
-        # best model, so the sidebar model choice does nothing there. Grey the
-        # radio out (it keeps its stored value) so users aren't misled. Scope is
-        # read from the persisted key set by the Scope radio further down; on the
-        # first run the key is absent (-> enabled), which matches the default
-        # Executive Overview scope.
-        _combined_view = st.session_state.get("scope") == BEST_MODEL_COMBINED_VIEW
-        st.radio(
-            "Forecasting model", list(MODEL_OPTIONS.keys()),
-            key="model_choice", on_change=_on_model_change,
-            format_func=model_display, disabled=_combined_view,
-            help="""
+    # Help text for the forecasting-model selector (rendered later in the panel).
+    _MODEL_HELP = """
         **Forecasting models**
 
         - **8-Week Moving Average** – Simple baseline model that forecasts using the average demand over the previous 8 weeks.
@@ -283,13 +273,7 @@ def main():
         - **Holt-Winters Exponential Smoothing** – Extends Holt's method by also modeling seasonality, making it well suited for recurring demand patterns.
         - **XGBoost** – Machine learning model that can capture complex relationships and nonlinear patterns in demand data. Best when sufficient historical data and predictive features are available.
         - **TSB (Teunter-Syntetos-Babai)** – Designed for intermittent demand, where products have many zero-demand periods with occasional sales.
-        """,
-        )
-        if _combined_view:
-            st.caption(
-                "Not used in Optimal Projections — each customer group uses its "
-                "own best model."
-            )
+        """
 
     P = load_pipeline(pipeline_path())
     st.title("📦 Demand Projection Dashboard")
@@ -316,9 +300,87 @@ def main():
         )
     _header_caption_slot = st.empty()
 
-    # ----- Data source -----------------------------------------------------
-    with st.sidebar:
-        st.header("Data source")
+    # ----- Top-of-page control panel ---------------------------------------
+    # No sidebar: every control lives here. Placeholder containers pin the visual
+    # order — view buttons, then the By-Region sub-selectors, then a two-column
+    # panel (left: forecasting model + model analysis; right: data source) — even
+    # though several are populated later (they need `df`, which the data-source
+    # column loads, and `view`/`today_ts`, resolved after that).
+    view_slot = st.container()
+    region_slot = st.container()
+    panel = st.container()
+    with panel:
+        col_model, col_data = st.columns([1, 1])
+
+    # Defaults so the recommend-button handlers below are always well-defined,
+    # even for views that hide their button (each view renders at most one).
+    run_agent = False
+    run_all = False
+    provider_label = None
+    anthropic_no_key = False
+
+    with view_slot:
+        # The four top-level views as a button-bar segmented control. Keeps
+        # key="scope" and the same internal view IDs the rest of the app reads
+        # (the model-selection logic above resolves the pipeline off it).
+        scope = st.segmented_control(
+            "View",
+            [ALL_CUSTOMERS_VIEW, "By region", BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW],
+            default=ALL_CUSTOMERS_VIEW,
+            key="scope",
+            format_func=lambda s: SCOPE_LABELS.get(s, s),
+            label_visibility="collapsed",
+        )
+        # segmented_control returns None if the user deselects the active pill;
+        # fall back to the persisted choice (or the default) so a view is always
+        # resolved.
+        if scope is None:
+            scope = st.session_state.get("scope") or ALL_CUSTOMERS_VIEW
+        with st.expander("ℹ️ About these views"):
+            st.markdown(
+                """
+Choose how forecasts are grouped before modeling.
+
+**Executive Overview:**
+Forecasts all customer groups as one combined demand series using the forecasting model selected above.
+
+**Optimized Projections:**
+Forecasts each customer group with its own most-accurate model (determined by model analysis), then combines the results into a single table. Requires the model analysis pipeline to have been run for all customer groups.
+
+**By Region:**
+Forecasts only the selected fulfillment region (or customer group within that region) using the forecasting model selected above.
+
+**Exceptions:**
+Scans every customer group for SKUs whose recent actual sell-through has diverged sharply from the existing system projection (the plan of record). Model-agnostic — no forecast is run.
+
+**Summary:**
+
+- Executive Overview: One model across all customers.
+- Optimized Projections: Best model for each customer group, combined into one view.
+- By Region: One model applied only to the selected customer group.
+- Exceptions: Recent actuals vs. the system projection, worst offenders first.
+"""
+            )
+
+    # Resolve the view for the three scopes that don't need `df`. "By region"
+    # depends on list_views(df), so it's resolved once the Data source block has
+    # loaded the frame (see the region_slot fill below).
+    if scope == ALL_CUSTOMERS_VIEW:
+        view = ALL_CUSTOMERS_VIEW
+        region = None
+    elif scope == BEST_MODEL_COMBINED_VIEW:
+        view = BEST_MODEL_COMBINED_VIEW
+        region = None
+    elif scope == EXCEPTIONS_VIEW:
+        view = EXCEPTIONS_VIEW
+        region = None
+    else:
+        view = None  # filled from region_slot once df is available
+        region = None
+
+    # ----- Data source (right column of the top panel) ---------------------
+    with col_data:
+        st.subheader("Data source")
         files = discover_raw_files()
         df = None
         today_str = None
@@ -440,12 +502,24 @@ def main():
                     "see logs/<date>/logs_refresh.txt for details."
                 )
 
+        # Manual data-file pickers live in ONE collapsible section at the top so
+        # the sync button + toggle stay uncluttered. A single expander object is
+        # reused across the snapshot / prices / warehouse blocks below: Streamlit
+        # forbids *nesting* expanders, but re-entering the same expander via
+        # `with data_exp:` just appends to it, which is allowed.
+        data_exp = None
+        if override or not files:
+            data_exp = st.expander(
+                "Data files (snapshot / prices / warehouse)", expanded=not files
+            )
+
         if files:
             labels = {f"{d}  ({os.path.basename(p)})": (d, p) for d, p in files}
             if override:
-                choice = st.selectbox(
-                    "Snapshot (raw file)", list(labels.keys()), key="snapshot_choice"
-                )
+                with data_exp:
+                    choice = st.selectbox(
+                        "Snapshot (raw file)", list(labels.keys()), key="snapshot_choice"
+                    )
             else:
                 # Toggle off: always the newest snapshot (== the refresh
                 # auto-select target), no widget shown.
@@ -453,12 +527,14 @@ def main():
             today_str, path = labels[choice]
             df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
         elif override:
-            st.info("Upload the Demand Planning Details and Plytix files below.")
+            with data_exp:
+                st.info("Upload the Demand Planning Details and Plytix files below.")
 
         # Show the upload box when overriding, and always when there's no
         # on-disk snapshot yet (otherwise a first-time user can't get started).
         if override or not files:
-            with st.expander("Upload the Demand Planning Details Projections from PowerBI", expanded=not files):
+            with data_exp:
+                st.markdown("**Demand Planning Details — PowerBI export**")
                 up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
                 if up is not None:
                     data = up.getvalue()
@@ -472,14 +548,13 @@ def main():
         # uploaded workbook wins; otherwise pull the public Plytix channel feed
         # (the default, so no file has to be dragged); otherwise fall back to the
         # newest local list_prices_*.xlsx on disk.
-        if override:
-            st.header("Revenue risk")
         prices = None
         plytix_df = None
         up_price = None
         price_file = discover_price_file()
         if override:
-            with st.expander("Override: upload a Plytix list-price file", expanded=False):
+            with data_exp:
+                st.markdown("**Revenue risk — list prices (Plytix override)**")
                 up_price = st.file_uploader(
                     "list_prices_*.xlsx", type=["xlsx"], key="price_upload",
                     help="SKU + List Price USD, plus SKU Status / SKU Type / "
@@ -535,8 +610,6 @@ def main():
         # refresh button under "Data source") writes them; a manual PowerBI
         # export (wide matrix or long table layout — the reader sniffs which)
         # still works.
-        if override:
-            st.header("Warehouse projections")
         warehouse_df = None
 
         # If a warehouse refresh we launched just finished and actually wrote a
@@ -560,10 +633,8 @@ def main():
                 )
 
         if override:
-            with st.expander(
-                "Upload warehouse projection files (AU/CA/EU/JP/US)",
-                expanded=not wh_snapshots,
-            ):
+            with data_exp:
+                st.markdown("**Warehouse projections — AU/CA/EU/JP/US**")
                 if wh_snapshots:
                     wh_choice = st.selectbox(
                         "Warehouse snapshot",
@@ -665,69 +736,33 @@ def main():
             excl.n_disc_rows, excl.n_disc_skus,
         )
 
-    # ----- View selector ---------------------------------------------------
-    with st.sidebar:
-        st.header("View")
-        by_region = list_views(df)
-        scope = st.radio(
-            "Scope",
-            [ALL_CUSTOMERS_VIEW, "By region", BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW],
-            index=0, key="scope",
-            format_func=lambda s: SCOPE_LABELS.get(s, s),
-            help="""
-            Choose how forecasts are grouped before modeling.
-
-            **Executive Overview:**
-            Forecasts all customer groups as one combined demand series using the forecasting model selected in the sidebar.
-
-            **Optimized Projections:**
-            Forecasts each customer group with its own most-accurate model (determined by model analysis), then combines the results into a single table. Requires the model analysis pipeline to have been run for all customer groups.
-
-            **By Region:**
-            Forecasts only the selected fulfillment region (or customer group within that region) using the forecasting model selected in the sidebar.
-
-            **Exceptions:**
-            Scans every customer group for SKUs whose recent actual sell-through has diverged sharply from the existing system projection (the plan of record). Model-agnostic — no forecast is run.
-
-            **Summary:**
-
-            • Executive Overview: One model across all customers.
-
-            • Optimized Projections: Best model for each customer group, combined into one view.
-
-            • By Region: One model applied only to the selected customer group.
-
-            • Exceptions: Recent actuals vs. the system projection, worst offenders first.
-            """,
-        )
-        if scope == ALL_CUSTOMERS_VIEW:
-            view = ALL_CUSTOMERS_VIEW
-            region = None
-        elif scope == BEST_MODEL_COMBINED_VIEW:
-            view = BEST_MODEL_COMBINED_VIEW
-            region = None
-        elif scope == EXCEPTIONS_VIEW:
-            view = EXCEPTIONS_VIEW
-            region = None
-        else:
+    # ----- View selector (By-Region sub-selectors) -------------------------
+    # The scope buttons rendered at the top of the page (into view_slot) already
+    # set `view` for the three scopes that don't need data. The "By region" scope
+    # needs list_views(df), so its Region / Customer-group dropdowns are filled
+    # here — into region_slot, which reserved its spot directly under the buttons.
+    if scope == "By region":
+        with region_slot:
+            by_region = list_views(df)
+            c1, c2 = st.columns(2)
             # key=str: a custom pipeline's region_for_group may return non-string
             # labels; sorting by their string form keeps the selectbox from
             # crashing on mixed types (see logs.txt, 2026-07-06).
-            region = st.selectbox("Region", sorted(by_region.keys(), key=str))
+            region = c1.selectbox("Region", sorted(by_region.keys(), key=str))
             # First entry is the synthetic per-region rollup ("All Customers"),
             # every group in this region combined. Its stored value embeds the
             # region so caches/keys stay unique across regions; format_func
             # shows the short label the user expects.
             all_view = region_all_view(region)
-            view = st.selectbox(
+            view = c2.selectbox(
                 "Customer group", [all_view] + by_region[region],
                 format_func=lambda v: f"All Customers - {region}" if v == all_view else v,
             )
 
     # Now that the view is known, fill the header caption — except for views that
-    # aren't tied to the sidebar model: the combined best-model view (a different
-    # model per group) and the model-agnostic Exceptions view both render their
-    # own caption instead, so the selected-model blurb would mislead.
+    # aren't tied to a single chosen model: the combined best-model view (a
+    # different model per group) and the model-agnostic Exceptions view both
+    # render their own caption instead, so the selected-model blurb would mislead.
     if view not in (BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW):
         _header_caption_slot.caption(header_caption)
 
@@ -741,111 +776,119 @@ def main():
     # fit), so the whole model-analysis apparatus — reasoning-LLM selector, the
     # all-views recommendation run, and any "No ANTHROPIC_API_KEY" warning — is
     # irrelevant there and would only confuse. Skip it entirely for that view.
-    anthropic_no_key = False
-    if view != EXCEPTIONS_VIEW:
-      with st.sidebar:
-        st.header("Model analysis")
-        provider_label = st.radio(
-            "Reasoning LLM",
-            list(LLM_PROVIDERS.keys()),
-            key="agent_llm_provider",
-            help="""
+    # ----- Forecasting model + Model analysis (left column of the panel) ----
+    with col_model:
+        # Forecasting model: only the single-model views use a chosen model
+        # (Optimized Projections picks per group; Exceptions is model-agnostic).
+        if scope in (ALL_CUSTOMERS_VIEW, "By region"):
+            st.subheader("Forecasting model")
+            st.selectbox(
+                "Forecasting model", list(MODEL_OPTIONS.keys()),
+                key="model_choice", on_change=_on_model_change,
+                format_func=model_display, label_visibility="collapsed",
+                help=_MODEL_HELP,
+            )
+
+        # Model analysis (reasoning-LLM selector + a recommend button) applies to
+        # every view except the model-agnostic Exceptions scan — where the whole
+        # apparatus (including the "No ANTHROPIC_API_KEY" warning) is irrelevant.
+        if scope != EXCEPTIONS_VIEW:
+            st.subheader("Model analysis")
+            provider_label = st.radio(
+                "Reasoning LLM",
+                list(LLM_PROVIDERS.keys()),
+                key="agent_llm_provider",
+                help="""
     Select which large language model (LLM) generates the forecast summary and anomaly analysis.
 
     **Anthropic (Claude):** uses Anthropic's Claude API and requires an `ANTHROPIC_API_KEY`.
 
     **Local (Gemma):** runs Google's Gemma model locally and does not require an external API.
     """,
-        )
-        # Anthropic needs a key; without one, block the run and steer the user
-        # to Local rather than silently degrading to it behind the scenes.
-        anthropic_no_key = LLM_PROVIDERS[provider_label] == "anthropic" and not (
-            os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-        )
-        if anthropic_no_key:
-            st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the analysis.")
-        # The per-view "Recommend best model" button lives on the page (next to
-        # the recommendation it produces); only the global all-views run and the
-        # reasoning-LLM selector stay here in the sidebar.
-
-        # All-views run (same work as `python -m agent.batch`). Runs hidden in
-        # the background; while it runs the button becomes a status check.
-        batch_running, batch_started = batch_in_progress()
-        if batch_running:
-            elapsed = batch_elapsed_suffix(batch_started)
-            prog = batch_progress()
-            if prog:
-                done, total = prog
-                st.info(f"⏳ Recommending the best model for every view — "
-                        f"{done} of {total} done.{elapsed} This runs in the "
-                        "background, so you can keep using the dashboard.")
-            else:
-                st.info(f"⏳ Recommending the best model for every view — getting "
-                        f"started.{elapsed} This runs in the background, so you "
-                        "can keep using the dashboard.")
-            if st.button("Check progress", key="check_agent_batch"):
-                st.rerun()
-        else:
-            # A just-finished run (this session): surface its outcome once.
-            proc = st.session_state.get("agent_batch_proc")
-            if proc is not None and proc.poll() is not None:
-                st.session_state["_batch_toast"] = (
-                    batch_result_message() or "Recommendations finished."
-                )
-                st.session_state.pop("agent_batch_proc", None)
-            run_all = st.button(
-                "Recommend models (all views)",
-                key="run_agent_all",
-                disabled=anthropic_no_key,
-                help="Recommends the most accurate model for EVERY view and "
-                     "writes each recommendation to disk. Runs ~60 views — can "
-                     "take up to 1 hour. Asks for confirmation first.",
             )
-            if run_all:
-                _confirm_run_all_dialog(LLM_PROVIDERS[provider_label])
+            # Anthropic needs a key; without one, block the run and steer the user
+            # to Local rather than silently degrading to it behind the scenes.
+            anthropic_no_key = LLM_PROVIDERS[provider_label] == "anthropic" and not (
+                os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            )
+            if anthropic_no_key:
+                st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the analysis.")
 
-            # If the last run left any views un-updated, name them and offer a
-            # targeted retry (re-runs ONLY those, not the whole batch).
-            failures = batch_failures()
-            if failures:
-                names = [v for v, _ in failures]
-                st.warning(
-                    "These views couldn't be updated last time:\n"
-                    + "\n".join(f"- {n}" for n in names)
+            if scope == BEST_MODEL_COMBINED_VIEW:
+                # Optimized Projections is the only place the global all-views run
+                # lives — the combined table is built from every group's own best
+                # model. Same work as `python -m agent.batch`; runs hidden in the
+                # background, and while it runs the button becomes a status check.
+                batch_running, batch_started = batch_in_progress()
+                if batch_running:
+                    elapsed = batch_elapsed_suffix(batch_started)
+                    prog = batch_progress()
+                    if prog:
+                        done, total = prog
+                        st.info(f"⏳ Recommending the best model for every view — "
+                                f"{done} of {total} done.{elapsed} This runs in the "
+                                "background, so you can keep using the dashboard.")
+                    else:
+                        st.info(f"⏳ Recommending the best model for every view — getting "
+                                f"started.{elapsed} This runs in the background, so you "
+                                "can keep using the dashboard.")
+                    if st.button("Check progress", key="check_agent_batch"):
+                        st.rerun()
+                else:
+                    # A just-finished run (this session): surface its outcome once.
+                    proc = st.session_state.get("agent_batch_proc")
+                    if proc is not None and proc.poll() is not None:
+                        st.session_state["_batch_toast"] = (
+                            batch_result_message() or "Recommendations finished."
+                        )
+                        st.session_state.pop("agent_batch_proc", None)
+                    run_all = st.button(
+                        "Recommend models (all views)",
+                        key="run_agent_all",
+                        disabled=anthropic_no_key,
+                        help="Recommends the most accurate model for EVERY view and "
+                             "writes each recommendation to disk. Runs ~60 views — can "
+                             "take up to 1 hour. Asks for confirmation first.",
+                    )
+                    if run_all:
+                        _confirm_run_all_dialog(LLM_PROVIDERS[provider_label])
+
+                    # If the last run left any views un-updated, name them and offer
+                    # a targeted retry (re-runs ONLY those, not the whole batch).
+                    failures = batch_failures()
+                    if failures:
+                        names = [v for v, _ in failures]
+                        st.warning(
+                            "These views couldn't be updated last time:\n"
+                            + "\n".join(f"- {n}" for n in names)
+                        )
+                        if st.button("Retry failed views", key="retry_agent_failed",
+                                     disabled=anthropic_no_key):
+                            ok, msg = start_agent_batch(
+                                LLM_PROVIDERS[provider_label], views=names
+                            )
+                            st.session_state["_batch_toast"] = (
+                                f"Retrying {len(names)} view(s)…" if ok else f"⚠️ {msg}"
+                            )
+                            st.rerun()
+            else:
+                # Executive Overview / By Region: recommend the best model for
+                # THIS view. The live progress + recommendation panel render below.
+                run_agent = st.button(
+                    "Recommend best model",
+                    key="run_agent_summary",
+                    disabled=anthropic_no_key,
+                    help="Backtests all models for this view, recommends the most "
+                         "accurate one, and writes an AI summary + flagged anomalies. "
+                         "Slow — runs only when you click, never on a normal rerun.",
                 )
-                if st.button("Retry failed views", key="retry_agent_failed",
-                             disabled=anthropic_no_key):
-                    ok, msg = start_agent_batch(
-                        LLM_PROVIDERS[provider_label], views=names
-                    )
-                    st.session_state["_batch_toast"] = (
-                        f"Retrying {len(names)} view(s)…" if ok else f"⚠️ {msg}"
-                    )
-                    st.rerun()
+                if anthropic_no_key:
+                    st.caption("⚠️ No ANTHROPIC_API_KEY found — pick **Local LLM** "
+                               "above to enable this.")
 
     # Surface batch start/finish toasts once (set from the dialog / poll above).
     if "_batch_toast" in st.session_state:
         st.toast(st.session_state.pop("_batch_toast"))
-
-    # ----- Model recommendation (this view) --------------------------------
-    # The per-view analysis button lives on the page, right above the live
-    # progress and the recommendation panel it produces (rendered below), so the
-    # trigger and its output sit together. The best-model-per-group view isn't a
-    # single-model view, so it has no button here — it reads every group's
-    # recommendation and points to the sidebar's all-views run instead.
-    run_agent = False
-    if view not in (BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW):
-        run_agent = st.button(
-            "Recommend best model",
-            key="run_agent_summary",
-            disabled=anthropic_no_key,
-            help="Backtests all models for this view, recommends the most "
-                 "accurate one, and writes an AI summary + flagged anomalies. "
-                 "Slow — runs only when you click, never on a normal rerun.",
-        )
-        if anthropic_no_key:
-            st.caption("⚠️ No ANTHROPIC_API_KEY found — pick **Local LLM** in the "
-                       "sidebar to enable this.")
 
     if run_agent:
         # Kick off the pipeline on a background thread and rerun immediately, so
@@ -906,7 +949,7 @@ def main():
         _render_agent_summary(view)
 
     # ----- Combined best-model-per-group view ------------------------------
-    # This view has no single model, so it skips the smoothing sidebar, the
+    # This view has no single model, so it skips the smoothing/autofit step, the
     # single-model compute, and the charts/KPIs below entirely: it renders the
     # stitched per-group best-model table and stops.
     if view == BEST_MODEL_COMBINED_VIEW:
@@ -928,80 +971,81 @@ def main():
     # Parameters are hidden from the UI entirely: Holt always uses autofitted
     # α/β/φ (backtested per view/snapshot), falling back to the pipeline's file
     # defaults when the backtest can't run. min-weeks uses the file default.
+    # This runs inline (no sidebar); its only visible output is a transient
+    # tuning spinner and a toast, so it doesn't inject controls into the page.
     min_weeks = None
     alpha = beta = phi = None
-    with st.sidebar:
-        smoothing_ok = _supports_smoothing(P)
-        min_weeks_ok = _supports_min_weeks(P)
+    smoothing_ok = _supports_smoothing(P)
+    min_weeks_ok = _supports_min_weeks(P)
 
-        if smoothing_ok or min_weeks_ok:
-            # The pipeline's own constants are the "file defaults".
-            a0 = float(getattr(P, "ALPHA", 0.5))
-            b0 = float(getattr(P, "BETA", 0.3))
-            p0 = float(getattr(P, "PHI", 0.85))
-            mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
+    if smoothing_ok or min_weeks_ok:
+        # The pipeline's own constants are the "file defaults".
+        a0 = float(getattr(P, "ALPHA", 0.5))
+        b0 = float(getattr(P, "BETA", 0.3))
+        p0 = float(getattr(P, "PHI", 0.85))
+        mw0 = int(getattr(P, "MIN_WEEKS_FOR_TREND", 4))
 
-            if min_weeks_ok:
-                min_weeks = mw0
+        if min_weeks_ok:
+            min_weeks = mw0
 
-            # Autofit results are keyed to the model/view/snapshot they were
-            # fitted on; anything else falls back to the file defaults.
-            autofit = st.session_state.get("autofit_params")
-            autofit_active = bool(
-                autofit
-                and autofit.get("model") == pipeline_path()
-                and autofit.get("view") == view
-                and autofit.get("today") == today_str
-            )
+        # Autofit results are keyed to the model/view/snapshot they were
+        # fitted on; anything else falls back to the file defaults.
+        autofit = st.session_state.get("autofit_params")
+        autofit_active = bool(
+            autofit
+            and autofit.get("model") == pipeline_path()
+            and autofit.get("view") == view
+            and autofit.get("today") == today_str
+        )
 
-            # ----- Always autofit -------------------------------------------
-            # Selecting a smoothing model (or a new view / snapshot) runs the
-            # backtest once per (model, view, snapshot) and uses the winning
-            # α/β/φ. The "autofit_tried" marker records that we've attempted
-            # it, so a failed backtest isn't retried on every rerun and a good
-            # fit isn't re-run needlessly.
-            autofit_key = (pipeline_path(), view, today_str)
-            autofit_tried = st.session_state.get("autofit_tried") == autofit_key
-            if (
-                smoothing_ok
-                and _supports_autofit(P)
-                and not autofit_active
-                and not autofit_tried
-            ):
-                st.session_state["autofit_tried"] = autofit_key
-                with st.spinner("Tuning the forecast for this view…"):
-                    best = run_autofit(df, view, today_ts, pipeline_path(), mw0)
-                if best is not None:
-                    logger.info(
-                        "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
-                        "(MAE %.2f vs %.2f with file defaults)",
-                        view, best["alpha"], best["beta"], best["phi"],
-                        best["mae"], best["baseline_mae"],
-                    )
-                    st.session_state["autofit_params"] = {
-                        **best, "model": pipeline_path(),
-                        "view": view, "today": today_str,
-                    }
-                    # Recompute the forecast with the fitted values.
-                    st.session_state["_do_recompute"] = True
-                    st.rerun()
-
-            if smoothing_ok:
-                if autofit_active:
-                    alpha, beta, phi = (
-                        autofit["alpha"], autofit["beta"], autofit["phi"]
-                    )
-                else:
-                    alpha, beta, phi = a0, b0, p0
-
-            if smoothing_ok and _supports_autofit(P) and autofit_active:
-                improve = autofit["baseline_mae"] - autofit["mae"]
-                pct = (
-                    f" ({improve / autofit['baseline_mae'] * 100:.0f}% better "
-                    "than the default settings)"
-                    if autofit["baseline_mae"] > 0 and improve > 0 else ""
+        # ----- Always autofit -------------------------------------------
+        # Selecting a smoothing model (or a new view / snapshot) runs the
+        # backtest once per (model, view, snapshot) and uses the winning
+        # α/β/φ. The "autofit_tried" marker records that we've attempted
+        # it, so a failed backtest isn't retried on every rerun and a good
+        # fit isn't re-run needlessly.
+        autofit_key = (pipeline_path(), view, today_str)
+        autofit_tried = st.session_state.get("autofit_tried") == autofit_key
+        if (
+            smoothing_ok
+            and _supports_autofit(P)
+            and not autofit_active
+            and not autofit_tried
+        ):
+            st.session_state["autofit_tried"] = autofit_key
+            with st.spinner("Tuning the forecast for this view…"):
+                best = run_autofit(df, view, today_ts, pipeline_path(), mw0)
+            if best is not None:
+                logger.info(
+                    "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
+                    "(MAE %.2f vs %.2f with file defaults)",
+                    view, best["alpha"], best["beta"], best["phi"],
+                    best["mae"], best["baseline_mae"],
                 )
-                st.success(f"Forecast auto-tuned for this view{pct}.")
+                st.session_state["autofit_params"] = {
+                    **best, "model": pipeline_path(),
+                    "view": view, "today": today_str,
+                }
+                # Recompute the forecast with the fitted values.
+                st.session_state["_do_recompute"] = True
+                st.rerun()
+
+        if smoothing_ok:
+            if autofit_active:
+                alpha, beta, phi = (
+                    autofit["alpha"], autofit["beta"], autofit["phi"]
+                )
+            else:
+                alpha, beta, phi = a0, b0, p0
+
+        if smoothing_ok and _supports_autofit(P) and autofit_active:
+            improve = autofit["baseline_mae"] - autofit["mae"]
+            pct = (
+                f" ({improve / autofit['baseline_mae'] * 100:.0f}% better "
+                "than the default settings)"
+                if autofit["baseline_mae"] > 0 and improve > 0 else ""
+            )
+            st.toast(f"Forecast auto-tuned for this view{pct}.")
 
     # ----- Compute (with a progress bar) -----------------------------------
     # The forecast is cached in session_state and only (re)built when:
@@ -1243,7 +1287,7 @@ def main():
     )
 
     # ----- Active products MISSING projections in regions they ARE active in --
-    # Uses the warehouse projection grid (sidebar), not the demand file.
+    # Uses the warehouse projection grid (Data source panel), not the demand file.
     missing_df = compute_missing_projections(warehouse_df, plytix_df, df, P)
     # Per-(customer group, SKU) data source to label the missing table. The
     # by-customer table (ALL CUSTOMERS view) carries every group; otherwise the
