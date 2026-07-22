@@ -542,16 +542,21 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     Ported from missing_pos.ipynb. For every ACTIVE SKU (Plytix SKU Status ==
     Active — any SKU Type, so Parts like PD6306 are kept, unlike
     compute_active_products), look at each customer whose warehouse region is one
-    the SKU is "Active in", and flag the SKU x customer combos with no POS/Orders
-    signal at or after the last completed week. This surfaces prolonged stockouts
-    and gone-silent channels the forecast would otherwise carry quietly.
+    the SKU is "Active in", and flag the SKU x customer combos with no real sale at
+    or after the last completed week. This surfaces prolonged stockouts and
+    gone-silent channels the forecast would otherwise carry quietly.
+
+    A "real sale" is a POSITIVE POS or Orders week; a week that nets zero, negative
+    (returns/credits), or NaN counts as missing, so a trailing 0 or return never
+    masks the true last sale (the reported Last Value is always the last positive
+    quantity).
 
     Scope is the TRAILING 3 MONTHS: a combo only surfaces if it sold within the
-    past 3 months (last_complete_week - 3mo) and has SINCE gone silent. Two
+    past 3 months (current_week_start - 3mo) and has SINCE gone silent. Two
     categories are deliberately excluded because there is no recent demand to be
-    "missing" — combos that never had any POS/Orders (never part of the assortment)
+    "missing" — combos that never had a real sale (never part of the assortment)
     and long-dead combos whose last sale is more than 3 months old. The gap is
-    measured from the week after the combo's last data week through the last
+    measured from the week after the combo's last real-sale week through the last
     completed week.
 
     Returns a table (columns = MISSING_POS_COLS), empty if none. Returns None if
@@ -571,7 +576,7 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     active_skus = set(active["SKU"])
     sku_active_in = dict(zip(active["SKU"], active["Active in"].astype(str)))
 
-    _, last_complete_week, _ = anchors
+    _, last_complete_week, current_week_start = anchors
 
     # --- Candidate combos: active SKU x customer, restricted to active regions -
     m = df.copy()
@@ -592,17 +597,19 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     if combos.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)
 
-    # --- Each combo's last data-bearing week + the POS/Orders recorded on it ----
-    # A recorded 0 counts as data; only NaN/absent is "no data". (SKU, Customer,
-    # WeekDate) isn't unique, so sum the duplicate-grain rows within each week
-    # (min_count=1 keeps an all-NaN week as NaN, not 0), then take each combo's
-    # latest data-bearing week and the values booked on it. Future weeks carry
-    # booked orders, so a combo with data at/after the reference week is NOT missing.
+    # --- Each combo's last REAL-SALE week + the POS/Orders recorded on it -------
+    # Only a POSITIVE POS or Orders counts as a real sale; a week that nets zero,
+    # negative (returns/credits), or NaN is treated as missing, so a trailing 0 or
+    # return does not mask the true last sale. (SKU, Customer, WeekDate) isn't
+    # unique, so sum the duplicate-grain rows within each week (min_count=1 keeps an
+    # all-NaN week as NaN, not 0), keep only weeks that netted a positive sale, then
+    # take each combo's latest such week and the values booked on it. Future weeks
+    # carry booked orders, so a combo selling at/after the reference week is NOT missing.
     weekly = (
         m.groupby(["SKU", "Customer", "WeekDate"], as_index=False)[["POS", "Orders"]]
         .sum(min_count=1)
     )
-    weekly = weekly[weekly["POS"].notna() | weekly["Orders"].notna()]
+    weekly = weekly[weekly["POS"].fillna(0).gt(0) | weekly["Orders"].fillna(0).gt(0)]
     last_rows = (
         weekly.loc[weekly.groupby(["SKU", "Customer"])["WeekDate"].idxmax()]
         .set_index(["SKU", "Customer"])
@@ -613,11 +620,13 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     combos["_last_orders"] = key.map(last_rows["Orders"])
 
     # --- Currently missing, but sold within the past 3 months ------------------
-    # Kept: combos whose most recent data is BEFORE last_complete_week AND no older
-    # than 3 months. The trailing-3-month floor drops long-dead combos and, since
-    # NaT >= three_months_ago is False, never-had-data combos too — both are combos
-    # with no recent demand to be "missing", not actionable gone-silent channels.
-    three_months_ago = last_complete_week - pd.DateOffset(months=3)
+    # Kept: combos whose most recent sale is BEFORE last_complete_week AND no older
+    # than 3 months. The floor is measured from the CURRENT week (not the last
+    # completed week), so "the past 3 months" is 3 months back from today — a sale
+    # exactly 3 months + 1 week ago is out. It drops long-dead combos and, since
+    # NaT >= three_months_ago is False, never-sold combos too — both are combos with
+    # no recent demand to be "missing", not actionable gone-silent channels.
+    three_months_ago = current_week_start - pd.DateOffset(months=3)
     missing = combos[
         ~(combos["Last Data Week"] >= last_complete_week)   # currently silent
         & (combos["Last Data Week"] >= three_months_ago)     # but sold within the past 3 months
@@ -630,11 +639,12 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     # week. Every surviving combo has a real (non-NaT) last data week within the
     # past 3 months, so no earliest-week fallback is needed.
     missing["Active in"] = missing["SKU"].map(lambda s: sku_active_in.get(s))
-    # POS-then-Orders: the last data point's source is POS if it recorded any POS,
-    # else Orders; Last Value is the quantity booked on that final data week.
-    missing["Data Source"] = missing["_last_pos"].notna().map({True: "POS", False: "Orders"})
+    # POS-then-Orders: the last real sale is booked to POS if that week recorded a
+    # positive POS, else Orders; Last Value is the quantity on that final sale week.
+    pos_is_sale = missing["_last_pos"].fillna(0).gt(0)
+    missing["Data Source"] = pos_is_sale.map({True: "POS", False: "Orders"})
     missing["Last Value"] = (
-        missing["_last_pos"].where(missing["_last_pos"].notna(), missing["_last_orders"])
+        missing["_last_pos"].where(pos_is_sale, missing["_last_orders"])
         .round(0).astype("Int64")
     )
     missing["First Missing Week"] = missing["Last Data Week"] + pd.Timedelta(weeks=1)
