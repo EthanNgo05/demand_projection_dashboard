@@ -102,7 +102,8 @@ if not logger.handlers:
 from dashboard_app.config import (  # noqa: F401
     ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID, C_ORIGINAL, C_UPDATED,
     DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
-    PRICE_COL, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_LABELS, _ENV_PIPELINE,
+    PRICE_COL, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS, SCOPE_LABELS,
+    _ENV_PIPELINE,
     fmt_dollar, model_display, region_all_view, region_from_view,
 )
 from dashboard_app.pipeline import (  # noqa: F401
@@ -304,9 +305,10 @@ def main():
     st.title("📦 Demand Projection Dashboard")
     # Header caption: the pipeline can supply its own (DASHBOARD_CAPTION, e.g.
     # the XGBoost pipeline); otherwise fall back to the smoothing-aware blurbs.
-    # It describes the *selected* model, so render it into a slot we fill only
-    # once the view is known — the combined best-model view uses a different model
-    # per group, so it suppresses this caption (and supplies its own).
+    # It describes the *selected* model, so it's rendered next to the Forecasting
+    # model selector further down and only for the single-model views (the
+    # combined best-model view uses a different model per group, and Exceptions is
+    # model-agnostic — both supply their own captions).
     caption = getattr(P, "DASHBOARD_CAPTION", None)
     if caption:
         header_caption = caption
@@ -323,19 +325,22 @@ def main():
             "(POS where available, else Orders"
             + (f"; trend weight = {tw})." if tw is not None else ").")
         )
-    _header_caption_slot = st.empty()
 
     # ----- Top-of-page control panel ---------------------------------------
     # No sidebar: every control lives here. Placeholder containers pin the visual
-    # order — view buttons, then the By-Region sub-selectors, then a two-column
-    # panel (left: forecasting model + model analysis; right: data source) — even
-    # though several are populated later (they need `df`, which the data-source
-    # column loads, and `view`/`today_ts`, resolved after that).
+    # order — the data source sits at the very top (it decides which data feeds
+    # the forecast), then the view tabs, then the By-Region sub-selectors, then
+    # the model + analysis panel — even though several are populated later (they
+    # need `df`, which the data-source block loads, and `view`/`today_ts`,
+    # resolved after that). Containers decouple render position from execution
+    # order, so the data-source block still runs before the region/model panels
+    # while rendering above them.
+    data_source_slot = st.container()
     view_slot = st.container()
     region_slot = st.container()
     panel = st.container()
     with panel:
-        col_model, col_data = st.columns([1, 1])
+        col_model = st.container()
 
     # Defaults so the recommend-button handlers below are always well-defined,
     # even for views that hide their button (each view renders at most one).
@@ -361,31 +366,9 @@ def main():
         # resolved.
         if scope is None:
             scope = st.session_state.get("scope") or ALL_CUSTOMERS_VIEW
-        with st.expander("ℹ️ About these views"):
-            st.markdown(
-                """
-Choose how forecasts are grouped before modeling.
-
-**Executive Overview:**
-Forecasts all customer groups as one combined demand series using the forecasting model selected above.
-
-**Optimized Projections:**
-Forecasts each customer group with its own most-accurate model (determined by model analysis), then combines the results into a single table. Requires the model analysis pipeline to have been run for all customer groups.
-
-**By Region:**
-Forecasts only the selected fulfillment region (or customer group within that region) using the forecasting model selected above.
-
-**Exceptions:**
-Scans every customer group for SKUs whose recent actual sell-through has diverged sharply from the existing system projection (the plan of record). Model-agnostic — no forecast is run.
-
-**Summary:**
-
-- Executive Overview: One model across all customers.
-- Optimized Projections: Best model for each customer group, combined into one view.
-- By Region: One model applied only to the selected customer group.
-- Exceptions: Recent actuals vs. the system projection, worst offenders first.
-"""
-            )
+        # Contextual help: one line describing the active tab, in place of the old
+        # "About these views" expander that listed all four at once.
+        st.caption(SCOPE_CAPTIONS.get(scope, ""))
 
     # Resolve the view for the three scopes that don't need `df`. "By region"
     # depends on list_views(df), so it's resolved once the Data source block has
@@ -403,9 +386,12 @@ Scans every customer group for SKUs whose recent actual sell-through has diverge
         view = None  # filled from region_slot once df is available
         region = None
 
-    # ----- Data source (right column of the top panel) ---------------------
-    with col_data:
-        st.subheader("Data source")
+    # ----- Data source (very top of the page) ------------------------------
+    # Promoted above the view tabs because the chosen snapshot/warehouse/Plytix
+    # data determines every projection. Renders into data_source_slot (declared
+    # first) though it executes here — before the region selectors and model
+    # panel that depend on the `df` it loads.
+    with data_source_slot:
         files = discover_raw_files()
         df = None
         today_str = None
@@ -445,7 +431,7 @@ Scans every customer group for SKUs whose recent actual sell-through has diverge
                 value=False,
                 key="data_override",
                 help="""
-        **Off (recommended)**:
+        **Off (default)**:
         Automatically loads the latest data snapshot, Plytix feed, and warehouse files.
 
         **On**:
@@ -474,8 +460,8 @@ Scans every customer group for SKUs whose recent actual sell-through has diverge
         if files:
             _d0, _p0 = files[0]
             st.caption(
-                f"Latest snapshot: {_d0} — pulled "
-                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(_p0)))}"
+                f"Latest snapshot: "
+                f"{time.strftime('%Y-%m-%d %I:%M %p', time.localtime(os.path.getmtime(_p0)))}"
             )
 
         if do_refresh:
@@ -784,13 +770,6 @@ Scans every customer group for SKUs whose recent actual sell-through has diverge
                 format_func=lambda v: f"All Customers - {region}" if v == all_view else v,
             )
 
-    # Now that the view is known, fill the header caption — except for views that
-    # aren't tied to a single chosen model: the combined best-model view (a
-    # different model per group) and the model-agnostic Exceptions view both
-    # render their own caption instead, so the selected-model blurb would mislead.
-    if view not in (BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW):
-        _header_caption_slot.caption(header_caption)
-
     # ----- Agent summary (LangGraph pipeline) ------------------------------
     # Button-triggered only: invoking the graph backtests all three models AND
     # calls an LLM, which is far too slow/expensive to run on every rerun. The
@@ -813,6 +792,10 @@ Scans every customer group for SKUs whose recent actual sell-through has diverge
                 format_func=model_display, label_visibility="collapsed",
                 help=_MODEL_HELP,
             )
+            # Blurb describing the selected model (computed near the title). Only
+            # the single-model views reach here, which matches its old suppression
+            # (combined/best-model and Exceptions supply their own captions).
+            st.caption(header_caption)
 
         # Model analysis (reasoning-LLM selector + a recommend button) applies to
         # every view except the model-agnostic Exceptions scan — where the whole

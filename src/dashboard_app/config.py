@@ -79,6 +79,29 @@ SCOPE_LABELS = {
     EXCEPTIONS_VIEW: "Exceptions",
 }
 
+# One-line description shown as a caption under the view tab strip — describes the
+# *active* tab only (the tabs replaced the old "About these views" expander that
+# listed all four at once). Keyed by the same internal view IDs as SCOPE_LABELS.
+SCOPE_CAPTIONS = {
+    ALL_CUSTOMERS_VIEW: (
+        "Forecasts all customer groups as one combined demand series using the "
+        "model selected below."
+    ),
+    "By region": (
+        "Forecasts only the selected fulfillment region (or a customer group "
+        "within it) using the model selected below."
+    ),
+    BEST_MODEL_COMBINED_VIEW: (
+        "Forecasts each customer group with its own most-accurate model, combined "
+        "into one table. Requires model analysis to have been run for all groups."
+    ),
+    EXCEPTIONS_VIEW: (
+        "Scans every customer group for SKUs whose recent actual sell-through has "
+        "diverged sharply from the existing system projection (the plan of "
+        "record). Model-agnostic — no forecast is run."
+    ),
+}
+
 # Per-region rollup views: "All Customers - <region label>" combines every
 # customer group in one region into a single forecast (e.g.
 # "All Customers - AU (ACR)" = Web Sales - AU + Others - AU). The region is
