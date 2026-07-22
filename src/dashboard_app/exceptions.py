@@ -270,7 +270,7 @@ def _section(frame, direction, key, P, today_str, slug, label, cols=None, empty_
     if sub.empty:
         st.caption(empty_msg or "No SKUs flagged in this section at the current thresholds.")
         return
-    st.caption(f"{len(sub):,} SKUs flagged.")
+    st.caption(f"{len(sub):,} SKUs flagged")
     render_filtered_table(sub[cols], key, P, style=True, column_config=_COLUMN_CONFIG)
     _download_button(sub[cols], slug, label, today_str)
 
