@@ -101,9 +101,9 @@ if not logger.handlers:
 # --------------------------------------------------------------------------- #
 from dashboard_app.config import (  # noqa: F401
     ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID, C_ORIGINAL, C_UPDATED,
-    DEFAULT_MODEL, HERE, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL, PRICE_COL,
-    REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_LABELS, _ENV_PIPELINE, fmt_dollar,
-    model_display, region_all_view, region_from_view,
+    DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
+    PRICE_COL, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_LABELS, _ENV_PIPELINE,
+    fmt_dollar, model_display, region_all_view, region_from_view,
 )
 from dashboard_app.pipeline import (  # noqa: F401
     _load_pipeline_cached, _supports_autofit, _supports_min_weeks, _supports_prices,
@@ -151,6 +151,9 @@ from dashboard_app.agent_summary import (  # noqa: F401
 )
 from dashboard_app.kpis import (  # noqa: F401
     _render_best_model_combined, _render_kpis,
+)
+from dashboard_app.exceptions import (  # noqa: F401
+    compute_exceptions, render_exceptions,
 )
 from dashboard_app.dataquality import (  # noqa: F401
     render_discontinued_section, render_inactive_section, render_missing_pos_section,
@@ -668,7 +671,7 @@ def main():
         by_region = list_views(df)
         scope = st.radio(
             "Scope",
-            [ALL_CUSTOMERS_VIEW, "By region", BEST_MODEL_COMBINED_VIEW],
+            [ALL_CUSTOMERS_VIEW, "By region", BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW],
             index=0, key="scope",
             format_func=lambda s: SCOPE_LABELS.get(s, s),
             help="""
@@ -683,6 +686,9 @@ def main():
             **By Region:**
             Forecasts only the selected fulfillment region (or customer group within that region) using the forecasting model selected in the sidebar.
 
+            **Exceptions:**
+            Scans every customer group for SKUs whose recent actual sell-through has diverged sharply from the existing system projection (the plan of record). Model-agnostic — no forecast is run.
+
             **Summary:**
 
             • Executive Overview: One model across all customers.
@@ -690,6 +696,8 @@ def main():
             • Optimized Projections: Best model for each customer group, combined into one view.
 
             • By Region: One model applied only to the selected customer group.
+
+            • Exceptions: Recent actuals vs. the system projection, worst offenders first.
             """,
         )
         if scope == ALL_CUSTOMERS_VIEW:
@@ -697,6 +705,9 @@ def main():
             region = None
         elif scope == BEST_MODEL_COMBINED_VIEW:
             view = BEST_MODEL_COMBINED_VIEW
+            region = None
+        elif scope == EXCEPTIONS_VIEW:
+            view = EXCEPTIONS_VIEW
             region = None
         else:
             # key=str: a custom pipeline's region_for_group may return non-string
@@ -713,10 +724,11 @@ def main():
                 format_func=lambda v: f"All Customers - {region}" if v == all_view else v,
             )
 
-    # Now that the view is known, fill the header caption — except for the
-    # combined best-model view, which uses a different model per group (so the
-    # selected-model blurb would mislead) and renders its own caption instead.
-    if view != BEST_MODEL_COMBINED_VIEW:
+    # Now that the view is known, fill the header caption — except for views that
+    # aren't tied to the sidebar model: the combined best-model view (a different
+    # model per group) and the model-agnostic Exceptions view both render their
+    # own caption instead, so the selected-model blurb would mislead.
+    if view not in (BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW):
         _header_caption_slot.caption(header_caption)
 
     # ----- Agent summary (LangGraph pipeline) ------------------------------
@@ -893,6 +905,15 @@ def main():
     # stitched per-group best-model table and stops.
     if view == BEST_MODEL_COMBINED_VIEW:
         _render_best_model_combined(
+            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P
+        )
+        st.stop()
+
+    # ----- Exceptions view -------------------------------------------------
+    # Model-agnostic actuals-vs-plan scan; like the best-model view it renders its
+    # own table and stops before the single-model compute/charts/KPIs below.
+    if view == EXCEPTIONS_VIEW:
+        render_exceptions(
             df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P
         )
         st.stop()

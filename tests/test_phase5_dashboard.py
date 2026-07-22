@@ -169,6 +169,21 @@ def test_smoothing_params_survive_model_round_trip():
 
 
 @needs_data
+def test_exceptions_view_renders():
+    """Selecting the Exceptions scope renders its own (model-agnostic) table
+    without error — the routing branch and render_exceptions wiring both work."""
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    at.radio(key="scope").set_value(dashboard.EXCEPTIONS_VIEW).run()
+    assert not at.exception
+    # It draws its own subheader and the two severity-threshold inputs.
+    assert any("Exceptions" == s.value for s in at.subheader)
+    assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min $ impact / wk"}
+
+
+@needs_data
 def test_provider_selector_change_does_not_call_llm(monkeypatch):
     """Moving the reasoning-LLM selector (a plain rerun) must not fire the LLM.
     The agent only runs on the button click, so any non-button interaction is a

@@ -60,6 +60,15 @@ ALL_CUSTOMERS_VIEW = "All customers (combined)"
 BEST_MODEL_COMBINED_VIEW = "Combined (best model per group)"
 MODEL_USED_COL = "Model Used"
 
+# A scan-everything view that flags SKUs whose recent actual sell-through (POS,
+# falling back to Orders) has diverged sharply from the existing SYSTEM
+# projection (the plan of record) — not from our model forecast. It is a pure
+# actuals-vs-plan comparison, so it needs no forecasting fit and does not depend
+# on the agent batch. Like the other scope constants this string doubles as the
+# stable view ID; unlike them it is a dashboard-only analysis scope and is never
+# returned by list_views/enumerate_views, so the agent never forecasts it.
+EXCEPTIONS_VIEW = "Exceptions"
+
 # Friendly labels shown in the Scope selector. The keys are the stable internal
 # view IDs (also the agent-summary filenames / agent config), so we rename only
 # what the planner sees, never the ID.
@@ -67,6 +76,7 @@ SCOPE_LABELS = {
     ALL_CUSTOMERS_VIEW: "Executive Overview",
     BEST_MODEL_COMBINED_VIEW: "Optimized Projections",
     "By region": "By Region",
+    EXCEPTIONS_VIEW: "Exceptions",
 }
 
 # Per-region rollup views: "All Customers - <region label>" combines every
