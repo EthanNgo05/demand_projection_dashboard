@@ -24,9 +24,14 @@ def style_summary(summary_df):
     for c in df.columns:
         if c.endswith("POS/Orders Average") and pd.api.types.is_numeric_dtype(df[c]):
             fmt[c] = "{:,.0f}" if pd.api.types.is_integer_dtype(df[c]) else "{:,.1f}"
-    # The Exceptions view's signed percent deviation, shown to two decimals.
+    # The Exceptions view's signed percent deviation: two decimals when the value
+    # has a fractional part, a whole number when it doesn't, always suffixed "%".
     if "% Deviation" in df.columns:
-        fmt["% Deviation"] = "{:.2f}"
+        def _fmt_pct(v):
+            if pd.isna(v):
+                return "—"
+            return f"{int(v):,}%" if v == int(v) else f"{v:,.2f}%"
+        fmt["% Deviation"] = _fmt_pct
     if PRICE_COL in df.columns:
         fmt[PRICE_COL] = lambda v: fmt_dollar(v, decimals=2)
     if RISK_COL in df.columns:
