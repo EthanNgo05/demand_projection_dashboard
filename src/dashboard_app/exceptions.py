@@ -379,16 +379,21 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     drawn by main(), so we start at the subheader."""
     st.subheader("Exceptions")
     st.caption(
-        "SKUs whose recent actual sell-through (last 8 weeks, POS or Orders) has "
-        "diverged sharply from the existing **system projection** — the plan of "
-        "record, not our forecast. Under-projected = selling faster than planned "
-        "(stockout risk); over-projected = planned but not selling (overstock risk)."
+        "SKUs where recent sales no longer match the plan. We compare each SKU's "
+        "actual sell-through over the **last 8 weeks** (POS, or Orders where POS "
+        "isn't available) against its **current system projection** — the official "
+        "plan of record, not our model's forecast."
     )
-    st.caption(
-        "**Projection Difference** = 8-Week POS/Orders Average - Current Projection "
-        "Average.  **% Deviation** = 100 x Projection Difference / Current Projection "
-        "Average (blank when there is no projection).  **Revenue Risk (avg/wk)** = "
-        "Projection Difference x List Price."
+    st.markdown(
+        "- **Under-projected** — selling faster than planned → **stockout risk**\n"
+        "- **Over-projected** — planned but not selling → **overstock risk**"
+    )
+    st.caption("How each column is calculated:")
+    st.markdown(
+        "- **Projection Difference** = (8-Week POS/Orders Average) − (Current Projection Average)\n"
+        "- **% Deviation** = (Projection Difference / Current Projection Average) × 100 "
+        "(blank when there is no projection)\n"
+        "- **Revenue Risk (avg/wk)** = Projection Difference × List Price"
     )
 
     # Cache on a structural signature so filter/threshold reruns don't rebuild it.
