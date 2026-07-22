@@ -184,7 +184,7 @@ def test_exceptions_view_renders():
     tab_labels = {t.label for t in at.tabs}
     assert {"All Exceptions", "Key SKUs"} <= tab_labels
     # The severity-threshold inputs live in the All Exceptions tab.
-    assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min $ impact / wk"}
+    assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min revenue risk / wk"}
 
 
 @needs_data

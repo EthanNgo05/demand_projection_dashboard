@@ -18,10 +18,15 @@ def style_summary(summary_df):
     fmt = {c: "{:,.0f}" for c in int_cols}
     # Format every descriptive-average column to one decimal. Single-group views
     # carry one; the Optimal Projections combined view carries two (All-History
-    # and 8-Week POS/Orders Average).
+    # and 8-Week POS/Orders Average). The Exceptions view stores its 8-week
+    # average as a whole number (integer dtype) so it ties out with Projection
+    # Difference / Revenue Risk — render those without a spurious decimal.
     for c in df.columns:
         if c.endswith("POS/Orders Average") and pd.api.types.is_numeric_dtype(df[c]):
-            fmt[c] = "{:,.1f}"
+            fmt[c] = "{:,.0f}" if pd.api.types.is_integer_dtype(df[c]) else "{:,.1f}"
+    # The Exceptions view's signed percent deviation, shown to two decimals.
+    if "% Deviation" in df.columns:
+        fmt["% Deviation"] = "{:.2f}"
     if PRICE_COL in df.columns:
         fmt[PRICE_COL] = lambda v: fmt_dollar(v, decimals=2)
     if RISK_COL in df.columns:
