@@ -37,14 +37,23 @@ def style_summary(summary_df):
     if RISK_COL in df.columns:
         fmt[RISK_COL] = lambda v: fmt_dollar(v, decimals=0)
 
+    # Brighter green/red on dark surfaces so the direction stays legible; the
+    # deeper light-mode shades keep good contrast on white. (Colour is cosmetic —
+    # the sign in the formatted number already carries the meaning.)
+    _mode = getattr(getattr(st, "context", None), "theme", None)
+    _dark = getattr(_mode, "type", "light") == "dark"
+    _up = "#4ade80" if _dark else "#15803d"
+    _down = "#f87171" if _dark else "#b91c1c"
+    _neutral = "#a1a1aa" if _dark else "#64748b"
+
     def colour_diff(v):
         if pd.isna(v):
             return ""
         if v > 0:
-            return "color:#15803d;font-weight:600"
+            return f"color:{_up};font-weight:600"
         if v < 0:
-            return "color:#b91c1c;font-weight:600"
-        return "color:#64748b"
+            return f"color:{_down};font-weight:600"
+        return f"color:{_neutral}"
 
     sty = df.style.format(fmt, na_rep="—")
     # Colour both the unit difference and the dollar revenue risk by direction.

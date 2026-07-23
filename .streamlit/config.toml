@@ -1,0 +1,50 @@
+# Streamlit theme for the Demand Projection Dashboard.
+#
+# Purely visual — no effect on forecasting logic, data flow, or computed values.
+# Direction: simplehuman-minimalist. Widget accents (buttons, active-tab underline,
+# focus rings, links) use a neutral graphite/near-black; the blue/orange/grey scheme
+# stays only inside the charts (defined in src/dashboard_app/config.py).
+#
+# Two modes are defined: [theme] is the light theme; [theme.dark] overrides it when the
+# viewer picks Dark (Settings -> Appearance). Chart text/grid colors adapt separately in
+# charts.py via st.context.theme.type.
+
+[theme]
+base = "light"
+
+# Minimalist graphite accent (buttons fill, focus rings, active tab, links).
+primaryColor = "#1f2937"          # slate-800 / graphite
+linkColor = "#1f2937"
+
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f4f5"  # zinc-100 — fills widgets + KPI stat-tile cards
+textColor = "#18181b"                 # near-black ink
+borderColor = "#e4e4e7"               # zinc-200 — soft element borders
+showWidgetBorder = true
+
+# Offline-safe system sans stack (no network font dependency). Segoe UI leads on Windows.
+font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+headingFont = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+baseFontSize = 15
+
+# Tighter, more balanced heading scale (h1 title / h2 / h3 = section headers & subheaders).
+headingFontSizes = ["2.25rem", "1.75rem", "1.4rem", "1.15rem", "1rem", "0.9rem"]
+headingFontWeights = [700, 650, 600, 600, 600, 600]
+
+# Softly rounded corners throughout.
+baseRadius = "0.6rem"
+buttonRadius = "0.5rem"
+
+# Keep chart categorical defaults consistent with the app palette. (Our go.Figure traces
+# set explicit colors, so this only affects any Streamlit-defaulted categorical usage.)
+chartCategoricalColors = ["#2563eb", "#ea580c", "#9ca3af"]
+
+[theme.dark]
+# Dark surface tuned to match the dataviz-validated chart surface (~#1a1a19).
+primaryColor = "#e5e7eb"          # light graphite / near-white inverted accent
+linkColor = "#d4d4d8"
+
+backgroundColor = "#141416"
+secondaryBackgroundColor = "#1f1f23"  # lighter graphite — card / widget fill on dark
+textColor = "#e5e5e5"
+borderColor = "#2e2e33"

@@ -215,11 +215,13 @@ def main():
             color: inherit !important;
             border-bottom-color: rgba(148,163,184,0.5) !important;
         }}
-        /* Active tab: brand-blue underline + emphasis (matches C_ACTUAL). */
+        /* Active tab: accent underline + emphasis. Follows the theme's primaryColor
+           (graphite in light, near-white in dark) via the CSS variable so it stays
+           on-brand in both modes and matches every other accent in the app. */
         div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] {{
             color: inherit !important;
             font-weight: 700;
-            border-bottom-color: #2563eb !important;
+            border-bottom-color: var(--primary-color, #1f2937) !important;
         }}
 
         /* Replace Streamlit's top-right "running" status graphic — which cycles
@@ -267,6 +269,78 @@ def main():
         div[data-testid="stMainBlockContainer"] h1 {{
             padding-top: 0;
             margin-top: 0;
+        }}
+
+        /* ---- KPI metrics as stat-tile cards ------------------------------- */
+        /* Turn the flat st.metric widgets into bordered cards: a soft surface
+           fill (theme's secondary background), a hairline border, rounded
+           corners and padding. Uses theme CSS variables + semi-transparent grey
+           so it adapts cleanly to both light and dark. Applies to the 7-KPI row
+           and the stacked per-SKU metric column alike. */
+        [data-testid="stMetric"] {{
+            background: var(--secondary-background-color, #f4f4f5);
+            border: 1px solid rgba(128,128,128,0.22);
+            border-radius: 0.6rem;
+            padding: 0.85rem 1rem 0.9rem 1rem;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }}
+        [data-testid="stMetric"]:hover {{
+            border-color: rgba(128,128,128,0.40);
+            box-shadow: 0 1px 6px rgba(0,0,0,0.06);
+        }}
+        /* Label: smaller, muted, subtly tracked — reads as a caption above the number. */
+        [data-testid="stMetricLabel"] p {{
+            font-size: 0.74rem !important;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            opacity: 0.72;
+        }}
+        /* Value: tabular figures so digits align across the row; sized to fit the
+           narrow 1/7 columns without wrapping long dollar amounts. */
+        [data-testid="stMetricValue"] {{
+            font-size: 1.55rem !important;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+            line-height: 1.15;
+        }}
+        [data-testid="stMetricDelta"] {{
+            font-variant-numeric: tabular-nums;
+        }}
+
+        /* ---- Heading rhythm ---------------------------------------------- */
+        /* Give section headers (st.subheader / ### markdown -> h2/h3) consistent
+           breathing room so sections separate evenly, with a hair of negative
+           tracking for a tighter, more designed look. */
+        div[data-testid="stMainBlockContainer"] h2,
+        div[data-testid="stMainBlockContainer"] h3 {{
+            margin-top: 1.4rem;
+            margin-bottom: 0.4rem;
+            letter-spacing: -0.01em;
+        }}
+        div[data-testid="stMainBlockContainer"] h4 {{
+            margin-top: 1.0rem;
+            margin-bottom: 0.3rem;
+            letter-spacing: -0.005em;
+        }}
+
+        /* ---- General polish ---------------------------------------------- */
+        /* Softer, rounded expander & dataframe frames and a bit more air around
+           dividers. Colors come from theme vars / translucent grey so both modes
+           stay correct. */
+        [data-testid="stExpander"] details {{
+            border: 1px solid rgba(128,128,128,0.22);
+            border-radius: 0.6rem;
+        }}
+        [data-testid="stDataFrame"] {{
+            border-radius: 0.5rem;
+            overflow: hidden;
+        }}
+        [data-testid="stCaptionContainer"] {{
+            opacity: 0.8;
+        }}
+        hr {{
+            margin: 1.4rem 0 1.0rem 0;
+            opacity: 0.5;
         }}
         </style>
         """,
