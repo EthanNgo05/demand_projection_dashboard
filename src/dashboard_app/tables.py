@@ -37,23 +37,18 @@ def style_summary(summary_df):
     if RISK_COL in df.columns:
         fmt[RISK_COL] = lambda v: fmt_dollar(v, decimals=0)
 
-    # Brighter green/red on dark surfaces so the direction stays legible; the
-    # deeper light-mode shades keep good contrast on white. (Colour is cosmetic —
-    # the sign in the formatted number already carries the meaning.)
-    _mode = getattr(getattr(st, "context", None), "theme", None)
-    _dark = getattr(_mode, "type", "light") == "dark"
-    _up = "#4ade80" if _dark else "#15803d"
-    _down = "#f87171" if _dark else "#b91c1c"
-    _neutral = "#a1a1aa" if _dark else "#64748b"
-
+    # Mid-tone green/red that keep adequate contrast on BOTH light and dark
+    # surfaces (Styler emits fixed inline colors that Streamlit does not recolor,
+    # so a single theme-neutral pair is used rather than a per-theme guess). Colour
+    # is cosmetic — the sign in the formatted number already carries the meaning.
     def colour_diff(v):
         if pd.isna(v):
             return ""
         if v > 0:
-            return f"color:{_up};font-weight:600"
+            return "color:#16a34a;font-weight:600"
         if v < 0:
-            return f"color:{_down};font-weight:600"
-        return f"color:{_neutral}"
+            return "color:#dc2626;font-weight:600"
+        return "color:#6b7280"
 
     sty = df.style.format(fmt, na_rep="—")
     # Colour both the unit difference and the dollar revenue risk by direction.

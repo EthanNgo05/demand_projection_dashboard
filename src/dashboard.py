@@ -289,6 +289,30 @@ def main():
             padding: 0.85rem 1rem 0.9rem 1rem;
             transition: border-color 0.15s ease, box-shadow 0.15s ease;
         }}
+        /* Uniform top-row KPI bubbles: scoped to the wide KPI row (keyed container
+           in kpis.py) so the side / stacked metrics keep their natural size. Each
+           card fills its column's full height — the columns already stretch to the
+           tallest, so every bubble matches — with a floor so the row still looks
+           even. Content stays top-aligned; extra space pads the shorter cards. */
+        .st-key-kpi_bubble_row [data-testid="stColumn"] {{
+            align-self: stretch;
+        }}
+        /* Carry height:100% down through Streamlit's wrapper divs so the card can
+           actually fill the stretched column (an auto-height wrapper in between
+           would otherwise collapse the chain). */
+        .st-key-kpi_bubble_row [data-testid="stColumn"] > div,
+        .st-key-kpi_bubble_row [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-kpi_bubble_row [data-testid="stVerticalBlock"],
+        .st-key-kpi_bubble_row [data-testid="stElementContainer"] {{
+            height: 100%;
+        }}
+        .st-key-kpi_bubble_row [data-testid="stMetric"] {{
+            height: 100%;
+            min-height: 7.25rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+        }}
         [data-testid="stMetric"]:hover {{
             border-color: rgba(128,128,128,0.40);
             box-shadow: 0 1px 6px rgba(0,0,0,0.06);
@@ -1263,21 +1287,18 @@ def main():
     # data exist between hist_start and lcw, so the count is derived, not fixed.
     n_hist_weeks = win_sig["WeekDate"].nunique()
     week_word = "week" if n_hist_weeks == 1 else "weeks"
-    # Muted parenthetical colour, theme-aware: a lighter slate on dark so the count
-    # stays readable, the deeper slate on light. (Was a hardcoded #64748b that read
-    # too dark once dark mode was enabled.)
-    _dark = getattr(getattr(st, "context", None), "theme", None)
-    _muted = "#94a3b8" if getattr(_dark, "type", "light") == "dark" else "#64748b"
+    # Muted parenthetical uses Streamlit's :gray[...] colored-text directive, which
+    # the frontend recolors per active theme (readable on both light and dark).
     hist_span = (
         f"**Historical window** &nbsp; {hist_start.date()} → {lcw.date()} "
-        f"<span style='color:{_muted}'>({n_hist_weeks} completed {week_word})</span>"
+        f":gray[({n_hist_weeks} completed {week_word})]"
     )
     w1.markdown(hist_span, unsafe_allow_html=True)
     fc_weeks = pd.to_datetime(weekly["WeekDate"])
     w2.markdown(
         f"**Forecast window** &nbsp; {ffw.date()} → "
         f"{fc_weeks.max().date()} "
-        f"<span style='color:{_muted}'>({fc_weeks.nunique()} weeks)</span>",
+        f":gray[({fc_weeks.nunique()} weeks)]",
         unsafe_allow_html=True,
     )
 

@@ -62,7 +62,14 @@ def _render_kpis(summary, agg, anchors, stacked=False):
 
     # Wide layout: seven side-by-side columns. Stacked: render straight into the
     # current container (st) so each metric sits on its own line.
-    k1, k2, k3, k4, k5, k6, k7 = [st] * 7 if stacked else st.columns(7)
+    # The keyed container tags the wide KPI row with a `.st-key-kpi_bubble_row`
+    # CSS class so the stylesheet can make just these bubbles equal-height (the
+    # stacked per-SKU/side metrics are intentionally left untouched).
+    if stacked:
+        k1, k2, k3, k4, k5, k6, k7 = [st] * 7
+    else:
+        with st.container(key="kpi_bubble_row"):
+            k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     k1.metric(
         "SKUs Forecasted", f"{n_skus:,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,

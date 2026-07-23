@@ -11,59 +11,40 @@ from dashboard_app.summaries import historical_window
 # Charts                                                                      #
 # --------------------------------------------------------------------------- #
 # App font stack — kept in sync with .streamlit/config.toml so chart text matches
-# the rest of the UI.
+# the rest of the UI. Only family/size are set on the figure; text COLORS are left
+# unset on purpose so Streamlit's built-in plotly theme (theme="streamlit", the
+# st.plotly_chart default) recolors them to match whichever theme is actually
+# displayed — it swaps placeholder colors on the frontend based on the live
+# background, which is the only reliable way to stay legible in both light and
+# dark (a server-side st.context.theme.type read can lag the displayed theme and
+# would paint near-white titles onto a light page).
 _CHART_FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
 
 
-def _theme_colors():
-    """Pick chart text/grid/surface colors for the active Streamlit theme.
-
-    Charts use a transparent background so they sit on the page surface; Plotly's
-    default text (~#444) is unreadable on the dark surface, so we set text/grid
-    colors explicitly per mode. Degrades to the light palette if the theme context
-    isn't available. Trace colors (C_ACTUAL/C_UPDATED/C_ORIGINAL) are unchanged.
-    """
-    mode = getattr(getattr(st, "context", None), "theme", None)
-    mode = getattr(mode, "type", "light") or "light"
-    if mode == "dark":
-        return dict(
-            text="#e5e5e5", muted="#a1a1aa",
-            grid="rgba(148,163,184,0.16)", divider="rgba(148,163,184,0.55)",
-            hover_bg="rgba(31,31,35,0.95)", hover_border="rgba(148,163,184,0.35)",
-        )
-    return dict(
-        text="#334155", muted="#64748b",
-        grid=C_GRID, divider="rgba(100,116,139,0.7)",
-        hover_bg="rgba(255,255,255,0.96)", hover_border="rgba(148,163,184,0.35)",
-    )
-
-
 def _base_layout(fig, title, forecast_start, y_title="Units (POS / Orders)"):
-    t = _theme_colors()
     fig.update_layout(
-        title=dict(text=title, font=dict(size=16, color=t["text"])),
-        font=dict(family=_CHART_FONT, color=t["text"], size=13),
+        title=dict(text=title, font=dict(size=16)),
+        font=dict(family=_CHART_FONT, size=13),
         margin=dict(l=10, r=10, t=80, b=10),
         height=420,
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=0.98, x=0,
-                    font=dict(size=12, color=t["text"])),
-        hoverlabel=dict(bgcolor=t["hover_bg"], bordercolor=t["hover_border"],
-                        font=dict(family=_CHART_FONT, size=12, color=t["text"])),
+        legend=dict(orientation="h", yanchor="bottom", y=0.98, x=0),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    fig.update_xaxes(gridcolor=t["grid"], title=None)
-    fig.update_yaxes(gridcolor=t["grid"], rangemode="tozero", title=y_title)
+    # Translucent grid/divider colors read correctly on both light and dark
+    # surfaces, so these stay explicit.
+    fig.update_xaxes(gridcolor=C_GRID, title=None)
+    fig.update_yaxes(gridcolor=C_GRID, rangemode="tozero", title=y_title)
     if forecast_start is not None:
         fig.add_vline(
             x=forecast_start, line_width=1, line_dash="dot",
-            line_color=t["divider"],
+            line_color="rgba(100,116,139,0.7)",
         )
         fig.add_annotation(
             x=forecast_start, yref="paper", y=0.93, yanchor="bottom",
             text="forecast →", showarrow=False,
-            font=dict(size=11, color=t["muted"]),
+            font=dict(size=11, color="rgba(100,116,139,0.95)"),
             xshift=4,
         )
     return fig
