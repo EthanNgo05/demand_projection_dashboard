@@ -278,7 +278,12 @@ def main():
            so it adapts cleanly to both light and dark. Applies to the 7-KPI row
            and the stacked per-SKU metric column alike. */
         [data-testid="stMetric"] {{
-            background: var(--secondary-background-color, #f4f4f5);
+            /* Translucent grey fill instead of a theme variable: it lifts off a
+               white surface as a soft grey card and off a dark surface as a raised
+               panel, so it is correct in BOTH modes without depending on a
+               Streamlit CSS variable that may not exist (a light fallback would
+               make dark-mode cards light-grey with unreadable light text). */
+            background: rgba(128,128,128,0.10);
             border: 1px solid rgba(128,128,128,0.22);
             border-radius: 0.6rem;
             padding: 0.85rem 1rem 0.9rem 1rem;
@@ -1258,16 +1263,21 @@ def main():
     # data exist between hist_start and lcw, so the count is derived, not fixed.
     n_hist_weeks = win_sig["WeekDate"].nunique()
     week_word = "week" if n_hist_weeks == 1 else "weeks"
+    # Muted parenthetical colour, theme-aware: a lighter slate on dark so the count
+    # stays readable, the deeper slate on light. (Was a hardcoded #64748b that read
+    # too dark once dark mode was enabled.)
+    _dark = getattr(getattr(st, "context", None), "theme", None)
+    _muted = "#94a3b8" if getattr(_dark, "type", "light") == "dark" else "#64748b"
     hist_span = (
         f"**Historical window** &nbsp; {hist_start.date()} → {lcw.date()} "
-        f"<span style='color:#64748b'>({n_hist_weeks} completed {week_word})</span>"
+        f"<span style='color:{_muted}'>({n_hist_weeks} completed {week_word})</span>"
     )
     w1.markdown(hist_span, unsafe_allow_html=True)
     fc_weeks = pd.to_datetime(weekly["WeekDate"])
     w2.markdown(
         f"**Forecast window** &nbsp; {ffw.date()} → "
         f"{fc_weeks.max().date()} "
-        f"<span style='color:#64748b'>({fc_weeks.nunique()} weeks)</span>",
+        f"<span style='color:{_muted}'>({fc_weeks.nunique()} weeks)</span>",
         unsafe_allow_html=True,
     )
 
