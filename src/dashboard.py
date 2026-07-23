@@ -203,6 +203,13 @@ def main():
             padding: 0.4rem 1rem;
             color: rgba(148,163,184,1);       /* muted inactive label */
             font-weight: 500;
+            font-size: 1.15rem;               /* larger, more prominent tab titles */
+        }}
+        /* The button label text inherits size from the button, but Streamlit
+           wraps it in a <p>/markdown span with its own size — bump that too so
+           the enlarged font actually takes effect. */
+        div[data-testid="stButtonGroup"] button p {{
+            font-size: 1.15rem;
         }}
         div[data-testid="stButtonGroup"] button:hover {{
             color: inherit !important;
@@ -240,6 +247,26 @@ def main():
         }}
         @keyframes sh-status-spin {{
             to {{ transform: rotate(360deg); }}
+        }}
+
+        /* Tighten the top of the page. In wide layout Streamlit reserves ~6rem
+           of padding above the main container plus a header spacer, which leaves
+           a large empty band above the title. Trim the container padding, zero
+           the (transparent) header spacer, and drop the title's own top margin so
+           the header sits near the top edge and the control row follows without a
+           big gap. Deploy menu / status widget stay reachable (header kept, just
+           collapsed — not display:none). */
+        div[data-testid="stMainBlockContainer"],
+        .block-container {{
+            padding-top: 2.5rem;
+        }}
+        [data-testid="stHeader"] {{
+            height: 0;
+            background: transparent;
+        }}
+        div[data-testid="stMainBlockContainer"] h1 {{
+            padding-top: 0;
+            margin-top: 0;
         }}
         </style>
         """,
@@ -420,25 +447,26 @@ def main():
                 "(usually a few minutes)."
             )
 
-        # The refresh button and the "manually override" toggle sit side by
-        # side. When the toggle is off (default) every file picker below is
-        # hidden and the app just loads the newest files / Plytix feed; flip
-        # it on to reveal the snapshot selectboxes and upload boxes.
-        col_btn, col_toggle = st.columns([1, 1])
-        with col_toggle:
-            override = st.toggle(
-                "Manually override data",
-                value=False,
-                key="data_override",
-                help="""
-        **Off (default)**:
-        Automatically loads the latest data snapshot, Plytix feed, and warehouse files.
-
-        **On**:
-        Lets you choose specific files from previous snapshots or upload your own files for analysis.
-        """,
-            )
-        with col_btn:
+        # The refresh button, the "manually override" toggle, and the reasoning-
+        # LLM selector sit side by side at the top. When the toggle is off
+        # (default) every file picker below is hidden and the app just loads the
+        # newest files / Plytix feed; flip it on to reveal the snapshot
+        # selectboxes and upload boxes. The LLM selector picks which model powers
+        # the "Model analysis" recommend button (rendered below the view tabs); it
+        # lives up here so it reads at the same level as the sync/override
+        # controls. It's irrelevant to the model-agnostic Exceptions scan, so its
+        # column is dropped there (keeping the button/toggle widths stable).
+        # Data controls (sync button, snapshot status, manual-override toggle)
+        # group on the LEFT; the reasoning-LLM selector sits on the RIGHT. The
+        # override toggle is a data control, so keeping it beside the sync button
+        # — rather than stranded in a middle column — closes the wide gaps the old
+        # three-across layout left and reads as one coherent group. The data
+        # column keeps its width regardless of scope; col_llm is simply dropped
+        # for the model-agnostic Exceptions scope, leaving the right side blank.
+        col_data, col_llm = st.columns([2, 1], gap="large", vertical_alignment="top")
+        if scope == EXCEPTIONS_VIEW:
+            col_llm = None
+        with col_data:
             do_refresh = False
             if running or wh_running:
                 if st.button("Check for new data", key="check_refresh"):
@@ -454,15 +482,52 @@ def main():
                          "usable and switches to the new snapshots when they're "
                          "ready. A nightly job does the full pull.",
                 )
+            # A compact timestamp of the last data-warehouse pull, so users know
+            # how fresh the auto-loaded data is without opening the manual
+            # pickers. Sits right under the sync button as its status line.
+            if files:
+                _d0, _p0 = files[0]
+                st.caption(
+                    f"Latest snapshot: "
+                    f"{time.strftime('%Y-%m-%d %I:%M %p', time.localtime(os.path.getmtime(_p0)))}"
+                )
+            override = st.toggle(
+                "Manually override data",
+                value=False,
+                key="data_override",
+                help="""
+        **Off (default)**:
+        Automatically loads the latest data snapshot, Plytix feed, and warehouse files.
 
-        # A compact timestamp of the last data-warehouse pull, so users know how
-        # fresh the auto-loaded data is without opening the manual pickers.
-        if files:
-            _d0, _p0 = files[0]
-            st.caption(
-                f"Latest snapshot: "
-                f"{time.strftime('%Y-%m-%d %I:%M %p', time.localtime(os.path.getmtime(_p0)))}"
+        **On**:
+        Lets you choose specific files from previous snapshots or upload your own files for analysis.
+        """,
             )
+        # Reasoning-LLM selector (drives the "Model analysis" recommend button
+        # below the tabs). Rendered here so it sits level with the sync/override
+        # controls; sets provider_label / anthropic_no_key before col_model reads
+        # them. Skipped for the model-agnostic Exceptions scope (col_llm is None).
+        if col_llm is not None:
+            with col_llm:
+                provider_label = st.radio(
+                    "Reasoning LLM",
+                    list(LLM_PROVIDERS.keys()),
+                    key="agent_llm_provider",
+                    help="""
+    Select which large language model (LLM) generates the forecast summary and anomaly analysis.
+
+    **Anthropic (Claude):** uses Anthropic's Claude API and requires an `ANTHROPIC_API_KEY`.
+
+    **Local (Gemma):** runs Google's Gemma model locally and does not require an external API.
+    """,
+                )
+                # Anthropic needs a key; without one, block the run and steer the
+                # user to Local rather than silently degrading to it.
+                anthropic_no_key = LLM_PROVIDERS[provider_label] == "anthropic" and not (
+                    os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+                )
+                if anthropic_no_key:
+                    st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the analysis.")
 
         if do_refresh:
             ok_dw, msg_dw = start_refresh()
@@ -786,113 +851,100 @@ def main():
         # (Optimized Projections picks per group; Exceptions is model-agnostic).
         if scope in (ALL_CUSTOMERS_VIEW, "By region"):
             st.subheader("Forecasting model")
-            st.selectbox(
-                "Forecasting model", list(MODEL_OPTIONS.keys()),
-                key="model_choice", on_change=_on_model_change,
-                format_func=model_display, label_visibility="collapsed",
-                help=_MODEL_HELP,
-            )
+            # The model dropdown and the "Recommend best model" button sit side by
+            # side — the button is short, so it takes a narrow column. The no-key
+            # warning is folded into the (disabled) button's hover tooltip instead
+            # of a standalone caption; provider_label / anthropic_no_key come from
+            # the top-row reasoning-LLM selector.
+            m_col, b_col = st.columns([3, 1], vertical_alignment="bottom")
+            with m_col:
+                st.selectbox(
+                    "Forecasting model", list(MODEL_OPTIONS.keys()),
+                    key="model_choice", on_change=_on_model_change,
+                    format_func=model_display, label_visibility="collapsed",
+                    help=_MODEL_HELP,
+                )
+            with b_col:
+                run_agent = st.button(
+                    "Recommend best model",
+                    key="run_agent_summary",
+                    disabled=anthropic_no_key,
+                    help=(
+                        "⚠️ No ANTHROPIC_API_KEY found — pick Local LLM above to "
+                        "enable this."
+                        if anthropic_no_key else
+                        "Backtests all models for this view, recommends the most "
+                        "accurate one, and writes an AI summary + flagged anomalies. "
+                        "Slow — runs only when you click, never on a normal rerun."
+                    ),
+                )
             # Blurb describing the selected model (computed near the title). Only
             # the single-model views reach here, which matches its old suppression
             # (combined/best-model and Exceptions supply their own captions).
             st.caption(header_caption)
 
-        # Model analysis (reasoning-LLM selector + a recommend button) applies to
-        # every view except the model-agnostic Exceptions scan — where the whole
-        # apparatus (including the "No ANTHROPIC_API_KEY" warning) is irrelevant.
-        if scope != EXCEPTIONS_VIEW:
+        # Model analysis: only Optimized Projections keeps its own section — the
+        # global all-views recommendation run. Executive Overview / By Region
+        # render their "Recommend best model" button inline beside the model
+        # dropdown above; Exceptions is model-agnostic (no analysis apparatus).
+        if scope == BEST_MODEL_COMBINED_VIEW:
             st.subheader("Model analysis")
-            provider_label = st.radio(
-                "Reasoning LLM",
-                list(LLM_PROVIDERS.keys()),
-                key="agent_llm_provider",
-                help="""
-    Select which large language model (LLM) generates the forecast summary and anomaly analysis.
-
-    **Anthropic (Claude):** uses Anthropic's Claude API and requires an `ANTHROPIC_API_KEY`.
-
-    **Local (Gemma):** runs Google's Gemma model locally and does not require an external API.
-    """,
-            )
-            # Anthropic needs a key; without one, block the run and steer the user
-            # to Local rather than silently degrading to it behind the scenes.
-            anthropic_no_key = LLM_PROVIDERS[provider_label] == "anthropic" and not (
-                os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-            )
-            if anthropic_no_key:
-                st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the analysis.")
-
-            if scope == BEST_MODEL_COMBINED_VIEW:
-                # Optimized Projections is the only place the global all-views run
-                # lives — the combined table is built from every group's own best
-                # model. Same work as `python -m agent.batch`; runs hidden in the
-                # background, and while it runs the button becomes a status check.
-                batch_running, batch_started = batch_in_progress()
-                if batch_running:
-                    elapsed = batch_elapsed_suffix(batch_started)
-                    prog = batch_progress()
-                    if prog:
-                        done, total = prog
-                        st.info(f"⏳ Recommending the best model for every view — "
-                                f"{done} of {total} done.{elapsed} This runs in the "
-                                "background, so you can keep using the dashboard.")
-                    else:
-                        st.info(f"⏳ Recommending the best model for every view — getting "
-                                f"started.{elapsed} This runs in the background, so you "
-                                "can keep using the dashboard.")
-                    if st.button("Check progress", key="check_agent_batch"):
-                        st.rerun()
+            # Optimized Projections is the only place the global all-views run
+            # lives — the combined table is built from every group's own best
+            # model. Same work as `python -m agent.batch`; runs hidden in the
+            # background, and while it runs the button becomes a status check.
+            batch_running, batch_started = batch_in_progress()
+            if batch_running:
+                elapsed = batch_elapsed_suffix(batch_started)
+                prog = batch_progress()
+                if prog:
+                    done, total = prog
+                    st.info(f"⏳ Recommending the best model for every view — "
+                            f"{done} of {total} done.{elapsed} This runs in the "
+                            "background, so you can keep using the dashboard.")
                 else:
-                    # A just-finished run (this session): surface its outcome once.
-                    proc = st.session_state.get("agent_batch_proc")
-                    if proc is not None and proc.poll() is not None:
-                        st.session_state["_batch_toast"] = (
-                            batch_result_message() or "Recommendations finished."
-                        )
-                        st.session_state.pop("agent_batch_proc", None)
-                    run_all = st.button(
-                        "Recommend models (all views)",
-                        key="run_agent_all",
-                        disabled=anthropic_no_key,
-                        help="Recommends the most accurate model for EVERY view and "
-                             "writes each recommendation to disk. Runs ~60 views — can "
-                             "take up to 1 hour. Asks for confirmation first.",
-                    )
-                    if run_all:
-                        _confirm_run_all_dialog(LLM_PROVIDERS[provider_label])
-
-                    # If the last run left any views un-updated, name them and offer
-                    # a targeted retry (re-runs ONLY those, not the whole batch).
-                    failures = batch_failures()
-                    if failures:
-                        names = [v for v, _ in failures]
-                        st.warning(
-                            "These views couldn't be updated last time:\n"
-                            + "\n".join(f"- {n}" for n in names)
-                        )
-                        if st.button("Retry failed views", key="retry_agent_failed",
-                                     disabled=anthropic_no_key):
-                            ok, msg = start_agent_batch(
-                                LLM_PROVIDERS[provider_label], views=names
-                            )
-                            st.session_state["_batch_toast"] = (
-                                f"Retrying {len(names)} view(s)…" if ok else f"⚠️ {msg}"
-                            )
-                            st.rerun()
+                    st.info(f"⏳ Recommending the best model for every view — getting "
+                            f"started.{elapsed} This runs in the background, so you "
+                            "can keep using the dashboard.")
+                if st.button("Check progress", key="check_agent_batch"):
+                    st.rerun()
             else:
-                # Executive Overview / By Region: recommend the best model for
-                # THIS view. The live progress + recommendation panel render below.
-                run_agent = st.button(
-                    "Recommend best model",
-                    key="run_agent_summary",
+                # A just-finished run (this session): surface its outcome once.
+                proc = st.session_state.get("agent_batch_proc")
+                if proc is not None and proc.poll() is not None:
+                    st.session_state["_batch_toast"] = (
+                        batch_result_message() or "Recommendations finished."
+                    )
+                    st.session_state.pop("agent_batch_proc", None)
+                run_all = st.button(
+                    "Recommend models (all views)",
+                    key="run_agent_all",
                     disabled=anthropic_no_key,
-                    help="Backtests all models for this view, recommends the most "
-                         "accurate one, and writes an AI summary + flagged anomalies. "
-                         "Slow — runs only when you click, never on a normal rerun.",
+                    help="Recommends the most accurate model for EVERY view and "
+                         "writes each recommendation to disk. Runs ~60 views — can "
+                         "take up to 1 hour. Asks for confirmation first.",
                 )
-                if anthropic_no_key:
-                    st.caption("⚠️ No ANTHROPIC_API_KEY found — pick **Local LLM** "
-                               "above to enable this.")
+                if run_all:
+                    _confirm_run_all_dialog(LLM_PROVIDERS[provider_label])
+
+                # If the last run left any views un-updated, name them and offer
+                # a targeted retry (re-runs ONLY those, not the whole batch).
+                failures = batch_failures()
+                if failures:
+                    names = [v for v, _ in failures]
+                    st.warning(
+                        "These views couldn't be updated last time:\n"
+                        + "\n".join(f"- {n}" for n in names)
+                    )
+                    if st.button("Retry failed views", key="retry_agent_failed",
+                                 disabled=anthropic_no_key):
+                        ok, msg = start_agent_batch(
+                            LLM_PROVIDERS[provider_label], views=names
+                        )
+                        st.session_state["_batch_toast"] = (
+                            f"Retrying {len(names)} view(s)…" if ok else f"⚠️ {msg}"
+                        )
+                        st.rerun()
 
     # Surface batch start/finish toasts once (set from the dialog / poll above).
     if "_batch_toast" in st.session_state:
