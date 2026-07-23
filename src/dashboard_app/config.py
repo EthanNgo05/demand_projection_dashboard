@@ -69,20 +69,36 @@ MODEL_USED_COL = "Model Used"
 # returned by list_views/enumerate_views, so the agent never forecasts it.
 EXCEPTIONS_VIEW = "Exceptions"
 
+# Dashboard-only top-level selector token that groups the two standard
+# single-model views (ALL_CUSTOMERS_VIEW + "By region") under one tab with a
+# nested sub-selector. It is NOT a forecast `view` ID — it never reaches the
+# compute path (the sub-selector resolves `scope` back to one of the real view
+# IDs) and is never returned by list_views/enumerate_views.
+QUICK_VIEW = "Quick Projections"
+
 # Friendly labels shown in the Scope selector. The keys are the stable internal
 # view IDs (also the agent-summary filenames / agent config), so we rename only
-# what the planner sees, never the ID.
+# what the planner sees, never the ID. One dict serves both selector levels:
+# QUICK_VIEW / BEST_MODEL_COMBINED_VIEW / EXCEPTIONS_VIEW label the top-level
+# pill bar, while ALL_CUSTOMERS_VIEW / "By region" label the nested sub-selector
+# shown under Quick Projections.
 SCOPE_LABELS = {
-    ALL_CUSTOMERS_VIEW: "Executive Overview",
+    QUICK_VIEW: "Quick Projections",
     BEST_MODEL_COMBINED_VIEW: "Optimized Projections",
-    "By region": "By Region",
     EXCEPTIONS_VIEW: "Exceptions",
+    # Quick Projections sub-views:
+    ALL_CUSTOMERS_VIEW: "All Customers",
+    "By region": "By Region",
 }
 
 # One-line description shown as a caption under the view tab strip — describes the
 # *active* tab only (the tabs replaced the old "About these views" expander that
 # listed all four at once). Keyed by the same internal view IDs as SCOPE_LABELS.
 SCOPE_CAPTIONS = {
+    QUICK_VIEW: (
+        "Standard 15-week forecasts — all customer groups combined, or drill "
+        "into a single fulfillment region or customer group."
+    ),
     ALL_CUSTOMERS_VIEW: (
         "Forecasts all customer groups as one combined demand series using the "
         "model selected below."

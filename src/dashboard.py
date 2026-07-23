@@ -102,7 +102,8 @@ if not logger.handlers:
 from dashboard_app.config import (  # noqa: F401
     ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID, C_ORIGINAL, C_UPDATED,
     DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
-    PRICE_COL, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS, SCOPE_LABELS,
+    PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
+    SCOPE_LABELS,
     _ENV_PIPELINE,
     fmt_dollar, model_display, region_all_view, region_from_view,
 )
@@ -222,6 +223,54 @@ def main():
             color: inherit !important;
             font-weight: 700;
             border-bottom-color: var(--primary-color, #1f2937) !important;
+        }}
+
+        /* ---- Nested "Quick Projections" sub-selector --------------------- */
+        /* The All Customers / By Region control is a second segmented_control, so
+           without this it inherits the tab-strip look above and reads as a second
+           row of main tabs. Scoped to its widget key (.st-key-quick_subview,
+           key="quick_subview"), these rules override that into a compact, slightly
+           indented, fully-rounded "iOS segmented track": a tinted pill track that
+           shrink-wraps its options, with the active option a filled chip. Reads as
+           a control nested under the Quick Projections tab. */
+        .st-key-quick_subview {{
+            margin: -0.35rem 0 0.9rem 0.15rem;   /* pull up under the tab + small indent */
+        }}
+        .st-key-quick_subview div[data-testid="stButtonGroup"] {{
+            display: inline-flex;
+            width: auto;                          /* shrink-wrap, not full width */
+            background: rgba(128,128,128,0.14);   /* the rounded track */
+            border: 1px solid rgba(128,128,128,0.20);
+            border-radius: 999px;
+            padding: 3px;
+            margin-bottom: 0;
+        }}
+        .st-key-quick_subview div[data-testid="stButtonGroup"] > div {{ gap: 2px; }}
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button {{
+            border: none !important;
+            border-bottom: none !important;       /* drop the tab underline slot */
+            border-radius: 999px !important;      /* rounded chip */
+            margin-bottom: 0;
+            padding: 0.2rem 0.9rem !important;
+            font-size: 0.85rem !important;        /* smaller than the main tabs */
+            font-weight: 500;
+            color: rgba(107,114,128,1);           /* muted inactive label */
+        }}
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button p {{
+            font-size: 0.85rem !important;        /* undo the 1.15rem global bump */
+        }}
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button:hover {{
+            color: inherit !important;
+            border-bottom-color: transparent !important;
+        }}
+        /* Active option: a filled chip that sits inside the track (theme surface
+           fill + soft shadow), replacing the underline used by the main tabs. */
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] {{
+            background: var(--background-color, #ffffff) !important;
+            color: inherit !important;
+            font-weight: 600;
+            border-bottom-color: transparent !important;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.14);
         }}
 
         /* Replace Streamlit's top-right "running" status graphic — which cycles
@@ -480,13 +529,15 @@ def main():
     anthropic_no_key = False
 
     with view_slot:
-        # The four top-level views as a button-bar segmented control. Keeps
+        # The three top-level views as a button-bar segmented control. Keeps
         # key="scope" and the same internal view IDs the rest of the app reads
-        # (the model-selection logic above resolves the pipeline off it).
+        # (the model-selection logic above resolves the pipeline off it). The two
+        # standard single-model views (Executive Overview + By Region) are nested
+        # under one "Quick Projections" pill and chosen via the sub-selector below.
         scope = st.segmented_control(
             "View",
-            [ALL_CUSTOMERS_VIEW, "By region", BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW],
-            default=ALL_CUSTOMERS_VIEW,
+            [QUICK_VIEW, BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW],
+            default=QUICK_VIEW,
             key="scope",
             format_func=lambda s: SCOPE_LABELS.get(s, s),
             label_visibility="collapsed",
@@ -495,9 +546,32 @@ def main():
         # fall back to the persisted choice (or the default) so a view is always
         # resolved.
         if scope is None:
-            scope = st.session_state.get("scope") or ALL_CUSTOMERS_VIEW
-        # Contextual help: one line describing the active tab, in place of the old
-        # "About these views" expander that listed all four at once.
+            scope = st.session_state.get("scope") or QUICK_VIEW
+
+        # Quick Projections is a container tab, not a real view: a nested
+        # sub-selector resolves it back to one of the standard single-model view
+        # IDs (ALL_CUSTOMERS_VIEW / "By region"), so every downstream branch keyed
+        # on `scope` sees the same values as before and the compute path is
+        # unchanged (exactly one view renders per run). It's a second
+        # segmented_control, but CSS scoped to its widget key (.st-key-quick_subview,
+        # see the <style> block above) overrides the global tab-strip styling to
+        # render it as a compact, indented, rounded "iOS segmented track" — so it
+        # reads as a control nested under the tab, not a second row of main tabs.
+        if scope == QUICK_VIEW:
+            sub = st.segmented_control(
+                "Quick Projections view",
+                [ALL_CUSTOMERS_VIEW, "By region"],
+                default=ALL_CUSTOMERS_VIEW,
+                key="quick_subview",
+                format_func=lambda s: SCOPE_LABELS.get(s, s),
+                label_visibility="collapsed",
+            )
+            if sub is None:
+                sub = st.session_state.get("quick_subview") or ALL_CUSTOMERS_VIEW
+            scope = sub
+
+        # Contextual help: one line describing the active (sub-)view, in place of
+        # the old "About these views" expander that listed everything at once.
         st.caption(SCOPE_CAPTIONS.get(scope, ""))
 
     # Resolve the view for the three scopes that don't need `df`. "By region"
