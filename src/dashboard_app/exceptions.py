@@ -22,8 +22,20 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_app.compute import EIGHT_WK_AVG_COL, _descriptive_averages, summary_to_excel
-from dashboard_app.config import PRICE_COL, RISK_COL
-from dashboard_app.datasources import discover_key_skus_file, load_key_skus
+from dashboard_app.config import ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL
+from dashboard_app.dataquality import (
+    render_discontinued_section,
+    render_inactive_section,
+    render_missing_pos_section,
+    render_missing_section,
+)
+from dashboard_app.datasources import (
+    compute_missing_pos_orders,
+    compute_missing_projections,
+    discover_key_skus_file,
+    load_key_skus,
+)
+from dashboard_app.summaries import customer_source_map
 from dashboard_app.tables import render_filtered_table
 
 # Display column names for the exceptions table. These deliberately reuse the
@@ -373,10 +385,52 @@ def _render_key_skus_tab(frame, P, today_str):
             st.markdown("\n".join(f"- {s}" for s in missing))
 
 
-def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors, P=None):
+def _render_data_quality_expanders(
+    *, view, region, today_str, P,
+    warehouse_df, check_ran, inactive_df, excluded_counts_by_key, n_excluded_rows,
+    disc_check_ran, discontinued_df, missing_df, missing_pos_df, cust_source,
+    key_skus, key_suffix,
+):
+    """Render the four data-quality sections, each in a collapsed expander, for one
+    Exceptions tab. ``key_skus`` (or None) filters every section to key SKUs;
+    ``key_suffix`` keeps each tab's widget keys unique. The section renderers draw
+    their own titles inside via ``show_header=False`` being unset — here we suppress
+    the ``###`` header since the expander label carries the title."""
+    with st.expander("SKUs with forecasts in locations they are not active in"):
+        render_inactive_section(
+            view, region, check_ran, inactive_df,
+            excluded_counts_by_key, n_excluded_rows, today_str,
+            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+        )
+    with st.expander("SKUs missing forecasts in locations they are active in"):
+        render_missing_section(
+            view, region, warehouse_df, check_ran, missing_df, today_str,
+            cust_source, P,
+            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+        )
+    with st.expander("SKUs missing POS/Orders data in locations they are active in"):
+        render_missing_pos_section(
+            view, region, missing_pos_df, today_str,
+            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+        )
+    with st.expander("Inactive/discontinued SKUs with forecasts"):
+        render_discontinued_section(
+            view, region, disc_check_ran, discontinued_df, today_str,
+            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+        )
+
+
+def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors, P=None,
+                      *, warehouse_df=None, plytix_df=None, check_ran=False,
+                      inactive_df=None, excluded_counts_by_key=None,
+                      disc_check_ran=False, discontinued_df=None):
     """Render the EXCEPTIONS_VIEW. Mirrors _render_best_model_combined's call
     signature so main() can dispatch it the same way; the page title is already
-    drawn by main(), so we start at the subheader."""
+    drawn by main(), so we start at the subheader.
+
+    The keyword-only args carry the inputs for the four data-quality sections
+    (moved here from Quick Projections): they render below each tab's Under/Over
+    tables — all rows in All Exceptions, key SKUs only in the Key SKUs tab."""
     st.subheader("Exceptions")
     st.caption(
         "SKUs where recent sales no longer match the plan. We compare each SKU's "
@@ -396,23 +450,58 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
         "- **Revenue Risk (avg/wk)** = Projection Difference × List Price"
     )
 
-    # Cache on a structural signature so filter/threshold reruns don't rebuild it.
+    # Cache on a structural signature so filter/threshold reruns don't rebuild the
+    # exceptions frame OR the (relatively expensive) data-quality tables. The
+    # warehouse marker invalidates the cache when the warehouse grid is re-uploaded.
     price_marker = None if prices is None else int(len(prices))
-    sig = (EXCEPTIONS_VIEW_SIG, today_str, price_marker, n_excluded_rows)
+    wh_marker = None if warehouse_df is None else int(len(warehouse_df))
+    sig = (EXCEPTIONS_VIEW_SIG, today_str, price_marker, n_excluded_rows, wh_marker)
     if st.session_state.get("exceptions_structural") != sig:
         with st.spinner("Scanning for exceptions…"):
-            st.session_state["exceptions_frame"] = compute_exceptions(
-                df, today_ts, prices, P
+            frame = compute_exceptions(df, today_ts, prices, P)
+            st.session_state["exceptions_frame"] = frame
+            # Data-quality tables for the four sections moved here from Quick
+            # Projections. missing_df needs the warehouse grid; missing_pos_df
+            # uses full demand history. cust_source rebuilds the POS/Orders label
+            # from the exceptions frame (the model summary that feeds it in the
+            # single-model views isn't computed in this model-agnostic view).
+            st.session_state["exceptions_missing_df"] = compute_missing_projections(
+                warehouse_df, plytix_df, df, P
             )
+            st.session_state["exceptions_missing_pos_df"] = compute_missing_pos_orders(
+                df, plytix_df, P, anchors=anchors
+            )
+            st.session_state["exceptions_cust_source"] = customer_source_map(frame)
         st.session_state["exceptions_structural"] = sig
     frame = st.session_state.get("exceptions_frame")
+    missing_df = st.session_state.get("exceptions_missing_df")
+    missing_pos_df = st.session_state.get("exceptions_missing_pos_df")
+    cust_source = st.session_state.get("exceptions_cust_source")
 
     if frame is None or frame.empty:
         st.info("No exceptions found — every SKU's recent sell-through tracks its projection.")
         return
 
+    # The four data-quality sections render globally (all regions) in this view.
+    dq_common = dict(
+        view=ALL_CUSTOMERS_VIEW, region=None, today_str=today_str, P=P,
+        warehouse_df=warehouse_df, check_ran=check_ran, inactive_df=inactive_df,
+        excluded_counts_by_key=excluded_counts_by_key, n_excluded_rows=n_excluded_rows,
+        disc_check_ran=disc_check_ran, discontinued_df=discontinued_df,
+        missing_df=missing_df, missing_pos_df=missing_pos_df, cust_source=cust_source,
+    )
+
+    # Key SKUs to filter the Key-SKUs-tab sections by (None → sections skipped).
+    path = discover_key_skus_file()
+    key_skus = load_key_skus(path, os.path.getmtime(path)) if path else None
+
     tab_key, tab_all = st.tabs(["Key SKUs", "All Exceptions"])
     with tab_key:
         _render_key_skus_tab(frame, P, today_str)
+        if key_skus:
+            st.divider()
+            _render_data_quality_expanders(**dq_common, key_skus=key_skus, key_suffix="_key")
     with tab_all:
         _render_all_exceptions_tab(frame, P, today_str)
+        st.divider()
+        _render_data_quality_expanders(**dq_common, key_skus=None, key_suffix="_all")

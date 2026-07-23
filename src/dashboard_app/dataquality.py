@@ -9,15 +9,22 @@ from dashboard_app.compute import summary_to_excel
 
 
 def render_inactive_section(view, region, check_ran, inactive_df,
-                            excluded_counts_by_key, n_excluded_rows, today_str):
+                            excluded_counts_by_key, n_excluded_rows, today_str,
+                            key_skus=None, key_suffix="", show_header=True):
     """Table of active products projected in regions they are not 'Active in'.
 
     The rows behind these SKU × customer × region combos were dropped from every
     summary table above (the SKU isn't 'Active in' that region). Surface them so
     the exclusion is visible and auditable.
+
+    ``key_skus`` (a set of key SKUs) filters the table to those SKUs only;
+    ``key_suffix`` disambiguates widget keys when the section is rendered twice on
+    one page (e.g. once per Exceptions tab); ``show_header`` suppresses the ``###``
+    title when the caller already labels the section (e.g. an expander).
     """
     HEADER = "### SKUs with forecasts in locations they are not active in"
-    st.markdown(HEADER)
+    if show_header:
+        st.markdown(HEADER)
     if not check_ran:
         st.info(
             "Upload a Plytix export with an 'Active in' column (sidebar) to run "
@@ -32,6 +39,10 @@ def render_inactive_section(view, region, check_ran, inactive_df,
     table_df = inactive_df
     if region_scoped:
         table_df = inactive_df[inactive_df["Region"] == region]
+    if key_skus is not None:
+        table_df = table_df[
+            table_df["SKU"].astype(str).str.rstrip("*").isin(key_skus)
+        ]
 
     # Always show only non-zero future projections: rows whose Last_WeekDate is
     # this week and onward (Sunday-anchored via _this_week_start, matching the
@@ -79,18 +90,19 @@ def render_inactive_section(view, region, check_ran, inactive_df,
         "Last_WeekDate": "Last Projected Week",
         "Original_Projection": "Original Projection (future avg/wk)",
     })
-    render_filtered_table(show, "filter_inactive", style=False)
+    render_filtered_table(show, f"filter_inactive{key_suffix}", style=False)
     st.download_button(
         "⬇️ Download the excluded (inactive-region) projections table",
         data=summary_to_excel(show, sheet_name="inactive_projections"),
         file_name=f"inactive_projections_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_inactive_projections",
+        key=f"dl_inactive_projections{key_suffix}",
     )
 
 
 def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
-                           today_str, cust_source=None, P=None):
+                           today_str, cust_source=None, P=None,
+                           key_skus=None, key_suffix="", show_header=True):
     """Table of active products MISSING future projections in active regions.
 
     Ported from active_missing_projections.py. The inverse of the inactive
@@ -99,9 +111,13 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
     warehouse projection grid (sidebar), the only place a blank/missing week is
     visible. In a "By customer group" view, only rows whose region matches the
     selected region are shown; ALL CUSTOMERS shows every region.
+
+    ``key_skus``/``key_suffix``/``show_header`` behave as in
+    ``render_inactive_section``.
     """
     HEADER = "### SKUs missing forecasts in locations they are active in"
-    st.markdown(HEADER)
+    if show_header:
+        st.markdown(HEADER)
     if warehouse_df is None or warehouse_df.empty:
         st.info(
             "Upload the warehouse projection files (AU/CA/EU/JP/US) in the "
@@ -132,6 +148,10 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
         ]
     elif group_scoped:
         table_df = missing_df[row_group == view]
+    if key_skus is not None:
+        table_df = table_df[
+            table_df["SKU"].astype(str).str.rstrip("*").isin(key_skus)
+        ]
 
     if table_df.empty:
         if group_scoped:
@@ -171,26 +191,31 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
             for s, c in zip(show["SKU"], show["Customer"])
         ],
     )
-    render_filtered_table(show, "filter_missing", P, style=False)
+    render_filtered_table(show, f"filter_missing{key_suffix}", P, style=False)
     st.download_button(
         "⬇️ Download the missing-projections table",
         data=summary_to_excel(show, sheet_name="missing_projections"),
         file_name=f"missing_projections_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_missing_projections",
+        key=f"dl_missing_projections{key_suffix}",
     )
 
 
 def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
-                                today_str):
+                                today_str,
+                                key_skus=None, key_suffix="", show_header=True):
     """Table of Discontinued/Inactive products that still carry projections.
 
     Ported from discontinued_with_projections.ipynb. In a "By customer group"
     view, only rows whose region matches the selected region are shown (e.g. an
     EU view won't list AAFES, a US customer); ALL CUSTOMERS shows every region.
+
+    ``key_skus``/``key_suffix``/``show_header`` behave as in
+    ``render_inactive_section``.
     """
     HEADER = "### Inactive/discontinued SKUs with forecasts"
-    st.markdown(HEADER)
+    if show_header:
+        st.markdown(HEADER)
     if not disc_check_ran:
         st.info(
             "Upload a Plytix export with a 'SKU Status' column (sidebar) to run "
@@ -202,6 +227,10 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
     table_df = discontinued_df
     if region_scoped:
         table_df = discontinued_df[discontinued_df["Region"] == region]
+    if key_skus is not None:
+        table_df = table_df[
+            table_df["SKU"].astype(str).str.rstrip("*").isin(key_skus)
+        ]
 
     # Apply the non-zero future-projection filter BEFORE the empty check, so a
     # scope whose rows all zero out still shows the "None found" message rather
@@ -247,26 +276,31 @@ def render_discontinued_section(view, region, disc_check_ran, discontinued_df,
         "Original_Projection": "Original Projection (future avg/wk)",
     })
 
-    render_filtered_table(disc, "filter_discontinued", style=False)
+    render_filtered_table(disc, f"filter_discontinued{key_suffix}", style=False)
     st.download_button(
         "⬇️ Download the discontinued/inactive projections table",
         data=summary_to_excel(disc, sheet_name="discontinued_projections"),
         file_name=f"discontinued_with_projections_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_discontinued_projections",
+        key=f"dl_discontinued_projections{key_suffix}",
     )
 
 
-def render_missing_pos_section(view, region, missing_pos_df, today_str):
+def render_missing_pos_section(view, region, missing_pos_df, today_str,
+                               key_skus=None, key_suffix="", show_header=True):
     """Table of active SKUs (incl. Parts) missing POS/Orders where they're active.
 
     Ported from missing_pos.ipynb. Flags SKU x customer combos that have stopped
     receiving (or never received) POS/Orders data in a region the SKU is "Active
     in", over full history. In a "By customer group" view only rows whose region
     matches the selected region are shown; ALL CUSTOMERS shows every region.
+
+    ``key_skus``/``key_suffix``/``show_header`` behave as in
+    ``render_inactive_section``.
     """
     HEADER = "### SKUs missing POS/Orders data in locations they are active in"
-    st.markdown(HEADER)
+    if show_header:
+        st.markdown(HEADER)
     st.caption(
         "Note: this table only surfaces combos that sold within the past 3 months "
         "and have since gone silent. It deliberately excludes customer/SKU "
@@ -284,6 +318,10 @@ def render_missing_pos_section(view, region, missing_pos_df, today_str):
     table_df = missing_pos_df
     if region_scoped:
         table_df = missing_pos_df[missing_pos_df["Region"] == region]
+    if key_skus is not None:
+        table_df = table_df[
+            table_df["SKU"].astype(str).str.rstrip("*").isin(key_skus)
+        ]
 
     if table_df.empty:
         if region_scoped:
@@ -310,11 +348,11 @@ def render_missing_pos_section(view, region, missing_pos_df, today_str):
     show["First Missing Week"] = pd.to_datetime(show["First Missing Week"]).dt.date
     show["Last Missing Week"] = pd.to_datetime(show["Last Missing Week"]).dt.date
 
-    render_filtered_table(show, "filter_missing_pos", style=False)
+    render_filtered_table(show, f"filter_missing_pos{key_suffix}", style=False)
     st.download_button(
         "⬇️ Download the missing POS/Orders table",
         data=summary_to_excel(show, sheet_name="missing_pos_orders"),
         file_name=f"missing_pos_orders_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_missing_pos_orders",
+        key=f"dl_missing_pos_orders{key_suffix}",
     )

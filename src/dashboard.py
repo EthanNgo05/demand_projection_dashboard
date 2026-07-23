@@ -112,7 +112,7 @@ from dashboard_app.pipeline import (  # noqa: F401
     _supports_smoothing, load_pipeline, pipeline_path,
 )
 from dashboard_app.summaries import (  # noqa: F401
-    _format_generated_at, avg_window_phrase, customer_source_map, historical_window,
+    _format_generated_at, avg_window_phrase, historical_window,
     resolve_avg_col, source_map,
 )
 from dashboard_app.charts import (  # noqa: F401
@@ -126,7 +126,7 @@ from dashboard_app.datasources import (  # noqa: F401
     _active_in_list, _clean, _date_from_name, _raw_dir, _region_code, _this_week_start,
     compute_active_products, compute_discontinued_products,
     compute_discontinued_projections, compute_inactive_projections,
-    compute_missing_pos_orders, compute_missing_projections, discover_key_skus_file,
+    discover_key_skus_file,
     discover_price_file, discover_raw_files, fetch_plytix_from_url, load_key_skus,
     load_prices_from_bytes, load_prices_from_path, load_raw_from_bytes,
     load_raw_from_path, load_warehouse_from_paths, load_warehouse_from_uploads,
@@ -156,10 +156,6 @@ from dashboard_app.kpis import (  # noqa: F401
 )
 from dashboard_app.exceptions import (  # noqa: F401
     compute_exceptions, render_exceptions,
-)
-from dashboard_app.dataquality import (  # noqa: F401
-    render_discontinued_section, render_inactive_section, render_missing_pos_section,
-    render_missing_section,
 )
 
 
@@ -1200,7 +1196,10 @@ def main():
     # own table and stops before the single-model compute/charts/KPIs below.
     if view == EXCEPTIONS_VIEW:
         render_exceptions(
-            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P
+            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P,
+            warehouse_df=warehouse_df, plytix_df=plytix_df, check_ran=check_ran,
+            inactive_df=inactive_df, excluded_counts_by_key=excluded_counts_by_key,
+            disc_check_ran=disc_check_ran, discontinued_df=discontinued_df,
         )
         st.stop()
 
@@ -1519,34 +1518,10 @@ def main():
                 key="dl_by_customer",
             )
 
-    # ----- Excluded: active products projected in non-active regions --------
-    render_inactive_section(
-        view, region, check_ran, inactive_df,
-        excluded_counts_by_key, n_excluded_rows, today_str,
-    )
-
-    # ----- Active products MISSING projections in regions they ARE active in --
-    # Uses the warehouse projection grid (Data source panel), not the demand file.
-    missing_df = compute_missing_projections(warehouse_df, plytix_df, df, P)
-    # Per-(customer group, SKU) data source to label the missing table. The
-    # by-customer table (ALL CUSTOMERS view) carries every group; otherwise the
-    # single-group summary does.
-    cust_source = customer_source_map(by_cust) or customer_source_map(summary)
-    render_missing_section(
-        view, region, warehouse_df, check_ran, missing_df, today_str,
-        cust_source, P,
-    )
-
-    # ----- Active SKUs (incl. Parts) MISSING POS/Orders data where active ----
-    # Uses the demand file's full history (not the warehouse grid), so gone-silent
-    # channels and prolonged stockouts surface even with no recent data.
-    missing_pos_df = compute_missing_pos_orders(df, plytix_df, P, anchors=(lb, lcw, ffw))
-    render_missing_pos_section(view, region, missing_pos_df, today_str)
-
-    # ----- Discontinued/inactive products with projections ------------------
-    render_discontinued_section(
-        view, region, disc_check_ran, discontinued_df, today_str,
-    )
+    # The four data-quality sections (inactive-region / missing forecasts /
+    # missing POS-Orders / discontinued-with-forecasts) used to render here for
+    # every Quick Projections view. They now live in the Exceptions view (both
+    # tabs), rendered by render_exceptions above.
 
 
 def _run():
