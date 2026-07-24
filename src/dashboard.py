@@ -270,7 +270,7 @@ def main():
             padding: 0.2rem 0.9rem !important;
             font-size: 0.85rem !important;        /* smaller than the main tabs */
             font-weight: 500;
-            color: rgba(107,114,128,1);           /* muted inactive label */
+            color: rgba(148,163,184,1);           /* muted inactive label — slate-400, matches the main tabs and stays legible on the dark track */
         }}
         .st-key-quick_subview div[data-testid="stButtonGroup"] button p {{
             font-size: 0.85rem !important;        /* undo the 1.15rem global bump */
@@ -279,14 +279,22 @@ def main():
             color: inherit !important;
             border-bottom-color: transparent !important;
         }}
-        /* Active option: a filled chip that sits inside the track (theme surface
-           fill + soft shadow), replacing the underline used by the main tabs. */
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] {{
-            background: var(--background-color, #ffffff) !important;
-            color: inherit !important;
+        /* Active option: a solid chip filled with the theme accent (primaryColor),
+           label in the theme background color — an inverted pill. Both fill and
+           label are pinned to theme variables (not left to `inherit`), so contrast
+           inside the chip is guaranteed and the chip pops off the track in BOTH
+           modes: graphite fill + white label in light, near-white fill + dark label
+           in dark. Replaces the underline used by the main tabs. */
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"],
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"]:hover {{
+            background: var(--primary-color, #1f2937) !important;
+            color: var(--background-color, #ffffff) !important;
             font-weight: 600;
-            border-bottom-color: transparent !important;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.14);
+            border: 1px solid var(--primary-color, #1f2937) !important;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+        }}
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] p {{
+            color: var(--background-color, #ffffff) !important;   /* label text lives in a <p>; pin it too */
         }}
 
         /* Replace Streamlit's top-right "running" status graphic — which cycles
