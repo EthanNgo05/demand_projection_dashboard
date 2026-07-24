@@ -160,6 +160,25 @@ from dashboard_app.exceptions import (  # noqa: F401
 )
 
 
+# Bounds for the per-view session caches below. Entries are keyed per
+# (view, model, snapshot, …); the caps keep memory flat across a long session of
+# view-hopping while leaving plenty of headroom for a normal set of visited
+# views. Forecast results carry DataFrames (kept smaller), autofit params are a
+# few floats (kept larger).
+FC_CACHE_MAX = 16
+AUTOFIT_CACHE_MAX = 64
+
+
+def _bounded_put(store, key, value, cap):
+    """Insert ``key -> value`` into an insertion-ordered dict, evicting the
+    oldest entries once ``cap`` is exceeded. Popping the key first gives
+    refreshed keys move-to-end (LRU-ish) semantics."""
+    store.pop(key, None)
+    store[key] = value
+    while len(store) > cap:
+        del store[next(iter(store))]
+
+
 def main():
     st.set_page_config(
         page_title="Demand Projections", page_icon="📦", layout="wide",
@@ -976,7 +995,28 @@ def main():
     # surfaced in its own table below. The identical logic runs in the agent's
     # ingest node (agent/data_io.py is the single source of truth), so the
     # dashboard and the agent agree on which SKUs are in scope.
-    excl = data_io.apply_exclusions(df, plytix_df, P, anchors=(lb, lcw, ffw))
+    #
+    # The exclusion filters run full-frame groupbys/region-maps but their result
+    # is view-INDEPENDENT — identical for every customer view on the same
+    # snapshot/prices/model. Memoise it in session_state keyed on a lightweight
+    # signature (same len()-marker style used for price_marker below) so
+    # switching views doesn't re-run the groupbys every time. today_str pins the
+    # anchors (lb/lcw/ffw derive from it), so it isn't needed in the key.
+    excl_sig = (
+        today_str,
+        pipeline_path(),
+        None if df is None else len(df),
+        None if plytix_df is None else len(plytix_df),
+    )
+    if (
+        st.session_state.get("_excl_sig") == excl_sig
+        and "_excl_result" in st.session_state
+    ):
+        excl = st.session_state["_excl_result"]
+    else:
+        excl = data_io.apply_exclusions(df, plytix_df, P, anchors=(lb, lcw, ffw))
+        st.session_state["_excl_result"] = excl
+        st.session_state["_excl_sig"] = excl_sig
     df = excl.df
     check_ran = excl.active_check_ran
     inactive_df = excl.inactive_df
@@ -1237,31 +1277,28 @@ def main():
         if min_weeks_ok:
             min_weeks = mw0
 
-        # Autofit results are keyed to the model/view/snapshot they were
-        # fitted on; anything else falls back to the file defaults.
-        autofit = st.session_state.get("autofit_params")
-        autofit_active = bool(
-            autofit
-            and autofit.get("model") == pipeline_path()
-            and autofit.get("view") == view
-            and autofit.get("today") == today_str
-        )
+        # Autofit results are keyed per (model, view, snapshot) so revisiting an
+        # already-fitted view restores its params instantly — no re-backtest and
+        # no extra st.rerun(). Both maps are insertion-ordered dicts bounded by
+        # AUTOFIT_CACHE_MAX; autofit_tried also records failed attempts (best is
+        # None) so a backtest that can't score isn't retried on every rerun.
+        autofit_key = (pipeline_path(), view, today_str)
+        autofit_map = st.session_state.setdefault("autofit_params", {})
+        autofit_tried_map = st.session_state.setdefault("autofit_tried", {})
+        autofit = autofit_map.get(autofit_key)
+        autofit_active = autofit is not None
 
         # ----- Always autofit -------------------------------------------
         # Selecting a smoothing model (or a new view / snapshot) runs the
-        # backtest once per (model, view, snapshot) and uses the winning
-        # α/β/φ. The "autofit_tried" marker records that we've attempted
-        # it, so a failed backtest isn't retried on every rerun and a good
-        # fit isn't re-run needlessly.
-        autofit_key = (pipeline_path(), view, today_str)
-        autofit_tried = st.session_state.get("autofit_tried") == autofit_key
+        # backtest once per (model, view, snapshot) and uses the winning α/β/φ.
+        autofit_tried = autofit_key in autofit_tried_map
         if (
             smoothing_ok
             and _supports_autofit(P)
             and not autofit_active
             and not autofit_tried
         ):
-            st.session_state["autofit_tried"] = autofit_key
+            _bounded_put(autofit_tried_map, autofit_key, True, AUTOFIT_CACHE_MAX)
             with st.spinner("Tuning the forecast for this view…"):
                 best = run_autofit(df, view, today_ts, pipeline_path(), mw0)
             if best is not None:
@@ -1271,10 +1308,9 @@ def main():
                     view, best["alpha"], best["beta"], best["phi"],
                     best["mae"], best["baseline_mae"],
                 )
-                st.session_state["autofit_params"] = {
-                    **best, "model": pipeline_path(),
-                    "view": view, "today": today_str,
-                }
+                _bounded_put(autofit_map, autofit_key, dict(best), AUTOFIT_CACHE_MAX)
+                autofit = autofit_map[autofit_key]
+                autofit_active = True
                 # Recompute the forecast with the fitted values.
                 st.session_state["_do_recompute"] = True
                 st.rerun()
@@ -1297,24 +1333,31 @@ def main():
             st.toast(f"Forecast auto-tuned for this view{pct}.")
 
     # ----- Compute (with a progress bar) -----------------------------------
-    # The forecast is cached in session_state and only (re)built when:
-    #   * there is no result yet (first load), or
-    #   * a structural input changed (view / model / snapshot / data / prices), or
-    #   * autofit produced new parameters (it sets _do_recompute).
+    # Forecasts are cached PER VIEW in session_state (an insertion-ordered dict
+    # bounded by FC_CACHE_MAX), so switching back to an already-visited view is an
+    # instant lookup — no recompute, no full-DataFrame re-hashing by
+    # compute_view's @st.cache_data, and no re-running the compute_by_customer
+    # loop/progress bar. The key carries every structural input (view / model /
+    # snapshot / prices / data) PLUS the smoothing params, so it self-invalidates
+    # whenever any of them change (a new snapshot, a model swap, or autofit
+    # landing new α/β/φ all produce a fresh key -> a genuine recompute).
     price_marker = None if prices is None else int(len(prices))
-    structural_sig = (
-        view, pipeline_path(), today_str, price_marker, n_excluded_rows
+    cache_key = (
+        view, pipeline_path(), today_str, price_marker, n_excluded_rows,
+        alpha, beta, phi, min_weeks,
     )
 
     do_recompute = st.session_state.pop("_do_recompute", False)
-    stored = st.session_state.get("fc_result")
-    need_compute = (
-        stored is None
-        or st.session_state.get("fc_structural") != structural_sig
-        or do_recompute
-    )
+    fc_cache = st.session_state.setdefault("fc_cache", {})
+    if do_recompute:
+        fc_cache.pop(cache_key, None)
 
-    if need_compute:
+    if cache_key in fc_cache:
+        # Move-to-end so a revisited view isn't the next eviction victim.
+        stored = fc_cache.pop(cache_key)
+        fc_cache[cache_key] = stored
+        summary, weekly, agg, by_cust = stored
+    else:
         prog = st.progress(0.0, text="Preparing…")
         try:
             prog.progress(0.15, text="Building forecast for this view…")
@@ -1343,10 +1386,9 @@ def main():
         finally:
             prog.empty()
 
-        st.session_state["fc_result"] = (summary, weekly, agg, by_cust)
-        st.session_state["fc_structural"] = structural_sig
-    else:
-        summary, weekly, agg, by_cust = stored
+        _bounded_put(
+            fc_cache, cache_key, (summary, weekly, agg, by_cust), FC_CACHE_MAX
+        )
 
     if summary is None or summary.empty:
         st.error(

@@ -135,12 +135,20 @@ def test_smoothing_params_survive_model_round_trip():
     so returning to the smoothing model saw "already tried", skipped the
     backtest, and computed the forecast with file-default α/β/φ instead of the
     tuned ones — changing the displayed forecast for an unchanged view/snapshot.
+
+    ``autofit_params`` is now a per-(model, view, snapshot) map — its keys are
+    ``(pipeline_path, view, today_str)`` tuples — so "has Holt params" means some
+    key carries the Holt pipeline path.
     """
     import dashboard
 
     HOLT = "Holt's (double) exponential smoothing"
     OTHER = "8-Week Moving Average"
     assert HOLT in dashboard.MODEL_OPTIONS and OTHER in dashboard.MODEL_OPTIONS
+
+    def _has_holt_params(state):
+        params = state["autofit_params"] if "autofit_params" in state else {}
+        return any(key[0] == dashboard.MODEL_OPTIONS[HOLT] for key in params)
 
     at = AppTest.from_file(DASHBOARD, default_timeout=120).run()
     assert not at.exception
@@ -149,10 +157,9 @@ def test_smoothing_params_survive_model_round_trip():
     # The model widget is now a top-of-page dropdown (selectbox), not a radio.
     at.selectbox(key="model_choice").set_value(HOLT).run()
     assert not at.exception
-    assert "autofit_params" in at.session_state, (
+    assert _has_holt_params(at.session_state), (
         "autofit did not run on first Holt selection"
     )
-    assert at.session_state["autofit_params"]["model"] == dashboard.MODEL_OPTIONS[HOLT]
 
     # Leave to another model, then come back to Holt.
     at.selectbox(key="model_choice").set_value(OTHER).run()
@@ -162,11 +169,10 @@ def test_smoothing_params_survive_model_round_trip():
 
     # Returning to Holt must re-establish autofit params for this view; otherwise
     # the forecast is silently computed with file defaults -> a different number.
-    assert "autofit_params" in at.session_state, (
+    assert _has_holt_params(at.session_state), (
         "autofit params lost after a model round-trip: the forecast falls back "
         "to file-default alpha/beta/phi and changes for an unchanged view"
     )
-    assert at.session_state["autofit_params"]["model"] == dashboard.MODEL_OPTIONS[HOLT]
 
 
 @needs_data
