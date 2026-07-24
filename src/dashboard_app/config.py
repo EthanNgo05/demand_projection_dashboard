@@ -16,6 +16,11 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # for DATA that stays at the repo root.
 REPO_ROOT = os.path.dirname(HERE)
 
+# The simplehuman brand logo, bundled as a committed asset (assets/ sits beside
+# the code and deploys to Streamlit Cloud). Used as the browser favicon and the
+# on-page header mark, replacing the old 📦 emoji.
+LOGO_PATH = os.path.join(REPO_ROOT, "assets", "sh_logo.jpg")
+
 # The forecasting models on offer. Each entry maps the label shown in the
 # sidebar toggle to the pipeline file implementing it. When a DEMAND_PIPELINE
 # env var is set, that file is offered as an extra option and is the default.

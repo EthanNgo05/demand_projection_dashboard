@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import time
+import base64
 import datetime
 import glob
 import html
@@ -101,7 +102,7 @@ if not logger.handlers:
 # --------------------------------------------------------------------------- #
 from dashboard_app.config import (  # noqa: F401
     ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID, C_ORIGINAL, C_UPDATED,
-    DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
+    DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, LOGO_PATH, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
     PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
     SCOPE_LABELS,
     _ENV_PIPELINE,
@@ -169,6 +170,19 @@ FC_CACHE_MAX = 16
 AUTOFIT_CACHE_MAX = 64
 
 
+@st.cache_data(show_spinner=False)
+def _logo_data_uri():
+    """Return the simplehuman logo as a ``data:`` URI for inline <img> use, or
+    None if the bundled asset is missing/unreadable (the header then degrades to
+    a plain title). Cached so the small file is read+encoded once per session."""
+    try:
+        with open(LOGO_PATH, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+    except OSError:
+        return None
+
+
 def _bounded_put(store, key, value, cap):
     """Insert ``key -> value`` into an insertion-ordered dict, evicting the
     oldest entries once ``cap`` is exceeded. Popping the key first gives
@@ -180,8 +194,11 @@ def _bounded_put(store, key, value, cap):
 
 
 def main():
+    # Browser-tab favicon: the simplehuman logo when the bundled asset is present,
+    # otherwise a plain fallback so a missing file never breaks app startup.
+    page_icon = LOGO_PATH if os.path.exists(LOGO_PATH) else "◾"
     st.set_page_config(
-        page_title="Demand Projections", page_icon="📦", layout="wide",
+        page_title="Demand Projections", page_icon=page_icon, layout="wide",
         initial_sidebar_state="collapsed",
     )
 
@@ -238,7 +255,7 @@ def main():
         div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] {{
             color: inherit !important;
             font-weight: 700;
-            border-bottom-color: var(--primary-color, #1f2937) !important;
+            border-bottom-color: var(--primary-color, #000000) !important;
         }}
 
         /* ---- Nested "Quick Projections" sub-selector --------------------- */
@@ -270,7 +287,7 @@ def main():
             padding: 0.2rem 0.9rem !important;
             font-size: 0.85rem !important;        /* smaller than the main tabs */
             font-weight: 500;
-            color: rgba(107,114,128,1);           /* muted inactive label */
+            color: rgba(148,163,184,1);           /* muted inactive label — slate-400, matches the main tabs and stays legible on the dark track */
         }}
         .st-key-quick_subview div[data-testid="stButtonGroup"] button p {{
             font-size: 0.85rem !important;        /* undo the 1.15rem global bump */
@@ -279,14 +296,22 @@ def main():
             color: inherit !important;
             border-bottom-color: transparent !important;
         }}
-        /* Active option: a filled chip that sits inside the track (theme surface
-           fill + soft shadow), replacing the underline used by the main tabs. */
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] {{
-            background: var(--background-color, #ffffff) !important;
-            color: inherit !important;
+        /* Active option: a solid chip filled with the theme accent (primaryColor),
+           label in the theme background color — an inverted pill. Both fill and
+           label are pinned to theme variables (not left to `inherit`), so contrast
+           inside the chip is guaranteed and the chip pops off the track in BOTH
+           modes: graphite fill + white label in light, near-white fill + dark label
+           in dark. Replaces the underline used by the main tabs. */
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"],
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"]:hover {{
+            background: var(--primary-color, #000000) !important;
+            color: var(--background-color, #ffffff) !important;
             font-weight: 600;
-            border-bottom-color: transparent !important;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.14);
+            border: 1px solid var(--primary-color, #000000) !important;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+        }}
+        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] p {{
+            color: var(--background-color, #ffffff) !important;   /* label text lives in a <p>; pin it too */
         }}
 
         /* Replace Streamlit's top-right "running" status graphic — which cycles
@@ -497,7 +522,27 @@ def main():
         """
 
     P = load_pipeline(pipeline_path())
-    st.title("📦 Demand Projection Dashboard")
+    # Brand header: the simplehuman logo mark left of the H1 title, replacing the
+    # old 📦 emoji. Rendered as one flex row (logo <img> + <h1>) rather than
+    # st.logo() — the CSS above zeroes the Streamlit header band where st.logo()
+    # would render, clipping it. The <h1> still picks up the theme's heading
+    # styling. Degrades to a plain title if the bundled logo asset is missing.
+    _logo_uri = _logo_data_uri()
+    if _logo_uri:
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:0.65rem; margin:0 0 0.25rem 0;">
+              <img src="{_logo_uri}" alt="simplehuman"
+                   style="height:44px; width:auto; display:block; border-radius:0.25rem;"/>
+              <h1 style="margin:0; padding:0; font-size:2.25rem; font-weight:700; line-height:1.1;">
+                Demand Projection Dashboard
+              </h1>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.title("Demand Projection Dashboard")
     # Header caption: the pipeline can supply its own (DASHBOARD_CAPTION, e.g.
     # the XGBoost pipeline); otherwise fall back to the smoothing-aware blurbs.
     # It describes the *selected* model, so it's rendered next to the Forecasting
@@ -612,6 +657,12 @@ def main():
     # first) though it executes here — before the region selectors and model
     # panel that depend on the `df` it loads.
     with data_source_slot:
+        # Breathing room between the page title/brand header and the data
+        # controls below, so the "Sync from Data Warehouse" button isn't crowded
+        # up against the title. Kept here (top of the first-rendered block) so the
+        # gap is consistent whether the header shows the logo row or the plain
+        # title fallback.
+        st.markdown("<div style='height:1.1rem'></div>", unsafe_allow_html=True)
         files = discover_raw_files()
         df = None
         today_str = None
