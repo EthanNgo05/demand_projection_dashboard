@@ -91,18 +91,21 @@ def _clear_lock(lock_path):
         pass
 
 
-def _refresh_state(lock_path, completed_since, label):
+def _refresh_state(lock_path, completed_since, label,
+                   stale_seconds=REFRESH_STALE_SECONDS):
     """Shared lock state-machine: (running, started_str) for a background pull.
 
     Self-healing, so no process has to clean up after itself:
       * ``completed_since(lock_mtime)`` says whether the pull's output has
         landed since the lock appeared — if so, clear the lock and report idle.
-      * If the lock is older than REFRESH_STALE_SECONDS with no output, the
+      * If the lock is older than ``stale_seconds`` with no output, the
         pull crashed/was killed — clear the lock so the button re-enables.
 
     What "output has landed" means differs per pull (the demand snapshot is one
     atomic workbook; a warehouse snapshot is a five-file set), which is exactly
-    the ``completed_since`` seam.
+    the ``completed_since`` seam. ``stale_seconds`` defaults to the ~10-minute
+    demand/warehouse window but is overridable for a faster pull (the key-SKU
+    list) so a failed run re-enables its button sooner.
     """
     if not os.path.exists(lock_path):
         return False, None
@@ -112,9 +115,9 @@ def _refresh_state(lock_path, completed_since, label):
         _clear_lock(lock_path)
         return False, None
 
-    if time.time() - lock_mtime > REFRESH_STALE_SECONDS:
+    if time.time() - lock_mtime > stale_seconds:
         logger.warning("%s refresh lock is stale (>%ds); clearing it.",
-                       label, REFRESH_STALE_SECONDS)
+                       label, stale_seconds)
         _clear_lock(lock_path)
         return False, None
 
@@ -270,6 +273,65 @@ def start_warehouse_refresh():
         [],
         {"WAREHOUSE_RAW_DIR": wh_dir},
         "Warehouse refresh",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Manual key-SKU list refresh                                                 #
+# --------------------------------------------------------------------------- #
+# Same lock-file coordination as the demand refresh: extract_key_skus.py is a
+# fast single-file atomic pull (raw_inputs/key_skus/key_skus_<date>.xlsx), so
+# completion is the same "any newer file since the lock" shape as the demand
+# snapshot. This backs the "Fetch key-SKU list" button on the empty Key SKUs
+# watchlist tab and rides along with the main "Sync from Data Warehouse" button.
+KEY_SKUS_EXTRACT_SCRIPT = os.path.join(HERE, "extract_key_skus.py")
+# The pull is fast (a single DISTINCT SKU query), so a shorter stale window than
+# the demand/warehouse 30 min re-enables the button quickly if it fails.
+KEY_SKUS_STALE_SECONDS = 5 * 60
+
+
+def _key_skus_dir():
+    """Folder the extract writes to and the dashboard discovers from."""
+    return os.path.join(REPO_ROOT, "raw_inputs", "key_skus")
+
+
+def _key_skus_lock_path():
+    """Lock for an in-flight key-SKU pull, in the key-SKU folder.
+
+    ``.refresh.lock`` isn't matched by the ``key_skus_*.xlsx`` discovery glob,
+    so it never shows up as a list file.
+    """
+    return os.path.join(_key_skus_dir(), ".refresh.lock")
+
+
+def key_skus_refresh_in_progress():
+    """(running, started_str): is a background key-SKU pull active."""
+    def _completed(lock_mtime):
+        path = data_io.discover_key_skus_file()
+        return bool(path) and os.path.getmtime(path) >= lock_mtime
+
+    return _refresh_state(_key_skus_lock_path(), _completed, "Key SKUs",
+                          stale_seconds=KEY_SKUS_STALE_SECONDS)
+
+
+def start_key_skus_refresh():
+    """Launch extract_key_skus.py in the background. Returns (ok, message).
+
+    The extract's default output dir already matches data_io.key_skus_glob(),
+    so no raw-dir env pin is needed — it writes exactly where the dashboard
+    looks.
+    """
+    running, started = key_skus_refresh_in_progress()
+    if running:
+        return False, f"A key-SKU refresh is already running (started {started})."
+
+    os.makedirs(_key_skus_dir(), exist_ok=True)
+    return _launch_refresh(
+        _key_skus_lock_path(),
+        KEY_SKUS_EXTRACT_SCRIPT,
+        [],
+        {},
+        "Key-SKU refresh",
     )
 
 
