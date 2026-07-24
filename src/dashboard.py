@@ -742,7 +742,10 @@ def main():
                 )
             override = st.toggle(
                 "Manually override data",
-                value=False,
+                # Default on only when there's no snapshot on disk yet, so a
+                # first-time user still gets the upload box; otherwise off so
+                # the manual pickers stay hidden until explicitly requested.
+                value=not files,
                 key="data_override",
                 help="""
         **Off (default)**:
@@ -833,7 +836,7 @@ def main():
         # forbids *nesting* expanders, but re-entering the same expander via
         # `with data_exp:` just appends to it, which is allowed.
         data_exp = None
-        if override or not files:
+        if override:
             data_exp = st.expander(
                 "Data files (snapshot / prices / warehouse)", expanded=not files
             )
@@ -858,9 +861,9 @@ def main():
             with data_exp:
                 st.info("Upload the Demand Planning Details and Plytix files below.")
 
-        # Show the upload box when overriding, and always when there's no
-        # on-disk snapshot yet (otherwise a first-time user can't get started).
-        if override or not files:
+        # Show the upload box only when overriding. The toggle defaults on when
+        # there's no on-disk snapshot yet, so a first-time user still lands here.
+        if override:
             with data_exp:
                 st.markdown("**Demand Planning Details — PowerBI export**")
                 up = st.file_uploader("all_demand_projections_*.xlsx", type=["xlsx"])
