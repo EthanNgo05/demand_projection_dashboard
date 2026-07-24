@@ -1,9 +1,10 @@
 # Streamlit theme for the Demand Projection Dashboard.
 #
 # Purely visual — no effect on forecasting logic, data flow, or computed values.
-# Direction: simplehuman-minimalist. Widget accents (buttons, active-tab underline,
-# focus rings, links) use a neutral graphite/near-black; the blue/orange/grey scheme
-# stays only inside the charts (defined in src/dashboard_app/config.py).
+# Direction: simplehuman-minimalist, matching simplehuman.com's stark black-on-white look.
+# Widget accents (buttons, active-tab underline, focus rings, links) are true black in light
+# mode and near-white when inverted for dark mode; the blue/orange/grey scheme stays only
+# inside the charts (defined in src/dashboard_app/config.py).
 #
 # Two modes are defined: [theme] is the light theme; [theme.dark] overrides it when the
 # viewer picks Dark (Settings -> Appearance). Chart text/grid colors adapt separately in
@@ -12,13 +13,13 @@
 [theme]
 base = "light"
 
-# Minimalist graphite accent (buttons fill, focus rings, active tab, links).
-primaryColor = "#1f2937"          # slate-800 / graphite
-linkColor = "#1f2937"
+# True-black accent (buttons fill, focus rings, active tab, links) — matches simplehuman.com.
+primaryColor = "#000000"          # true black
+linkColor = "#000000"
 
 backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f4f4f5"  # zinc-100 — fills widgets + KPI stat-tile cards
-textColor = "#18181b"                 # near-black ink
+textColor = "#000000"                 # black ink
 borderColor = "#e4e4e7"               # zinc-200 — soft element borders
 showWidgetBorder = true
 
@@ -41,8 +42,8 @@ chartCategoricalColors = ["#2563eb", "#ea580c", "#9ca3af"]
 
 [theme.dark]
 # Dark surface tuned to match the dataviz-validated chart surface (~#1a1a19).
-primaryColor = "#e5e7eb"          # light graphite / near-white inverted accent
-linkColor = "#d4d4d8"
+primaryColor = "#f5f5f5"          # near-white inverted accent (true black flips to white)
+linkColor = "#e5e5e5"
 
 backgroundColor = "#141416"
 secondaryBackgroundColor = "#1f1f23"  # lighter graphite — card / widget fill on dark
