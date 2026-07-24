@@ -352,7 +352,7 @@ def _render_key_skus_fetch_prompt():
         "No key-SKU list yet. Fetch the current list of key items from the "
         "data warehouse to populate this watchlist."
     )
-    if st.button("⬇️ Fetch key-SKU list", key="key_skus_fetch", type="primary"):
+    if st.button("🔄 Fetch key-SKU list", key="key_skus_fetch"):
         ok, msg = start_key_skus_refresh()
         if ok:
             st.success("Fetching the key-SKU list — running in the background.")
