@@ -423,7 +423,8 @@ def _render_data_quality_expanders(
 def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors, P=None,
                       *, warehouse_df=None, plytix_df=None, check_ran=False,
                       inactive_df=None, excluded_counts_by_key=None,
-                      disc_check_ran=False, discontinued_df=None):
+                      disc_check_ran=False, discontinued_df=None,
+                      allocation_pairs=None):
     """Render the EXCEPTIONS_VIEW. Mirrors _render_best_model_combined's call
     signature so main() can dispatch it the same way; the page title is already
     drawn by main(), so we start at the subheader.
@@ -455,7 +456,9 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     # warehouse marker invalidates the cache when the warehouse grid is re-uploaded.
     price_marker = None if prices is None else int(len(prices))
     wh_marker = None if warehouse_df is None else int(len(warehouse_df))
-    sig = (EXCEPTIONS_VIEW_SIG, today_str, price_marker, n_excluded_rows, wh_marker)
+    alloc_marker = None if allocation_pairs is None else len(allocation_pairs)
+    sig = (EXCEPTIONS_VIEW_SIG, today_str, price_marker, n_excluded_rows,
+           wh_marker, alloc_marker)
     if st.session_state.get("exceptions_structural") != sig:
         with st.spinner("Scanning for exceptions…"):
             frame = compute_exceptions(df, today_ts, prices, P)
@@ -466,7 +469,7 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
             # from the exceptions frame (the model summary that feeds it in the
             # single-model views isn't computed in this model-agnostic view).
             st.session_state["exceptions_missing_df"] = compute_missing_projections(
-                warehouse_df, plytix_df, df, P
+                warehouse_df, plytix_df, df, P, allocation_pairs
             )
             st.session_state["exceptions_missing_pos_df"] = compute_missing_pos_orders(
                 df, plytix_df, P, anchors=anchors

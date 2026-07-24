@@ -171,7 +171,9 @@ def render_missing_section(view, region, warehouse_df, check_ran, missing_df,
     st.caption(
         f"Flagged{scope_note}: {n_skus:,} distinct SKUs. Each is an active "
         "product (Plytix) with no projection for one or more of the coming 15 "
-        "weeks in a region (US/CA/EU/JP/AU) it IS 'Active in'."
+        "weeks in a region (US/CA/EU/JP/AU) it IS 'Active in'. Combos not in the "
+        "current allocation — no POS, orders, inventory, or promo in the past 3 "
+        "months — are excluded."
     )
 
     show = table_df[[

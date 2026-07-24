@@ -271,3 +271,107 @@ def test_history_only_pair_flagged_across_forward_window(tmp_path):
     flagged = missing[missing["SKU"] == "SKU1"]
     assert len(flagged) == 1
     assert flagged["First_WeekDate"].iloc[0] == W1  # first *future* week
+
+
+# --------------------------------------------------------------------------- #
+# Current-allocation gate (active_allocation_pairs + compute_missing_projections)
+# --------------------------------------------------------------------------- #
+ALLOC_SIGNAL_COLS = data_io.ALLOCATION_SIGNAL_COLS
+RECENT = TODAY - pd.Timedelta(weeks=2)      # inside the trailing-3-month window
+STALE = TODAY - pd.Timedelta(weeks=30)      # ~7 months back -> outside the window
+
+
+def raw_demand_frame(rows):
+    """Build a raw (pre-_clean) demand frame with the PowerBI column names.
+
+    ``rows`` is a list of dicts with keys sku/cust/week plus any signal column
+    (POS, On Hand, ...); unspecified signal columns default to 0.
+    """
+    records = []
+    for r in rows:
+        rec = {
+            "'Demand'[DisplaySKU]": r["sku"],
+            "Custnmbr": r["cust"],
+            "WeekDate": r["week"],
+        }
+        for c in ALLOC_SIGNAL_COLS:
+            rec[c] = r.get(c, 0)
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
+# ANCHOR/CUSTZ is fully projected across W1..W3 in every gate test below: it
+# populates the forward week-union so the tested combos (projected at W1 only)
+# read NaN at W2/W3 and get flagged. ANCHOR itself is never missing -> never in
+# the output, and is absent from the demand frames so the gate ignores it.
+ANCHOR_ROWS = [
+    ["ANCHOR", "CUSTZ", W1, 5], ["ANCHOR", "CUSTZ", W2, 5], ["ANCHOR", "CUSTZ", W3, 5],
+]
+
+
+def test_allocation_gate_drops_combos_with_no_recent_real_signal(tmp_path):
+    # Both CUSTA and CUSTB are missing W2/W3 -> both flagged without a gate.
+    # CUSTA has a recent POS (in allocation); CUSTB only had inventory ~7 months
+    # ago (outside the trailing-3-month window) -> dropped once the gate applies.
+    path = write_long_export(
+        tmp_path / "US_warehouse_projections_2026-07-14.xlsx",
+        [["SKU1", "CUSTA", W1, 20], ["SKU1", "CUSTB", W1, 20], *ANCHOR_ROWS],
+    )
+    projections = data_io.combine_warehouse_projections([(path, path)])
+    plytix = plytix_frame(["SKU1", "ANCHOR"])
+
+    ungated = data_io.compute_missing_projections(projections, plytix, None, None)
+    assert set(ungated["Customer"]) == {"CUSTA", "CUSTB"}  # legacy behaviour
+
+    raw = raw_demand_frame([
+        {"sku": "SKU1", "cust": "CUSTA", "week": RECENT, "POS": 3},
+        {"sku": "SKU1", "cust": "CUSTB", "week": STALE, "On Hand": 5},
+    ])
+    pairs = data_io.active_allocation_pairs(raw)
+    gated = data_io.compute_missing_projections(
+        projections, plytix, None, None, allocation_pairs=pairs)
+    assert set(gated["Customer"]) == {"CUSTA"}
+
+
+def test_allocation_gate_ignores_bare_projection(tmp_path):
+    # A combo whose only demand-frame trace is real inventory stays; the
+    # GALLAF case (a live projection but zero real signal) is dropped — a bare
+    # projection is not one of ALLOCATION_SIGNAL_COLS, so it never enters the set.
+    path = write_long_export(
+        tmp_path / "US_warehouse_projections_2026-07-14.xlsx",
+        [["REAL", "CUSTA", W1, 20], ["PHANTOM", "CUSTB", W1, 20], *ANCHOR_ROWS],
+    )
+    projections = data_io.combine_warehouse_projections([(path, path)])
+    plytix = plytix_frame(["REAL", "PHANTOM", "ANCHOR"])
+
+    # PHANTOM/CUSTB has recent rows but only zero signal columns (mimicking a
+    # projection-only carrier row); REAL/CUSTA has a recent on-order quantity.
+    raw = raw_demand_frame([
+        {"sku": "REAL", "cust": "CUSTA", "week": RECENT, "On Order": 4},
+        {"sku": "PHANTOM", "cust": "CUSTB", "week": RECENT},  # all signals 0
+    ])
+    pairs = data_io.active_allocation_pairs(raw)
+    gated = data_io.compute_missing_projections(
+        projections, plytix, None, None, allocation_pairs=pairs)
+    assert set(gated["SKU"]) == {"REAL"}
+
+
+def test_active_allocation_pairs_none_when_columns_missing():
+    # An older snapshot without the inventory columns -> None -> callers skip the
+    # gate rather than dropping everything.
+    raw = pd.DataFrame({
+        "'Demand'[DisplaySKU]": ["SKU1"],
+        "Custnmbr": ["CUSTA"],
+        "WeekDate": [RECENT],
+        "Projection": [10],  # no real-signal columns present
+    })
+    assert data_io.active_allocation_pairs(raw) is None
+
+
+def test_active_allocation_pairs_normalizes_keys():
+    # Padded + starred SKU and padded customer must match the warehouse grid's
+    # normalized keys (strip + rstrip '*').
+    raw = raw_demand_frame([
+        {"sku": "  SKU1*", "cust": "CUSTA   ", "week": RECENT, "POS": 2},
+    ])
+    assert data_io.active_allocation_pairs(raw) == {("SKU1", "CUSTA")}

@@ -40,12 +40,23 @@ if __name__ == '__main__':
     for loc in sorted(projections["Region Code"].unique()):
         print(f"Cleaned {loc}: {(projections['Region Code'] == loc).sum()} rows")
 
-    # 2) Active SKUs missing future projections in regions they ARE 'Active in'.
+    # 2) Current-allocation gate: drop combos with no real demand signal in the
+    #    trailing 3 months (phantom rows the warehouse look-back keeps alive via a
+    #    stale projection). Built from the newest raw demand snapshot, which still
+    #    carries the inventory columns _clean drops. Skipped (None) if no snapshot
+    #    is on disk, matching the dashboard's behaviour on older files.
+    allocation_pairs = None
+    raw_files = data_io.discover_raw_files()
+    if raw_files:
+        raw = data_io.read_raw_frame(raw_files[0][1])
+        allocation_pairs = data_io.active_allocation_pairs(raw)
+
+    # 3) Active SKUs missing future projections in regions they ARE 'Active in'.
     #    df/P are only used to add a Region label (for the dashboard); the batch
     #    output doesn't need it, so pass None and drop the column.
     plytix_df = data_io.read_plytix(PLYTIX_FILE)
     missing = data_io.compute_missing_projections(
-        projections, plytix_df, df=None, P=None
+        projections, plytix_df, df=None, P=None, allocation_pairs=allocation_pairs
     ).drop(columns=["Region"])
 
     output_fname = f"{OUTPUT_PATH}/active_missing_projections_{TODAY}.xlsx"

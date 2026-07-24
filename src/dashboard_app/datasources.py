@@ -98,6 +98,7 @@ compute_discontinued_products = data_io.compute_discontinued_products
 compute_discontinued_projections = data_io.compute_discontinued_projections
 compute_missing_projections = data_io.compute_missing_projections
 compute_missing_pos_orders = data_io.compute_missing_pos_orders
+active_allocation_pairs = data_io.active_allocation_pairs
 
 
 # Cleaning lives in agent/data_io.py (shared with the agent's ingest node);
@@ -144,6 +145,27 @@ def load_warehouse_from_uploads(items):
     return data_io.combine_warehouse_projections(
         [(BytesIO(data), name) for name, data in items]
     )
+
+
+@st.cache_data(show_spinner=False)
+def load_allocation_pairs_from_path(path, _mtime, _week_key):
+    """(SKU, Customer) combos in the current allocation, read from disk.
+
+    Reads the RAW demand snapshot (the inventory columns _clean drops still live
+    there) and returns data_io.active_allocation_pairs. Used to drop phantom
+    combos from the missing-projections table. ``_mtime`` busts the cache on a
+    new snapshot; ``_week_key`` (current week-start ISO) busts it weekly so the
+    trailing-3-month window rolls forward.
+    """
+    raw = data_io.read_raw_frame(path)  # Parquet sidecar when present, else xlsx
+    return data_io.active_allocation_pairs(raw)
+
+
+@st.cache_data(show_spinner=False)
+def load_allocation_pairs_from_bytes(_data, name, _week_key):
+    """(SKU, Customer) combos in the current allocation, from uploaded bytes."""
+    raw = pd.read_excel(BytesIO(_data), header=2)
+    return data_io.active_allocation_pairs(raw)
 
 
 @st.cache_data(show_spinner="Loading list prices…")

@@ -797,6 +797,17 @@ MISSING_COLS = [
     "First_WeekDate", "Last_WeekDate",
 ]
 
+# Real-world demand signals that prove a SKU x customer is in the live
+# assortment. A bare Projection is excluded on purpose: planners leave stale
+# projections on lapsed combos (see compute_missing_projections), so a
+# projection alone does not mean the combo still ships. Raw-snapshot column
+# names (pre-_clean); _clean drops everything but POS/Orders/Projection, so the
+# allocation gate reads the raw frame instead.
+ALLOCATION_SIGNAL_COLS = [
+    "POS", "Promo Qty", "On Hand", "On Order", "Sum of Quantity",
+    "In Stock", "Store Count",
+]
+
 
 def _warehouse_dir(warehouse_dir=None):
     """Resolve the folder holding the warehouse projection exports.
@@ -1057,7 +1068,54 @@ def combine_warehouse_projections(sources):
     return pd.concat(frames, ignore_index=True)
 
 
-def compute_missing_projections(projections, plytix_df, df, P):
+def active_allocation_pairs(raw_df, months=3):
+    """(SKU, Customer) combos with any real demand signal in the trailing window.
+
+    "In the current allocation" = the combo shows a non-zero real-world signal
+    (POS, Orders, on-hand/on-order inventory, in-stock, store count, or promo;
+    see ALLOCATION_SIGNAL_COLS) within the past ``months`` months. A bare
+    Projection deliberately does NOT count — planners leave stale/short
+    projections on combos a retailer no longer stocks, and those are exactly the
+    phantom rows compute_missing_projections should stop flagging as "missing".
+
+    Operates on the RAW (pre-_clean) demand frame, which still carries the
+    inventory columns _clean drops. Keys are normalized to match the warehouse
+    grid (SKU whitespace-stripped and trailing '*' dropped; Customer stripped).
+    The window floor mirrors the sibling missing-POS/Orders check: the current
+    week's Sunday minus ``months`` months (via _this_week_start()).
+
+    Returns a ``set`` of ``(SKU, Customer)`` tuples, or ``None`` when the frame
+    lacks the columns the gate needs (an older snapshot) — callers treat ``None``
+    as "don't filter", preserving the pre-gate behaviour.
+    """
+    if raw_df is None or raw_df.empty:
+        return None
+    sku_col = "'Demand'[DisplaySKU]"
+    if sku_col not in raw_df.columns or "Custnmbr" not in raw_df.columns \
+            or "WeekDate" not in raw_df.columns:
+        return None
+    signal_cols = [c for c in ALLOCATION_SIGNAL_COLS if c in raw_df.columns]
+    if not signal_cols:
+        return None
+
+    d = raw_df[[sku_col, "Custnmbr", "WeekDate", *signal_cols]].copy()
+    d["SKU"] = d[sku_col].astype(str).str.strip().str.rstrip("*")
+    d["Customer"] = d["Custnmbr"].astype(str).str.strip()
+    d["WeekDate"] = pd.to_datetime(d["WeekDate"], errors="coerce")
+
+    floor = _this_week_start() - pd.DateOffset(months=months)
+    d = d[d["WeekDate"] >= floor]
+    if d.empty:
+        return set()
+
+    signal = (
+        d[signal_cols].apply(pd.to_numeric, errors="coerce").abs().sum(axis=1)
+    )
+    d = d[signal > 0]
+    return set(zip(d["SKU"], d["Customer"]))
+
+
+def compute_missing_projections(projections, plytix_df, df, P, allocation_pairs=None):
     """Active SKUs missing future projections in regions they ARE 'Active in'.
 
     Mirrors active_missing_projections.py: from the combined warehouse grid
@@ -1068,6 +1126,12 @@ def compute_missing_projections(projections, plytix_df, df, P):
     region_for_group) is added from ``df``'s customer groupings so a
     by-customer-group view can scope to its own region, matching the sibling
     excluded tables.
+
+    ``allocation_pairs`` (from active_allocation_pairs) optionally restricts the
+    result to SKU×customer combos genuinely in the current allocation — those
+    with a real demand signal in the trailing 3 months — dropping phantom rows
+    whose only trace is a stale/short projection the warehouse look-back keeps
+    alive. ``None`` (the default) skips this gate and flags every missing cell.
 
     Returns a table (columns = MISSING_COLS), empty if none or inputs missing.
     """
@@ -1102,6 +1166,18 @@ def compute_missing_projections(projections, plytix_df, df, P):
     m = m[(m["WeekDate"] > today) & (m["WeekDate"] <= cutoff)]
     if m.empty:
         return pd.DataFrame(columns=MISSING_COLS)
+
+    # Drop combos not in the current allocation (no real demand signal in the
+    # trailing window) — they are only flagged because the warehouse look-back
+    # keeps a stale/short projection alive. ``None`` = no gate (legacy behaviour).
+    if allocation_pairs is not None:
+        keep = [
+            (str(s), str(c)) in allocation_pairs
+            for s, c in zip(m["SKU"], m["Customer"])
+        ]
+        m = m[keep]
+        if m.empty:
+            return pd.DataFrame(columns=MISSING_COLS)
 
     g = m.groupby(["SKU", "Region Code", "Customer"], as_index=False).agg(
         First_WeekDate=("WeekDate", "min"),
