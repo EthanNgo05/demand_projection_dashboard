@@ -35,6 +35,10 @@ from dashboard_app.datasources import (
     discover_key_skus_file,
     load_key_skus,
 )
+from dashboard_app.refresh import (
+    key_skus_refresh_in_progress,
+    start_key_skus_refresh,
+)
 from dashboard_app.summaries import customer_source_map
 from dashboard_app.tables import render_filtered_table
 
@@ -328,15 +332,41 @@ def _render_all_exceptions_tab(frame, P, today_str):
              label="Overstocked Exceptions table")
 
 
+def _render_key_skus_fetch_prompt():
+    """Empty-state prompt for the Key SKUs tab: a button that pulls the key-SKU
+    list from the data warehouse in the background (extract_key_skus.py), so
+    planners never have to run a terminal command. Mirrors the demand refresh
+    button's running/idle states — once the pull's file lands, the tab
+    re-discovers it and renders the watchlist on the next run."""
+    running, started = key_skus_refresh_in_progress()
+    if running:
+        st.info(
+            f"Fetching the key-SKU list from the data warehouse… "
+            f"(started {started}). This usually takes under a minute."
+        )
+        if st.button("Check for the list", key="key_skus_check"):
+            st.rerun()
+        return
+
+    st.info(
+        "No key-SKU list yet. Fetch the current list of key items from the "
+        "data warehouse to populate this watchlist."
+    )
+    if st.button("⬇️ Fetch key-SKU list", key="key_skus_fetch", type="primary"):
+        ok, msg = start_key_skus_refresh()
+        if ok:
+            st.success("Fetching the key-SKU list — running in the background.")
+            st.rerun()
+        else:
+            st.warning(msg)
+
+
 def _render_key_skus_tab(frame, P, today_str):
     """The Key SKUs watchlist tab: every key SKU (from extract_key_skus.py) with
     its status, no threshold filtering — a always-on watchlist of important items."""
     path = discover_key_skus_file()
     if not path:
-        st.info(
-            "No key-SKU list found yet. Run `python src/extract_key_skus.py` "
-            "(or wait for the nightly refresh) to populate this tab."
-        )
+        _render_key_skus_fetch_prompt()
         return
     key_skus = load_key_skus(path, os.path.getmtime(path))
     if not key_skus:

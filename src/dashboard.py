@@ -147,7 +147,8 @@ from dashboard_app.refresh import (  # noqa: F401
     _wh_snapshot_complete_since, batch_elapsed_suffix, batch_failures,
     batch_in_progress, batch_progress,
     batch_result_message, refresh_in_progress, start_agent_batch,
-    start_refresh, start_warehouse_refresh, warehouse_refresh_in_progress,
+    start_key_skus_refresh, start_refresh, start_warehouse_refresh,
+    warehouse_refresh_in_progress,
 )
 from dashboard_app.agent_summary import (  # noqa: F401
     LLM_PROVIDERS, _AGENT_NODE_PROGRESS, _agent_progress_fragment, _agent_scores,
@@ -799,6 +800,10 @@ def main():
                 st.session_state["_wh_refresh_baseline"] = max(
                     (os.path.getmtime(p) for p in _wh_paths_now), default=0.0
                 )
+            # Ride the key-SKU pull along so the Key SKUs watchlist stays current.
+            # Fire-and-forget: the watchlist tab re-discovers the new file on its
+            # own, so no baseline/auto-select bookkeeping is needed here.
+            start_key_skus_refresh()
             st.session_state["plytix_nonce"] = (
                 st.session_state.get("plytix_nonce", 0) + 1
             )
