@@ -16,12 +16,16 @@ Recent run-rate and the forward window come from the same helpers the models use
 so the numbers agree with what the other views show.
 """
 import os
+import re
+from functools import partial
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from dashboard_app.compute import EIGHT_WK_AVG_COL, _descriptive_averages, summary_to_excel
+from dashboard_app.compute import (
+    EIGHT_WK_AVG_COL, _descriptive_averages, optimal_projection_for, summary_to_excel,
+)
 from dashboard_app.config import ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL
 from dashboard_app.dataquality import (
     render_discontinued_section,
@@ -39,8 +43,9 @@ from dashboard_app.refresh import (
     key_skus_refresh_in_progress,
     start_key_skus_refresh,
 )
+from dashboard_app.charts import actuals_vs_plan_chart, chart_range_control
 from dashboard_app.summaries import customer_source_map
-from dashboard_app.tables import render_filtered_table
+from dashboard_app.tables import render_selectable_table
 
 # Display column names for the exceptions table. These deliberately reuse the
 # names style_summary already formats/colours so the table matches the other
@@ -91,6 +96,15 @@ _COLUMN_CONFIG = {
     FLAG_COL: st.column_config.TextColumn(width="medium"),
 }
 
+# The condensed row shown in the click-to-expand Exceptions tables: just the
+# essentials for triage. Every other column surfaces in the detail card on click.
+# The column_config only relabels the "Customer Grouping" header to "Customer" —
+# the underlying column name is unchanged so the filter chips keep working.
+CONDENSED_EXCEPTION_COLS = ["SKU", "Customer Grouping", RECENT_COL, PROJ_COL, IMPACT_COL]
+_CONDENSED_COLUMN_CONFIG = {
+    "Customer Grouping": st.column_config.Column("Customer"),
+}
+
 
 def _forward_projection_avg(agg_by_group, first_forecast_week, last_forecast_week):
     """Per-(Customer Grouping, SKU) mean of the system Projection over the 15
@@ -129,6 +143,106 @@ def _recent_data_source(agg_by_group, today_ts):
     return src
 
 
+def sku_week_by_group(df, P):
+    """Per-(Customer Grouping, SKU) weekly frame (SKU, WeekDate, POS, Orders,
+    Projection, Description, Customer Grouping), with discontinued '*' SKUs dropped.
+
+    The canonical weekly aggregation shared by ``compute_exceptions`` (for the table)
+    and the detail-card charts (for the per-SKU time series), so both tie out. Uses
+    only the model-agnostic ``P.aggregate_to_sku_week``. Returns an empty frame when
+    there's nothing to aggregate."""
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=["SKU", "WeekDate", "POS", "Orders", "Projection",
+                     "Description", "Customer Grouping"]
+        )
+    agg_frames = []
+    for group, sub in df.groupby("Customer Grouping"):
+        ag = P.aggregate_to_sku_week(sub)
+        ag["Customer Grouping"] = group
+        agg_frames.append(ag)
+    if not agg_frames:
+        return pd.DataFrame(
+            columns=["SKU", "WeekDate", "POS", "Orders", "Projection",
+                     "Description", "Customer Grouping"]
+        )
+    agg_by_group = pd.concat(agg_frames, ignore_index=True)
+    agg_by_group["WeekDate"] = pd.to_datetime(agg_by_group["WeekDate"])
+    # Discontinued SKUs (trailing '*') are handled by the data-quality tables;
+    # drop them here so they don't double-surface (also matches _descriptive_averages).
+    return agg_by_group[~agg_by_group["SKU"].astype(str).str.endswith("*")]
+
+
+def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
+    """Detail-card chart + "Calculate Optimal Projection" for one (SKU, group).
+
+    Draws this SKU's actual sell-through vs the system projection with its own
+    date-range picker (``agg`` is the stashed per-SKU-week frame). A button computes
+    the model-chosen optimized 15-week forecast (fast when the group already has a
+    published best model / was forecast this session; runs the 5-model backtest live
+    otherwise) and overlays it on the chart. Each card gets an independent, stable
+    widget key so its range and computed result persist across reruns.
+
+    Signature matches the ``detail_chart(row, key_base)`` contract in
+    ``tables.render_selectable_table`` (bind the leading args via functools.partial).
+    """
+    if agg is None or agg.empty:
+        return
+    group, sku = row.get("Customer Grouping"), row.get("SKU")
+    source = row.get("Data Source") or "POS"
+    ag = agg[(agg["Customer Grouping"] == group)
+             & (agg["SKU"].astype(str) == str(sku))]
+    if ag.empty:
+        st.caption("No weekly history to chart for this SKU.")
+        return
+    _, lcw, ffw = anchors
+    # Widen the history bound to this SKU's earliest week so the date-range picker
+    # isn't trapped in the model's short (8-week) lookback (cf. kpis.py best-model).
+    chart_lb = pd.to_datetime(ag["WeekDate"]).min()
+    key = re.sub(r"[^0-9A-Za-z_]+", "_", f"{key_base}__chart__{sku}__{group}")
+
+    # ----- Optimized projection (best-model 5-model backtest) --------------
+    opt_key = f"{key}__opt"
+    if st.button("Calculate Optimal Projection", key=f"{key}_optbtn",
+                 help="Forecast this SKU with the model that wins its 5-model "
+                      "backtest. Reuses the Optimized Projections view's result when "
+                      "available; otherwise backtests live (can be slow)."):
+        with st.spinner("Finding the best model and forecasting…"):
+            st.session_state[opt_key] = optimal_projection_for(
+                df, group, sku, today_ts, prices
+            )
+    opt = st.session_state.get(opt_key)
+    weekly = None
+    if opt:
+        if opt["status"] == "ok":
+            weekly = opt["weekly"]
+            current = row.get(PROJ_COL)
+            delta = (None if current is None or pd.isna(current)
+                     else f"{opt['optimized_avg'] - current:+,.0f} vs current")
+            st.metric("Optimized Projection (avg/wk)",
+                      f"{opt['optimized_avg']:,.0f}", delta=delta, delta_color="off")
+            st.caption(f"Winning model: {opt['label']}")
+        elif opt["status"] == "no_model":
+            st.info("Couldn't determine a best model for this view — its history is "
+                    "too short to backtest any model.")
+        elif opt["status"] == "no_data":
+            st.info(f"The best model ({opt.get('label')}) produced no forecast for "
+                    "this SKU.")
+
+    # The date-range picker derives the visible window's end from the horizon
+    # frame's max WeekDate. Include the optimized forecast weeks so its line isn't
+    # clipped away for SKUs that carry no forward SYSTEM projection (whose ag ends
+    # at the last actual week, before the forecast horizon).
+    horizon = ag
+    if weekly is not None and not weekly.empty:
+        horizon = pd.concat([ag[["WeekDate"]], weekly[["WeekDate"]]], ignore_index=True)
+    date_range = chart_range_control(ag, horizon, lcw, key=key)
+    fig = actuals_vs_plan_chart(sku, row.get("Description"), source, ag,
+                                (chart_lb, lcw, ffw), date_range=date_range,
+                                weekly=weekly)
+    st.plotly_chart(fig, width="stretch", key=f"{key}_plot")
+
+
 def compute_exceptions(df, today_ts, prices, P):
     """Build the (unfiltered, unsorted-for-display) exceptions frame.
 
@@ -144,19 +258,9 @@ def compute_exceptions(df, today_ts, prices, P):
     if df is None or df.empty:
         return empty
 
-    # Per-group SKU-week aggregates, tagged with the group (mirrors compute.py).
-    agg_frames = []
-    for group, sub in df.groupby("Customer Grouping"):
-        ag = P.aggregate_to_sku_week(sub)
-        ag["Customer Grouping"] = group
-        agg_frames.append(ag)
-    if not agg_frames:
-        return empty
-    agg_by_group = pd.concat(agg_frames, ignore_index=True)
-    agg_by_group["WeekDate"] = pd.to_datetime(agg_by_group["WeekDate"])
-    # Discontinued SKUs (trailing '*') are handled by the data-quality tables;
-    # drop them here so they don't double-surface (also matches _descriptive_averages).
-    agg_by_group = agg_by_group[~agg_by_group["SKU"].astype(str).str.endswith("*")]
+    # Per-group SKU-week aggregates (shared helper — the detail-card charts reuse
+    # the same aggregation so their series tie out with these table numbers).
+    agg_by_group = sku_week_by_group(df, P)
     if agg_by_group.empty:
         return empty
 
@@ -273,11 +377,12 @@ def _download_button(table, slug, label, today_str):
     )
 
 
-def _section(frame, direction, key, P, today_str, slug, label, cols=None, empty_msg=None):
+def _section(frame, direction, key, P, today_str, slug, label, cols=None,
+             empty_msg=None, chart_cb=None):
     """Render one direction's ranked, filterable table (worst first). ``cols``
     selects the column set (All-Exceptions vs Key SKUs); ``empty_msg`` overrides
     the placeholder caption when the section has no rows; ``slug``/``label`` name
-    the download file and button."""
+    the download file and button; ``chart_cb`` draws the per-row detail chart."""
     cols = cols if cols is not None else _DISPLAY_COLS
     sub = frame[frame[DIRECTION_COL] == direction].sort_values(
         "_sort", ascending=False
@@ -287,11 +392,13 @@ def _section(frame, direction, key, P, today_str, slug, label, cols=None, empty_
         st.caption(empty_msg or "No SKUs flagged in this section at the current thresholds.")
         return
     st.caption(f"{len(sub):,} SKUs flagged")
-    render_filtered_table(sub[cols], key, P, style=True, column_config=_COLUMN_CONFIG)
+    render_selectable_table(sub[cols], key, P, condensed_cols=CONDENSED_EXCEPTION_COLS,
+                            style=True, column_config=_CONDENSED_COLUMN_CONFIG,
+                            detail_chart=chart_cb)
     _download_button(sub[cols], slug, label, today_str)
 
 
-def _render_all_exceptions_tab(frame, P, today_str):
+def _render_all_exceptions_tab(frame, P, today_str, chart_cb=None):
     """The All-Exceptions tab: severity thresholds + Under/Over sections over the
     diverging rows (on-plan rows are excluded here)."""
     diverging = frame[frame[DIRECTION_COL] != ON_PLAN]
@@ -325,11 +432,11 @@ def _render_all_exceptions_tab(frame, P, today_str):
 
     _section(flagged, UNDER, "exc_under", P, today_str,
              slug="exceptions_under-projected",
-             label="Understocked Exceptions table")
+             label="Understocked Exceptions table", chart_cb=chart_cb)
     st.divider()
     _section(flagged, OVER, "exc_over", P, today_str,
              slug="exceptions_over-projected",
-             label="Overstocked Exceptions table")
+             label="Overstocked Exceptions table", chart_cb=chart_cb)
 
 
 def _render_key_skus_fetch_prompt():
@@ -361,7 +468,7 @@ def _render_key_skus_fetch_prompt():
             st.warning(msg)
 
 
-def _render_key_skus_tab(frame, P, today_str):
+def _render_key_skus_tab(frame, P, today_str, chart_cb=None):
     """The Key SKUs watchlist tab: every key SKU (from extract_key_skus.py) with
     its status, no threshold filtering — a always-on watchlist of important items."""
     path = discover_key_skus_file()
@@ -392,11 +499,13 @@ def _render_key_skus_tab(frame, P, today_str):
     # Split into the two planning actions, same layout as the All-Exceptions tab.
     _section(key_frame, UNDER, "exc_key_under", P, today_str,
              slug="key_skus_under-projected", label="Understocked Key SKUs table",
-             cols=KEY_DISPLAY_COLS, empty_msg="No under-projected key SKUs.")
+             cols=KEY_DISPLAY_COLS, empty_msg="No under-projected key SKUs.",
+             chart_cb=chart_cb)
     st.divider()
     _section(key_frame, OVER, "exc_key_over", P, today_str,
              slug="key_skus_over-projected", label="Overstocked Key SKUs table",
-             cols=KEY_DISPLAY_COLS, empty_msg="No over-projected key SKUs.")
+             cols=KEY_DISPLAY_COLS, empty_msg="No over-projected key SKUs.",
+             chart_cb=chart_cb)
 
     # On-plan key SKUs belong to neither table; keep them in a collapsed section
     # so the watchlist still accounts for every key SKU.
@@ -405,8 +514,10 @@ def _render_key_skus_tab(frame, P, today_str):
     )
     if not on_plan.empty:
         with st.expander(f"On-plan key SKUs ({on_plan['SKU'].nunique():,})"):
-            render_filtered_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
-                                   style=True, column_config=_COLUMN_CONFIG)
+            render_selectable_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
+                                    condensed_cols=CONDENSED_EXCEPTION_COLS,
+                                    style=True, column_config=_CONDENSED_COLUMN_CONFIG,
+                                    detail_chart=chart_cb)
             _download_button(on_plan[KEY_DISPLAY_COLS], "key_skus_on-plan",
                              "On-plan Key SKUs table", today_str)
 
@@ -493,6 +604,9 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
         with st.spinner("Scanning for exceptions…"):
             frame = compute_exceptions(df, today_ts, prices, P)
             st.session_state["exceptions_frame"] = frame
+            # Per-SKU-week frame for the detail-card charts (same aggregation the
+            # table uses, so the plotted series tie out with the row's numbers).
+            st.session_state["exceptions_agg"] = sku_week_by_group(df, P)
             # Data-quality tables for the four sections moved here from Quick
             # Projections. missing_df needs the warehouse grid; missing_pos_df
             # uses full demand history. cust_source rebuilds the POS/Orders label
@@ -528,13 +642,19 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     path = discover_key_skus_file()
     key_skus = load_key_skus(path, os.path.getmtime(path)) if path else None
 
+    # Per-row detail-card chart + "Calculate Optimal Projection". Binds the stashed
+    # per-SKU-week frame, anchors, and the cleaned df / prices / today (needed for the
+    # optimized forecast); called as (row, key_base) per the detail_chart contract.
+    chart_cb = partial(_render_exception_chart, st.session_state.get("exceptions_agg"),
+                       anchors, df, prices, today_ts)
+
     tab_key, tab_all = st.tabs(["Key SKUs", "All Exceptions"])
     with tab_key:
-        _render_key_skus_tab(frame, P, today_str)
+        _render_key_skus_tab(frame, P, today_str, chart_cb=chart_cb)
         if key_skus:
             st.divider()
             _render_data_quality_expanders(**dq_common, key_skus=key_skus, key_suffix="_key")
     with tab_all:
-        _render_all_exceptions_tab(frame, P, today_str)
+        _render_all_exceptions_tab(frame, P, today_str, chart_cb=chart_cb)
         st.divider()
         _render_data_quality_expanders(**dq_common, key_skus=None, key_suffix="_all")

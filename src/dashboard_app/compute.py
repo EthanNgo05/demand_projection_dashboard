@@ -462,6 +462,75 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
     return combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded
 
 
+def _live_best_model(df, group, today_ts, prices=None):
+    """Run the 5-model backtest live for ONE group and return its
+    ``(label, model_path)``, or None if no model was scoreable (history too short).
+
+    Used when the group has no published ``agent_summary_<group>.json`` yet. Calls
+    the same three agent nodes the graph uses (skipping ingest / LLM / publish) on a
+    hand-built state; ``run_all_models`` slices the group via ``view_frame``. Imported
+    lazily so the dashboard doesn't pull the agent/LangGraph stack unless this runs.
+    """
+    from agent.nodes.forecast import run_all_models
+    from agent.nodes.evaluate import evaluate_models
+    from agent.nodes.select import select_best_model
+
+    state = {"cleaned_df": df, "view": group, "today_ts": today_ts,
+             "prices": prices, "errors": []}
+    state.update(run_all_models(state))
+    state.update(evaluate_models(state))
+    state.update(select_best_model(state))
+    label = state.get("best_model")
+    path = MODEL_OPTIONS.get(label) if label else None
+    if not label or path is None:
+        return None
+    return label, path
+
+
+def optimal_projection_for(df, group, sku, today_ts, prices=None, min_weeks=None):
+    """Optimized (best-model) 15-week forecast for ONE (SKU, Customer Grouping).
+
+    Reuses the Optimized Projections view's machinery so a group already forecast
+    this session is an instant cache hit: resolve the group's backtest winner from
+    ``agent_summary_<group>.json`` (else run the 5-model backtest live for the group),
+    then forecast that winner through the SAME cached ``run_autofit`` /
+    ``_forecast_one_group`` calls ``compute_by_customer_best`` uses, and slice the SKU.
+
+    Returns a dict:
+      * ``{"status": "ok", "label", "weekly", "optimized_avg"}`` — ``weekly`` is the
+        SKU's ``SKU/WeekDate/projected_pos`` frame; ``optimized_avg`` its 15-week mean.
+      * ``{"status": "no_model"}`` — no model could be backtested for the group.
+      * ``{"status": "no_data", "label"}`` — winner produced no forecast for this SKU.
+    """
+    best = _best_model_for_group(group)
+    if best is None:
+        best = _live_best_model(df, group, today_ts, prices)
+        if best is None:
+            return {"status": "no_model"}
+    label, path = best
+
+    sub = df[df["Customer Grouping"] == group]
+    alpha = beta = phi = None
+    P = load_pipeline(path)
+    if _supports_autofit(P):
+        fitted = run_autofit(df, group, today_ts, path, min_weeks)
+        if fitted:
+            alpha, beta, phi = fitted.get("alpha"), fitted.get("beta"), fitted.get("phi")
+    _, weekly, _ = _forecast_one_group(
+        sub, today_ts, path, group, prices, alpha, beta, phi, min_weeks
+    )
+    if weekly is None or weekly.empty:
+        return {"status": "no_data", "label": label}
+    wk = weekly[weekly["SKU"].astype(str) == str(sku)][
+        ["SKU", "WeekDate", "projected_pos"]
+    ].copy()
+    if wk.empty:
+        return {"status": "no_data", "label": label}
+    wk["WeekDate"] = pd.to_datetime(wk["WeekDate"])
+    return {"status": "ok", "label": label, "weekly": wk,
+            "optimized_avg": float(wk["projected_pos"].mean())}
+
+
 def _agent_summary_path(view):
     """Path publish.py writes for a given view (same view->filename mangling)."""
     safe_view = view.replace(" ", "_").replace("/", "-")

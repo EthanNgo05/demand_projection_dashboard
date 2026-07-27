@@ -397,3 +397,116 @@ def render_filtered_table(df, key, P=None, *, style=True, column_config=None):
         style_summary(filtered) if style else filtered,
         width="stretch", hide_index=True, column_config=column_config,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Click-to-expand exception tables (condensed rows + a detail card on select)  #
+# --------------------------------------------------------------------------- #
+def _fmt_detail_value(col, val):
+    """Format one cell for the detail card, matching how style_summary renders
+    the same column in the table (dollars, signed percent, comma'd integers)."""
+    if pd.isna(val):
+        return "—"
+    if col == PRICE_COL:
+        return fmt_dollar(val, decimals=2)
+    if col == RISK_COL:
+        return fmt_dollar(val, decimals=0)
+    if col == "% Deviation":
+        return f"{int(val):,}%" if val == int(val) else f"{val:,.2f}%"
+    int_cols = {
+        "Weeks with data", "Current Projection Average",
+        "Updated Projection Average", "Projection Difference",
+    }
+    if col in int_cols:
+        return f"{val:,.0f}"
+    if col.endswith("POS/Orders Average") and isinstance(val, (int, float)):
+        return f"{val:,.0f}" if float(val).is_integer() else f"{val:,.1f}"
+    return str(val)
+
+
+def _dismiss_card(dismissed_key, label):
+    """Callback: mark a card's row-label dismissed so its detail card closes in
+    place (runs before the rerun, so the card is gone on the next render)."""
+    st.session_state.setdefault(dismissed_key, set()).add(label)
+
+
+def _render_row_detail(row, shown, detail_chart=None, key_base=None,
+                       dismissed_key=None, close_label=None):
+    """Render a row's full detail in a bordered card beneath the table.
+
+    The card is self-contained: it lists EVERY field (SKU, Customer, the condensed
+    columns, and the rest) as label/value pairs, so it reads on its own. ``shown``
+    is kept for signature stability but no longer hides columns. When ``detail_chart``
+    is given it is called with ``(row, key_base)`` to draw a chart below the fields.
+    A ✕ button (top-right) dismisses the card via ``dismissed_key``/``close_label``
+    so the user can close it without scrolling the table back up to deselect."""
+    # SKU and Description live in the card title, so they're dropped from the grid;
+    # the remaining columns start with Customer Grouping, which fills the first slot.
+    detail_cols = [
+        c for c in row.index
+        if c not in ("SKU", "Description") and not str(c).startswith("_")
+    ]
+    desc = row["Description"] if "Description" in row.index else ""
+    with st.container(border=True):
+        title_col, x_col = st.columns([12, 1])
+        title = f"**{row.get('SKU', '')}** — {desc}" if desc else f"**{row.get('SKU', '')}**"
+        title_col.markdown(title)
+        if dismissed_key is not None and close_label is not None:
+            x_col.button(
+                "✕", key=f"{key_base}__close__{close_label}", help="Close this card",
+                on_click=_dismiss_card, args=(dismissed_key, close_label),
+            )
+        per_row = 3
+        for start in range(0, len(detail_cols), per_row):
+            chunk = detail_cols[start:start + per_row]
+            cols = st.columns(per_row)
+            for i, c in enumerate(chunk):
+                cols[i].markdown(f"**{c}**\n\n{_fmt_detail_value(c, row[c])}")
+        if detail_chart is not None:
+            detail_chart(row, key_base)
+
+
+@st.fragment
+def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
+                            column_config=None, detail_chart=None):
+    """Like render_filtered_table, but shows only ``condensed_cols`` per row and
+    reveals the full row in a detail card below when a row is clicked.
+
+    The Exceptions tables use this so each row stays scannable (SKU / Customer /
+    projection / revenue risk) while every other field is one click away. Select
+    multiple rows to stack their detail cards side by side. Filtering still runs on
+    the FULL frame, so the filter chips are unaffected; the detail lookup also uses
+    the full frame, mapping each selected positional index back to ``filtered``.
+    Wrapped in a fragment so a row click reruns only this block. ``detail_chart``,
+    if given, is a ``(row, key_base)`` callback that draws a chart inside each card.
+    """
+    filtered = filter_table(df, key, P)
+    display_cols = [c for c in condensed_cols if c in filtered.columns]
+    display_df = filtered[display_cols]
+    event = st.dataframe(
+        style_summary(display_df) if style else display_df,
+        width="stretch", hide_index=True, column_config=column_config,
+        on_select="rerun", selection_mode="multi-row", key=f"{key}__sel",
+    )
+    # Positional indices persist across reruns, so drop any that a filter has since
+    # pushed out of range (sorted so cards stack in table order, not click order).
+    rows = event.selection.rows if event and event.selection else []
+    rows = sorted(r for r in rows if r < len(filtered))
+
+    # Cards can be closed in place (✕) without deselecting the table row. Track the
+    # dismissed rows by their stable pandas index label (survives filtering, unlike
+    # the positional index). Prune to only still-selected rows so re-clicking a row
+    # reopens its card and a deselected row drops out of the dismissed set.
+    dismissed_key = f"{key}__dismissed"
+    selected_labels = {filtered.index[r] for r in rows}
+    dismissed = st.session_state.get(dismissed_key, set()) & selected_labels
+    st.session_state[dismissed_key] = dismissed
+
+    visible = [r for r in rows if filtered.index[r] not in dismissed]
+    if visible:
+        for r in visible:
+            _render_row_detail(filtered.iloc[r], shown=display_cols,
+                               detail_chart=detail_chart, key_base=key,
+                               dismissed_key=dismissed_key, close_label=filtered.index[r])
+    else:
+        st.caption("Select one or more rows to see their full details.")
