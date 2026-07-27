@@ -104,7 +104,7 @@ from dashboard_app.config import (  # noqa: F401
     ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID, C_ORIGINAL, C_UPDATED,
     DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, LOGO_PATH, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
     PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
-    SCOPE_LABELS,
+    SCOPE_LABELS, WATCHLIST_VIEW,
     _ENV_PIPELINE,
     fmt_dollar, model_display, region_all_view, region_from_view,
 )
@@ -160,6 +160,7 @@ from dashboard_app.kpis import (  # noqa: F401
 from dashboard_app.exceptions import (  # noqa: F401
     compute_exceptions, render_exceptions,
 )
+from dashboard_app.watchlist_view import render_watchlist  # noqa: F401
 
 
 # Bounds for the per-view session caches below. Entries are keyed per
@@ -598,7 +599,7 @@ def main():
         # under one "Quick Projections" pill and chosen via the sub-selector below.
         scope = st.segmented_control(
             "View",
-            [QUICK_VIEW, BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW],
+            [QUICK_VIEW, BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW, WATCHLIST_VIEW],
             default=QUICK_VIEW,
             key="scope",
             format_func=lambda s: SCOPE_LABELS.get(s, s),
@@ -647,6 +648,9 @@ def main():
         region = None
     elif scope == EXCEPTIONS_VIEW:
         view = EXCEPTIONS_VIEW
+        region = None
+    elif scope == WATCHLIST_VIEW:
+        view = WATCHLIST_VIEW
         region = None
     else:
         view = None  # filled from region_slot once df is available
@@ -1312,6 +1316,16 @@ def main():
             inactive_df=inactive_df, excluded_counts_by_key=excluded_counts_by_key,
             disc_check_ran=disc_check_ran, discontinued_df=discontinued_df,
             allocation_pairs=allocation_pairs,
+        )
+        st.stop()
+
+    # ----- Watchlist view --------------------------------------------------
+    # Pin-board of starred (SKU, Customer Grouping) pairs. Reuses the best-model
+    # table for its detail numbers; like the two views above it renders its own
+    # table and stops before the single-model compute/charts/KPIs below.
+    if view == WATCHLIST_VIEW:
+        render_watchlist(
+            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P
         )
         st.stop()
 

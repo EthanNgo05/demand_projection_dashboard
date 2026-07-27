@@ -3,6 +3,9 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_app.config import MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar
+from dashboard_app.watchlist import (
+    STAR_PREFIX, active_pairs, mark_starred_sku, starred_mask,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -101,6 +104,16 @@ def _build_fields(df, key, P):
                 "options": sorted(series.dropna().unique(), key=str),
             })
 
+    # Watchlist ("Starred") filter — a single toggle that narrows to rows on the
+    # active watchlist. Membership is computed live (no column); only offered when
+    # it actually varies (some but not all rows starred), so it would narrow.
+    starred = starred_mask(df)
+    if starred is not None and starred.any() and not starred.all():
+        fields.append({
+            "label": "Starred", "wkey": f"{key}::Starred",
+            "kind": "starred", "values": starred,
+        })
+
     if "SKU" in df.columns:
         add_checklist("SKU", df["SKU"])
 
@@ -163,6 +176,8 @@ def _selection(field):
         if isinstance(cur, (tuple, list)) and len(cur) == 2:
             return (cur[0], cur[1])
         return None
+    if field["kind"] == "starred":
+        return bool(st.session_state.get(f"{wkey}__on", False))
     return {o for o in field["options"]
             if st.session_state.get(_cb_key(wkey, o), False)}
 
@@ -170,6 +185,10 @@ def _selection(field):
 def _field_mask(df, field, selection):
     """Boolean row mask for one field's selection (empty selection → all True)."""
     kind = field["kind"]
+    if kind == "starred":
+        if not selection:
+            return pd.Series(True, index=df.index)
+        return field["values"]
     if kind == "checklist":
         if not selection:
             return pd.Series(True, index=df.index)
@@ -257,6 +276,15 @@ def _popover_daterange(label, field):
     return None  # mid-selection (only a start picked) → treat as no filter
 
 
+def _popover_starred(label, field):
+    """A watchlist filter chip: one checkbox that narrows to starred rows."""
+    onkey = f"{field['wkey']}__on"
+    on = bool(st.session_state.get(onkey, False))
+    with st.popover(f"{label} ✓" if on else label, use_container_width=True):
+        st.checkbox("On the active watchlist", key=onkey)
+    return bool(st.session_state.get(onkey, False))
+
+
 def _add_filter(key, active_key):
     """Callback: activate the field chosen in the "Add filter" selectbox."""
     choice = st.session_state.get(f"{key}__add")
@@ -275,6 +303,8 @@ def _remove_filter(active_key, label, wkey, kind, options):
     ]
     if kind == "date":
         st.session_state.pop(f"{wkey}__di", None)
+    elif kind == "starred":
+        st.session_state.pop(f"{wkey}__on", None)
     else:
         for o in options:
             st.session_state[_cb_key(wkey, o)] = False
@@ -337,7 +367,7 @@ def filter_table(df, key, P=None):
     # Clamp away any checked value that no longer yields rows, so an empty
     # combination can't persist (date fields aren't clamped).
     for f in active_fields:
-        if f["kind"] == "date":
+        if f["kind"] in ("date", "starred"):
             continue
         reachable = available(f)
         for o in list(sel[f["label"]]):
@@ -359,6 +389,8 @@ def filter_table(df, key, P=None):
             with cols[i * 2]:
                 if f["kind"] == "date":
                     selections[f["label"]] = _popover_daterange(f["label"], f)
+                elif f["kind"] == "starred":
+                    selections[f["label"]] = _popover_starred(f["label"], f)
                 else:
                     selections[f["label"]] = _popover_checklist(
                         f["label"], sorted(available(f), key=str), f["wkey"]
@@ -391,10 +423,13 @@ def render_filtered_table(df, key, P=None, *, style=True, column_config=None):
     (the unfiltered frame) is captured as a fragment arg and reused each rerun.
     ``column_config`` is forwarded to ``st.dataframe`` so callers can pin
     per-column widths (e.g. widen a free-text column so its text isn't clipped).
+    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
+    (display only — filtering runs on the un-prefixed frame).
     """
     filtered = filter_table(df, key, P)
+    display = mark_starred_sku(filtered)
     st.dataframe(
-        style_summary(filtered) if style else filtered,
+        style_summary(display) if style else display,
         width="stretch", hide_index=True, column_config=column_config,
     )
 
@@ -447,9 +482,14 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
         if c not in ("SKU", "Description") and not str(c).startswith("_")
     ]
     desc = row["Description"] if "Description" in row.index else ""
+    # Mark the card title with a ★ when this row is on the active watchlist, so an
+    # opened card (in any view) shows membership without a dedicated column.
+    cust = row.get("Customer Grouping") or row.get("Customer")
+    star = STAR_PREFIX if (str(row.get("SKU", "")), str(cust)) in active_pairs() else ""
     with st.container(border=True):
         title_col, x_col = st.columns([12, 1])
-        title = f"**{row.get('SKU', '')}** — {desc}" if desc else f"**{row.get('SKU', '')}**"
+        sku_txt = f"{star}{row.get('SKU', '')}"
+        title = f"**{sku_txt}** — {desc}" if desc else f"**{sku_txt}**"
         title_col.markdown(title)
         if dismissed_key is not None and close_label is not None:
             x_col.button(
@@ -479,10 +519,12 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     the full frame, mapping each selected positional index back to ``filtered``.
     Wrapped in a fragment so a row click reruns only this block. ``detail_chart``,
     if given, is a ``(row, key_base)`` callback that draws a chart inside each card.
+    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
+    (display only — filtering and the detail lookup use the un-prefixed frame).
     """
     filtered = filter_table(df, key, P)
     display_cols = [c for c in condensed_cols if c in filtered.columns]
-    display_df = filtered[display_cols]
+    display_df = mark_starred_sku(filtered[display_cols])
     event = st.dataframe(
         style_summary(display_df) if style else display_df,
         width="stretch", hide_index=True, column_config=column_config,
