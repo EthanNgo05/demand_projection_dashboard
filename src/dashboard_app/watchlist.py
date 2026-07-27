@@ -212,6 +212,29 @@ def toggle_star(sku, customer, name=None):
     return now_starred
 
 
+def remove_star(sku, customer, name=None):
+    """Remove ``(sku, customer)`` from ``name`` (default: the active list).
+
+    Idempotent (unlike ``toggle_star``): a no-op returning False if the pair
+    isn't on the list, so a stale removal — e.g. another viewer deleting the same
+    pair from this shared list between render and click — can never re-add it.
+    Returns True when it actually removed the pair.
+    """
+    if name is None:
+        name = active_name()
+    if name is None:
+        return False
+    lists = dict(load_all())
+    pairs = set(lists.get(name, set()))
+    key = (str(sku), str(customer))
+    if key not in pairs:
+        return False
+    pairs.discard(key)
+    lists[name] = pairs
+    save_all(lists)
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Table marker helpers                                                        #
 # --------------------------------------------------------------------------- #

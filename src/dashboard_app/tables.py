@@ -420,7 +420,8 @@ def _dismiss_card(dismissed_key, label):
 
 
 def _render_row_detail(row, shown, detail_chart=None, key_base=None,
-                       dismissed_key=None, close_label=None, card_cols=None):
+                       dismissed_key=None, close_label=None, card_cols=None,
+                       row_action=None):
     """Render a row's full detail in a bordered card beneath the table.
 
     ``card_cols`` (if given) is the explicit, ordered list of fields to show in the
@@ -430,7 +431,10 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
     is kept for signature stability but no longer hides columns. When ``detail_chart``
     is given it is called with ``(row, key_base)`` to draw a chart below the fields.
     A ✕ button (top-right) dismisses the card via ``dismissed_key``/``close_label``
-    so the user can close it without scrolling the table back up to deselect."""
+    so the user can close it without scrolling the table back up to deselect.
+    ``row_action`` (if given) is a ``{label, help, danger, callback}`` dict rendered
+    as a button at the bottom of the card; clicking it calls ``callback(row)`` (the
+    callback owns any rerun — e.g. by opening a confirmation dialog)."""
     # SKU and Description live in the card title, so they're dropped from the grid;
     # the remaining columns start with Customer Grouping, which fills the first slot.
     if card_cols is not None:
@@ -479,11 +483,28 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
             st.markdown(f"**Note**\n\n{_fmt_detail_value('Note', note_val)}")
         if detail_chart is not None:
             detail_chart(row, key_base)
+        if row_action is not None:
+            btn_key = re.sub(r"[^0-9A-Za-z_-]+", "-",
+                             f"{key_base}__rowaction__{close_label}")
+            if row_action.get("danger"):
+                # Scope the destructive red styling to this button's key wrapper,
+                # matching the delete-watchlist confirm button elsewhere.
+                st.markdown(
+                    f"<style>.st-key-{btn_key} button{{background-color:#dc2626;"
+                    "border-color:#dc2626;color:#fff;}"
+                    f".st-key-{btn_key} button:hover{{background-color:#b91c1c;"
+                    "border-color:#b91c1c;color:#fff;}</style>",
+                    unsafe_allow_html=True,
+                )
+            if st.button(row_action["label"], key=btn_key,
+                         help=row_action.get("help"), width="content"):
+                row_action["callback"](row)
 
 
 @st.fragment
 def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
-                            column_config=None, detail_chart=None, detail_cols=None):
+                            column_config=None, detail_chart=None, detail_cols=None,
+                            row_action=None):
     """Like render_filtered_table, but shows only ``condensed_cols`` per row and
     reveals the full row in a detail card below when a row is clicked.
 
@@ -496,6 +517,8 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     if given, is a ``(row, key_base)`` callback that draws a chart inside each card.
     Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
     (display only — filtering and the detail lookup use the un-prefixed frame).
+    ``row_action`` is forwarded to each detail card (see ``_render_row_detail``) so
+    callers can add a per-row button (e.g. the watchlist's "Remove" affordance).
     """
     filtered = filter_table(df, key, P)
     display_cols = [c for c in condensed_cols if c in filtered.columns]
@@ -539,6 +562,6 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
             _render_row_detail(filtered.iloc[r], shown=display_cols,
                                detail_chart=detail_chart, key_base=key,
                                dismissed_key=dismissed_key, close_label=filtered.index[r],
-                               card_cols=detail_cols)
+                               card_cols=detail_cols, row_action=row_action)
     else:
         st.caption("Select one or more rows to see their full details.")

@@ -23,8 +23,13 @@ from dashboard_app.exceptions import _render_exception_chart, sku_week_by_group
 from dashboard_app.tables import render_selectable_table
 from dashboard_app.watchlist import (
     DEFAULT_NAME, active_name, active_pairs, create_watchlist, delete_watchlist,
-    is_starred, list_names, rename_watchlist, set_active, toggle_star,
+    is_starred, list_names, remove_star, rename_watchlist, set_active, toggle_star,
 )
+
+# st.dataframe stores its row selection under "<key>__sel"; the watchlist table
+# uses key "watchlist". Removing a row shifts positional indices, so this is
+# cleared on removal to stop a stale selection reopening the wrong card.
+_WATCHLIST_SEL_KEY = "watchlist__sel"
 
 # Detail-card field order for the watchlist (decoupled from the best-model table's
 # full column set). Renders as three rows:
@@ -123,6 +128,46 @@ def _delete_dialog(active):
         st.rerun()
 
 
+@st.dialog("Remove from watchlist")
+def _remove_dialog(pairs, active):
+    """Confirm removing one or more ``(sku, customer)`` pairs from ``active``.
+
+    Shared by the detail-card "Remove" button (a single pair) and the orphan-pair
+    "Remove selected" control (a list). Confirming removes each pair, clears the
+    watchlist table's stale row selection, and triggers a full app rerun so the
+    table and the ★ marker in the other views refresh."""
+    pairs = list(pairs)
+    if len(pairs) == 1:
+        s, c = pairs[0]
+        st.warning(f"Remove **{s} / {c}** from **{active}**?")
+    else:
+        st.warning(f"Remove **{len(pairs)}** combinations from **{active}**?")
+    # Red confirm button — same scoped-style trick as _delete_dialog.
+    st.markdown(
+        "<style>.st-key-wl_rm_go button{background-color:#dc2626;"
+        "border-color:#dc2626;color:#fff;}"
+        ".st-key-wl_rm_go button:hover{background-color:#b91c1c;"
+        "border-color:#b91c1c;color:#fff;}</style>",
+        unsafe_allow_html=True,
+    )
+    left, right = st.columns(2)
+    if left.button("Cancel", key="wl_rm_cancel", width="stretch"):
+        st.rerun()
+    if right.button("Remove", key="wl_rm_go", type="primary", width="stretch"):
+        for s, c in pairs:
+            remove_star(s, c, active)
+        # Reset widgets whose stored value now references removed rows: the table's
+        # positional selection (a shifted index could reopen the wrong card) and the
+        # orphan multiselect (Streamlit rejects stored values absent from options).
+        # Guarded — these are widget-owned keys.
+        for k in (_WATCHLIST_SEL_KEY, "wl_missing_ms"):
+            try:
+                st.session_state.pop(k, None)
+            except Exception:
+                pass
+        st.rerun()
+
+
 @st.fragment
 def _list_controls():
     """Watchlist selector + always-visible icon actions (New / Rename / Delete),
@@ -193,16 +238,33 @@ def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, 
     active = active_name()
 
     # ----- Add / remove control (acts on the active list) ------------------- #
+    # Cascade the pickers so only real (SKU, group) pairs that actually have
+    # demand data can be selected — the customer list is narrowed to the groups
+    # the chosen SKU sells to. Prevents starring nonexistent combinations (which
+    # would have no detail card and get stranded in the "not in best-model table"
+    # list below).
     skus = sorted(df["SKU"].dropna().astype(str).unique().tolist())
-    groups = sorted(df["Customer Grouping"].dropna().astype(str).unique().tolist())
     c_sku, c_cust = st.columns(2)
     sel_sku = c_sku.selectbox("SKU", skus, help="Type to search") if skus else None
+    groups = (sorted(df.loc[df["SKU"].astype(str) == sel_sku, "Customer Grouping"]
+                     .dropna().astype(str).unique().tolist())
+              if sel_sku is not None else [])
     sel_cust = c_cust.selectbox("Customer Grouping", groups) if groups else None
     if sel_sku is not None and sel_cust is not None:
         starred = is_starred(sel_sku, sel_cust)
         label = (f"★ Remove from “{active}”" if starred
                  else f"☆ Add to “{active}”")
-        if st.button(label, type="secondary" if starred else "primary"):
+        if starred:
+            # Destructive red styling for the remove mode (scoped to this button).
+            st.markdown(
+                "<style>.st-key-wl_toggle button{background-color:#dc2626;"
+                "border-color:#dc2626;color:#fff;}"
+                ".st-key-wl_toggle button:hover{background-color:#b91c1c;"
+                "border-color:#b91c1c;color:#fff;}</style>",
+                unsafe_allow_html=True,
+            )
+        if st.button(label, key="wl_toggle",
+                     type="secondary" if starred else "primary"):
             toggle_star(sel_sku, sel_cust)
             st.rerun()
 
@@ -258,13 +320,32 @@ def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, 
             condensed_cols=["SKU", "Customer Grouping"],
             detail_chart=chart_cb,
             detail_cols=WATCHLIST_CARD_COLS,
+            row_action={
+                "label": f"🗑 Remove from “{active}”",
+                "help": "Remove this combination from the active watchlist",
+                "danger": True,
+                "callback": lambda row: _remove_dialog(
+                    [(str(row["SKU"]), str(row["Customer Grouping"]))], active),
+            },
         )
 
+    # Orphaned pins: on the list but absent from the best-model table (discontinued,
+    # remapped, or awaiting a recommendation), so they have no row/detail card to
+    # remove from. Offer a dedicated remover so they're never stranded.
     missing = sorted(p for p in pairs if p not in present)
     if missing:
-        shown = ", ".join(f"{s} / {c}" for s, c in missing[:10])
-        more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
         st.caption(
             f"{len(missing)} starred combination(s) on this list aren't in the "
-            f"current best-model table: {shown}{more}."
+            "current best-model table (discontinued, remapped, or awaiting a model "
+            "recommendation). Select any below to remove them."
         )
+        by_label = {f"{s} / {c}": (s, c) for s, c in missing}
+        picked = st.multiselect(
+            "Combinations not in the best-model table", list(by_label),
+            key="wl_missing_ms",
+            placeholder="Select combinations to remove — type to search",
+            label_visibility="collapsed",
+        )
+        if st.button("🗑 Remove selected", key="wl_missing_rm",
+                     disabled=not picked):
+            _remove_dialog([by_label[p] for p in picked], active)
