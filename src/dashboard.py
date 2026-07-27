@@ -721,6 +721,15 @@ def main():
         if scope == EXCEPTIONS_VIEW:
             col_llm = None
         with col_data:
+            # Sync writes fresh data to a new dated snapshot on disk. While the
+            # "Manually override data" toggle is on the user is analyzing chosen /
+            # uploaded files that take precedence over anything on disk, so a pull
+            # would be invisible and pointless — disable Sync in that case. The
+            # toggle renders further down (after this button), so read its
+            # persisted state from session_state; toggling it always triggers a
+            # rerun, so the value is current by the time this matters. Default
+            # mirrors the toggle's own default (on only when no snapshot on disk).
+            override_on = st.session_state.get("data_override", not files)
             do_refresh = False
             if running or wh_running:
                 if st.button("Check for new data", key="check_refresh"):
@@ -729,13 +738,22 @@ def main():
                 do_refresh = st.button(
                     "🔄 Sync from Data Warehouse",
                     key="refresh_all",
+                    disabled=override_on,
                     help="Pull the demand snapshot (last few weeks + current "
                          "projections) and the five regional warehouse-projection "
                          "files from the data warehouse now, in the background, and "
                          "re-fetch list prices from the Plytix feed. The page stays "
                          "usable and switches to the new snapshots when they're "
-                         "ready. A nightly job does the full pull.",
+                         "ready. A nightly job does the full pull. Unavailable while "
+                         "\"Manually override data\" is on, since the pull writes to "
+                         "a new snapshot on disk that your chosen/uploaded files "
+                         "override.",
                 )
+                if override_on:
+                    st.caption(
+                        "Sync is paused while \"Manually override data\" is on — "
+                        "turn it off to sync."
+                    )
             # A compact timestamp of the last data-warehouse pull, so users know
             # how fresh the auto-loaded data is without opening the manual
             # pickers. Sits right under the sync button as its status line.
