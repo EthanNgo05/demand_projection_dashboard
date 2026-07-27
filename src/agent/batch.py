@@ -173,7 +173,7 @@ def main(argv=None) -> int:
         os.environ[var] = "1"
 
     # ProcessPoolExecutor imported here so the thread-cap env is set first.
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     started = time.time()
     ok = fail = 0
@@ -189,7 +189,16 @@ def main(argv=None) -> int:
             initializer=_worker_init,
             initargs=(cleaned_path, prices, today_ts),
         ) as ex:
-            for view, succeeded, error in ex.map(_run_view, views):
+            # submit + as_completed, NOT ex.map: map yields results in SUBMISSION
+            # order, so the counter would stall on the first-listed view (the slow
+            # combined/regional rollups from enumerate_views) even while a dozen
+            # small views have already finished and written their JSON. Iterating
+            # as they COMPLETE makes "k of N done" track the files actually on
+            # disk. _run_view never raises (it wraps its own errors), so
+            # fut.result() is a plain (view, ok, error) unpack.
+            futures = [ex.submit(_run_view, v) for v in views]
+            for fut in as_completed(futures):
+                view, succeeded, error = fut.result()
                 if succeeded:
                     ok += 1
                     tag = "ok" if not error else f"ok (warnings: {error})"
@@ -197,7 +206,7 @@ def main(argv=None) -> int:
                     fail += 1
                     failures.append((view, error))
                     tag = f"FAILED: {error}"
-                print(f"  [{ok + fail}/{len(views)}] {view} -> {tag}")
+                print(f"  [{ok + fail}/{len(views)}] {view} -> {tag}", flush=True)
     finally:
         try:
             os.remove(cleaned_path)

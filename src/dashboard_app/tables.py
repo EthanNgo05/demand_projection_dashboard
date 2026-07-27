@@ -62,12 +62,10 @@ def style_summary(summary_df):
 
 
 # --------------------------------------------------------------------------- #
-# Excel-style add-filter chips (searchable checklist / date range per field)   #
+# Excel-style add-filter chips (multiselect / date range per field)            #
 # --------------------------------------------------------------------------- #
 # Only these fields are ever offered as filters — no continuous-number columns
-# (e.g. Revenue Risk) that would make a useless hundreds-long checkbox list.
-_SMALL_LIST = 15    # lists this short show every value up-front; bigger ones search
-_CAP = 200          # max checkboxes rendered at once (keeps big fields snappy)
+# (e.g. Revenue Risk) that would make a useless hundreds-long value list.
 _ADD_PLACEHOLDER = "➕ Add filter…"
 # Recognised week/date columns across the summary and data-quality tables.
 _DATE_COLS = ["First_WeekDate", "Last_WeekDate",
@@ -75,15 +73,9 @@ _DATE_COLS = ["First_WeekDate", "Last_WeekDate",
               "First Missing Week", "Last Missing Week"]
 
 
-def _cb_key(wkey, opt):
-    return f"{wkey}__cb__{opt}"
-
-
-def _set_many(wkey, options, value):
-    """Callback: check/uncheck a batch of options (runs before the rerun renders
-    the checkboxes, so setting their session_state keys is safe)."""
-    for o in options:
-        st.session_state[_cb_key(wkey, o)] = value
+def _ms_key(wkey):
+    """Session-state key holding a checklist/active-in field's multiselect list."""
+    return f"{wkey}__ms"
 
 
 def _build_fields(df, key, P):
@@ -178,8 +170,8 @@ def _selection(field):
         return None
     if field["kind"] == "starred":
         return bool(st.session_state.get(f"{wkey}__on", False))
-    return {o for o in field["options"]
-            if st.session_state.get(_cb_key(wkey, o), False)}
+    # checklist / active_in: the multiselect stores its picked values as a list.
+    return set(st.session_state.get(_ms_key(wkey), []))
 
 
 def _field_mask(df, field, selection):
@@ -211,54 +203,18 @@ def _field_mask(df, field, selection):
     return overlap.fillna(True)  # keep rows with unknown dates
 
 
-def _popover_checklist(label, options, wkey):
-    """A filter chip: a popover button opening a searchable checkbox list.
+def _multiselect_field(label, options, wkey):
+    """A filter chip: a multiselect listing the field's currently-reachable values.
 
-    Values are OR-ed within the field. Small lists render in full; large ones
-    show a search box (and only the values you've already checked) until you
-    type, so the dropdown stays fast and uncluttered. Each checkbox owns its
-    state via a stable session-state key, so a choice survives reruns and being
-    searched out of view. Returns the set of checked values (empty = no filter).
-    """
-    options = list(options)
-
-    def selected():
-        return [o for o in options if st.session_state.get(_cb_key(wkey, o), False)]
-
-    n = len(selected())
-    with st.popover(f"{label} ({n})" if n else label, use_container_width=True):
-        query = st.text_input(
-            f"Search {label}", key=f"{wkey}__q", placeholder="Type to search…",
-            label_visibility="collapsed",
-        ).strip().lower()
-
-        if query:
-            matches = [o for o in options if query in str(o).lower()]
-        elif len(options) <= _SMALL_LIST:
-            matches = options
-        else:
-            matches = None  # big list, no query: show only what's already picked
-
-        batch = matches if matches is not None else options
-        c_all, c_clear = st.columns(2)
-        c_all.button("Select all", key=f"{wkey}__all", use_container_width=True,
-                     on_click=_set_many, args=(wkey, batch, True))
-        c_clear.button("Clear", key=f"{wkey}__clear", use_container_width=True,
-                       on_click=_set_many, args=(wkey, batch, False))
-
-        if matches is None:
-            for o in sorted(selected(), key=str):
-                st.checkbox(str(o), key=_cb_key(wkey, o))
-            st.caption(f"Type to search {len(options):,} values.")
-        else:
-            for o in matches[:_CAP]:
-                st.checkbox(str(o), key=_cb_key(wkey, o))
-            if len(matches) > _CAP:
-                st.caption(f"Showing {_CAP:,} of {len(matches):,} — refine the search.")
-            elif not matches:
-                st.caption("No matches.")
-
-    return set(selected())
+    Values are OR-ed within the field. ``st.multiselect`` is natively multi-select
+    with built-in type-to-search (fine for the ~700-SKU list) and shows the picks
+    as removable tags. Its own session-state key (``_ms_key``) persists the choice
+    across reruns. Returns the set of picked values (empty = no filter)."""
+    picked = st.multiselect(
+        label, list(options), key=_ms_key(wkey),
+        placeholder=f"All {label.lower()} — type to search",
+    )
+    return set(picked)
 
 
 def _popover_daterange(label, field):
@@ -296,7 +252,7 @@ def _add_filter(key, active_key):
     st.session_state[f"{key}__add"] = _ADD_PLACEHOLDER  # reset for the next add
 
 
-def _remove_filter(active_key, label, wkey, kind, options):
+def _remove_filter(active_key, label, wkey, kind):
     """Callback: drop a filter chip and clear whatever it had selected."""
     st.session_state[active_key] = [
         l for l in st.session_state.get(active_key, []) if l != label
@@ -305,20 +261,19 @@ def _remove_filter(active_key, label, wkey, kind, options):
         st.session_state.pop(f"{wkey}__di", None)
     elif kind == "starred":
         st.session_state.pop(f"{wkey}__on", None)
-    else:
-        for o in options:
-            st.session_state[_cb_key(wkey, o)] = False
+    else:  # checklist / active_in
+        st.session_state.pop(_ms_key(wkey), None)
 
 
 def filter_table(df, key, P=None):
     """Add-filter-chip filtering: start clean, add only the fields you want.
 
-    An "Add filter" picker activates a field; each active filter shows as a chip
-    — a searchable checkbox dropdown (or a date-range picker) plus a ✕ to remove
-    it. Excel semantics (OR within a field, AND across fields) with
-    cross-filtering, so the active dropdowns only offer values that still yield
-    rows. Only the whitelist SKU / Customer / Data Source / Model Used / Region /
-    Date range / Active In is offered. ``key`` namespaces the widgets.
+    An "Add filter" picker activates a field; each active filter shows as a row
+    — a multiselect (or a date-range / starred popover) plus a ✕ to remove it.
+    Excel semantics (OR within a field, AND across fields) with cross-filtering,
+    so the active multiselects only offer values that still yield rows. Only the
+    whitelist SKU / Customer / Data Source / Model Used / Region / Date range /
+    Active In is offered. ``key`` namespaces the widgets.
     """
     fields = _build_fields(df, key, P)
     if not fields:
@@ -364,43 +319,40 @@ def filter_table(df, key, P=None):
             return codes
         return None
 
-    # Clamp away any checked value that no longer yields rows, so an empty
-    # combination can't persist (date fields aren't clamped).
+    # Clamp away any picked value that no longer yields rows, so an empty
+    # combination can't persist (date fields aren't clamped). Rewriting the
+    # multiselect's stored list here — before the widget instantiates — is legal
+    # and keeps the value ⊆ its options (which Streamlit requires).
+    reachable_by = {}
     for f in active_fields:
         if f["kind"] in ("date", "starred"):
             continue
         reachable = available(f)
-        for o in list(sel[f["label"]]):
-            if o not in reachable:
-                st.session_state[_cb_key(f["wkey"], o)] = False
-                sel[f["label"]].discard(o)
+        reachable_by[f["label"]] = reachable
+        kept = [o for o in sel[f["label"]] if o in reachable]
+        if len(kept) != len(sel[f["label"]]):
+            st.session_state[_ms_key(f["wkey"])] = kept
+            sel[f["label"]] = set(kept)
 
-    # Render active filters as compact chips — [ control ][✕] — several per row.
+    # Render active filters one per row — [ control ][✕] — so each multiselect has
+    # room to show every picked value as a tag (date/starred keep compact popovers).
     selections = {}
-    per_row, chip_w, x_w = 3, 5, 1
-    unit = chip_w + x_w
-    for start in range(0, len(active_fields), per_row):
-        chunk = active_fields[start:start + per_row]
-        widths = [chip_w, x_w] * len(chunk)
-        if len(chunk) < per_row:
-            widths.append(unit * (per_row - len(chunk)))  # spacer keeps chips small
-        cols = st.columns(widths)
-        for i, f in enumerate(chunk):
-            with cols[i * 2]:
-                if f["kind"] == "date":
-                    selections[f["label"]] = _popover_daterange(f["label"], f)
-                elif f["kind"] == "starred":
-                    selections[f["label"]] = _popover_starred(f["label"], f)
-                else:
-                    selections[f["label"]] = _popover_checklist(
-                        f["label"], sorted(available(f), key=str), f["wkey"]
-                    )
-            with cols[i * 2 + 1]:
-                st.button("✕", key=f"{f['wkey']}__rm",
-                          help=f"Remove the {f['label']} filter",
-                          on_click=_remove_filter,
-                          args=(active_key, f["label"], f["wkey"], f["kind"],
-                                f.get("options", [])))
+    for f in active_fields:
+        ctrl_col, x_col = st.columns([12, 1], vertical_alignment="bottom")
+        with ctrl_col:
+            if f["kind"] == "date":
+                selections[f["label"]] = _popover_daterange(f["label"], f)
+            elif f["kind"] == "starred":
+                selections[f["label"]] = _popover_starred(f["label"], f)
+            else:
+                selections[f["label"]] = _multiselect_field(
+                    f["label"], sorted(reachable_by[f["label"]], key=str), f["wkey"]
+                )
+        with x_col:
+            st.button("✕", key=f"{f['wkey']}__rm",
+                      help=f"Remove the {f['label']} filter",
+                      on_click=_remove_filter,
+                      args=(active_key, f["label"], f["wkey"], f["kind"]))
 
     mask = pd.Series(True, index=df.index)
     for f in active_fields:

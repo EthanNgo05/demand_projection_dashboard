@@ -13,7 +13,7 @@ import streamlit as st
 
 from dashboard_app.compute import (
     _agent_summaries_mtime,
-    _agent_summaries_generated_at,
+    _agent_summaries_oldest_at,
     compute_by_customer_best,
 )
 from dashboard_app.config import BEST_MODEL_COMBINED_VIEW
@@ -39,7 +39,10 @@ def _best_model_table(df, today_ts, today_str, prices, n_excluded_rows):
         with st.spinner("Forecasting each group with its best model…"):
             result = compute_by_customer_best(df, today_ts, prices, min_weeks=None)
         st.session_state["bestmix_result"] = result
-        st.session_state["bestmix_generated_at"] = _agent_summaries_generated_at()
+        # Oldest stamp — see kpis.py: the shared "bestmix_generated_at" cache must
+        # mean the same thing whichever view populated it (the freshness caption
+        # reads it as "everything here is at least this fresh").
+        st.session_state["bestmix_generated_at"] = _agent_summaries_oldest_at()
         st.session_state["bestmix_structural"] = sig
     else:
         result = st.session_state.get("bestmix_result")

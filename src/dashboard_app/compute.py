@@ -234,6 +234,28 @@ def _agent_summaries_generated_at():
     return latest
 
 
+def _agent_summaries_oldest_at():
+    """Oldest ``generated_at`` across outputs/agent_summary_*.json, or None.
+
+    The companion to _agent_summaries_generated_at (which returns the NEWEST).
+    While a batch rewrites the summaries one view at a time, the newest stamp
+    races ahead of the run even though most files are still from the PREVIOUS
+    run — so "last generated <newest>" reads as if the whole set just refreshed
+    when it hasn't. The OLDEST stamp is the honest "as of" for the table: every
+    view in it is at least this fresh. Same one-pass parse; the stamps share the
+    ISO ``YYYY-MM-DDTHH:MM:SS`` format, so a lexical min is the oldest."""
+    oldest = None
+    for p in glob.glob(os.path.join(REPO_ROOT, "outputs", "agent_summary_*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                gen = json.load(f).get("generated_at")
+        except (OSError, ValueError):
+            continue
+        if gen and (oldest is None or str(gen) < oldest):
+            oldest = str(gen)
+    return oldest
+
+
 def _best_model_for_group(group):
     """(label, model_path) for a group's backtest-winning model, or None.
 
