@@ -74,6 +74,14 @@ MODEL_USED_COL = "Model Used"
 # returned by list_views/enumerate_views, so the agent never forecasts it.
 EXCEPTIONS_VIEW = "Exceptions"
 
+# A pin-board view: users star (SKU, Customer Grouping) combinations on a single
+# shared watchlist and jump straight to their projection detail. Like
+# EXCEPTIONS_VIEW this string is a dashboard-only top-level scope token — it never
+# reaches the compute path and is never returned by list_views/enumerate_views,
+# so the agent never forecasts it. Its detail numbers reuse the best-model-per-
+# group table (BEST_MODEL_COMBINED_VIEW).
+WATCHLIST_VIEW = "Watchlist"
+
 # Dashboard-only top-level selector token that groups the two standard
 # single-model views (ALL_CUSTOMERS_VIEW + "By region") under one tab with a
 # nested sub-selector. It is NOT a forecast `view` ID — it never reaches the
@@ -91,6 +99,7 @@ SCOPE_LABELS = {
     QUICK_VIEW: "Quick Projections",
     BEST_MODEL_COMBINED_VIEW: "Optimized Projections",
     EXCEPTIONS_VIEW: "Exceptions",
+    WATCHLIST_VIEW: "Watchlist",
     # Quick Projections sub-views:
     ALL_CUSTOMERS_VIEW: "All Customers",
     "By region": "By Region",
@@ -120,6 +129,12 @@ SCOPE_CAPTIONS = {
         "Scans every customer group for SKUs whose recent actual sell-through has "
         "diverged sharply from the existing system projection (the plan of "
         "record). Model-agnostic — no forecast is run."
+    ),
+    WATCHLIST_VIEW: (
+        "Star SKU / customer-group combinations on named lists to pin their "
+        "projection detail (best-model numbers + an actuals-vs-plan chart). The "
+        "active list drives the ★ marker on every table; lists are shared across "
+        "everyone using this dashboard."
     ),
 }
 

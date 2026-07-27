@@ -1,8 +1,13 @@
 """Summary-table styling and the Excel-style add-filter-chip table filters."""
+import re
+
 import pandas as pd
 import streamlit as st
 
 from dashboard_app.config import MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar
+from dashboard_app.watchlist import (
+    STAR_PREFIX, active_pairs, mark_starred_sku, starred_mask,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -59,12 +64,10 @@ def style_summary(summary_df):
 
 
 # --------------------------------------------------------------------------- #
-# Excel-style add-filter chips (searchable checklist / date range per field)   #
+# Excel-style add-filter chips (multiselect / date range per field)            #
 # --------------------------------------------------------------------------- #
 # Only these fields are ever offered as filters — no continuous-number columns
-# (e.g. Revenue Risk) that would make a useless hundreds-long checkbox list.
-_SMALL_LIST = 15    # lists this short show every value up-front; bigger ones search
-_CAP = 200          # max checkboxes rendered at once (keeps big fields snappy)
+# (e.g. Revenue Risk) that would make a useless hundreds-long value list.
 _ADD_PLACEHOLDER = "➕ Add filter…"
 # Recognised week/date columns across the summary and data-quality tables.
 _DATE_COLS = ["First_WeekDate", "Last_WeekDate",
@@ -72,15 +75,9 @@ _DATE_COLS = ["First_WeekDate", "Last_WeekDate",
               "First Missing Week", "Last Missing Week"]
 
 
-def _cb_key(wkey, opt):
-    return f"{wkey}__cb__{opt}"
-
-
-def _set_many(wkey, options, value):
-    """Callback: check/uncheck a batch of options (runs before the rerun renders
-    the checkboxes, so setting their session_state keys is safe)."""
-    for o in options:
-        st.session_state[_cb_key(wkey, o)] = value
+def _ms_key(wkey):
+    """Session-state key holding a checklist/active-in field's multiselect list."""
+    return f"{wkey}__ms"
 
 
 def _build_fields(df, key, P):
@@ -100,6 +97,16 @@ def _build_fields(df, key, P):
                 "values": series,
                 "options": sorted(series.dropna().unique(), key=str),
             })
+
+    # Watchlist ("Starred") filter — a single toggle that narrows to rows on the
+    # active watchlist. Membership is computed live (no column); only offered when
+    # it actually varies (some but not all rows starred), so it would narrow.
+    starred = starred_mask(df)
+    if starred is not None and starred.any() and not starred.all():
+        fields.append({
+            "label": "Starred", "wkey": f"{key}::Starred",
+            "kind": "starred", "values": starred,
+        })
 
     if "SKU" in df.columns:
         add_checklist("SKU", df["SKU"])
@@ -163,13 +170,19 @@ def _selection(field):
         if isinstance(cur, (tuple, list)) and len(cur) == 2:
             return (cur[0], cur[1])
         return None
-    return {o for o in field["options"]
-            if st.session_state.get(_cb_key(wkey, o), False)}
+    if field["kind"] == "starred":
+        return bool(st.session_state.get(f"{wkey}__on", False))
+    # checklist / active_in: the multiselect stores its picked values as a list.
+    return set(st.session_state.get(_ms_key(wkey), []))
 
 
 def _field_mask(df, field, selection):
     """Boolean row mask for one field's selection (empty selection → all True)."""
     kind = field["kind"]
+    if kind == "starred":
+        if not selection:
+            return pd.Series(True, index=df.index)
+        return field["values"]
     if kind == "checklist":
         if not selection:
             return pd.Series(True, index=df.index)
@@ -192,54 +205,18 @@ def _field_mask(df, field, selection):
     return overlap.fillna(True)  # keep rows with unknown dates
 
 
-def _popover_checklist(label, options, wkey):
-    """A filter chip: a popover button opening a searchable checkbox list.
+def _multiselect_field(label, options, wkey):
+    """A filter chip: a multiselect listing the field's currently-reachable values.
 
-    Values are OR-ed within the field. Small lists render in full; large ones
-    show a search box (and only the values you've already checked) until you
-    type, so the dropdown stays fast and uncluttered. Each checkbox owns its
-    state via a stable session-state key, so a choice survives reruns and being
-    searched out of view. Returns the set of checked values (empty = no filter).
-    """
-    options = list(options)
-
-    def selected():
-        return [o for o in options if st.session_state.get(_cb_key(wkey, o), False)]
-
-    n = len(selected())
-    with st.popover(f"{label} ({n})" if n else label, use_container_width=True):
-        query = st.text_input(
-            f"Search {label}", key=f"{wkey}__q", placeholder="Type to search…",
-            label_visibility="collapsed",
-        ).strip().lower()
-
-        if query:
-            matches = [o for o in options if query in str(o).lower()]
-        elif len(options) <= _SMALL_LIST:
-            matches = options
-        else:
-            matches = None  # big list, no query: show only what's already picked
-
-        batch = matches if matches is not None else options
-        c_all, c_clear = st.columns(2)
-        c_all.button("Select all", key=f"{wkey}__all", use_container_width=True,
-                     on_click=_set_many, args=(wkey, batch, True))
-        c_clear.button("Clear", key=f"{wkey}__clear", use_container_width=True,
-                       on_click=_set_many, args=(wkey, batch, False))
-
-        if matches is None:
-            for o in sorted(selected(), key=str):
-                st.checkbox(str(o), key=_cb_key(wkey, o))
-            st.caption(f"Type to search {len(options):,} values.")
-        else:
-            for o in matches[:_CAP]:
-                st.checkbox(str(o), key=_cb_key(wkey, o))
-            if len(matches) > _CAP:
-                st.caption(f"Showing {_CAP:,} of {len(matches):,} — refine the search.")
-            elif not matches:
-                st.caption("No matches.")
-
-    return set(selected())
+    Values are OR-ed within the field. ``st.multiselect`` is natively multi-select
+    with built-in type-to-search (fine for the ~700-SKU list) and shows the picks
+    as removable tags. Its own session-state key (``_ms_key``) persists the choice
+    across reruns. Returns the set of picked values (empty = no filter)."""
+    picked = st.multiselect(
+        label, list(options), key=_ms_key(wkey),
+        placeholder=f"All {label.lower()} — type to search",
+    )
+    return set(picked)
 
 
 def _popover_daterange(label, field):
@@ -257,6 +234,15 @@ def _popover_daterange(label, field):
     return None  # mid-selection (only a start picked) → treat as no filter
 
 
+def _popover_starred(label, field):
+    """A watchlist filter chip: one checkbox that narrows to starred rows."""
+    onkey = f"{field['wkey']}__on"
+    on = bool(st.session_state.get(onkey, False))
+    with st.popover(f"{label} ✓" if on else label, use_container_width=True):
+        st.checkbox("On the active watchlist", key=onkey)
+    return bool(st.session_state.get(onkey, False))
+
+
 def _add_filter(key, active_key):
     """Callback: activate the field chosen in the "Add filter" selectbox."""
     choice = st.session_state.get(f"{key}__add")
@@ -268,27 +254,28 @@ def _add_filter(key, active_key):
     st.session_state[f"{key}__add"] = _ADD_PLACEHOLDER  # reset for the next add
 
 
-def _remove_filter(active_key, label, wkey, kind, options):
+def _remove_filter(active_key, label, wkey, kind):
     """Callback: drop a filter chip and clear whatever it had selected."""
     st.session_state[active_key] = [
         l for l in st.session_state.get(active_key, []) if l != label
     ]
     if kind == "date":
         st.session_state.pop(f"{wkey}__di", None)
-    else:
-        for o in options:
-            st.session_state[_cb_key(wkey, o)] = False
+    elif kind == "starred":
+        st.session_state.pop(f"{wkey}__on", None)
+    else:  # checklist / active_in
+        st.session_state.pop(_ms_key(wkey), None)
 
 
 def filter_table(df, key, P=None):
     """Add-filter-chip filtering: start clean, add only the fields you want.
 
-    An "Add filter" picker activates a field; each active filter shows as a chip
-    — a searchable checkbox dropdown (or a date-range picker) plus a ✕ to remove
-    it. Excel semantics (OR within a field, AND across fields) with
-    cross-filtering, so the active dropdowns only offer values that still yield
-    rows. Only the whitelist SKU / Customer / Data Source / Model Used / Region /
-    Date range / Active In is offered. ``key`` namespaces the widgets.
+    An "Add filter" picker activates a field; each active filter shows as a row
+    — a multiselect (or a date-range / starred popover) plus a ✕ to remove it.
+    Excel semantics (OR within a field, AND across fields) with cross-filtering,
+    so the active multiselects only offer values that still yield rows. Only the
+    whitelist SKU / Customer / Data Source / Model Used / Region / Date range /
+    Active In is offered. ``key`` namespaces the widgets.
     """
     fields = _build_fields(df, key, P)
     if not fields:
@@ -334,41 +321,40 @@ def filter_table(df, key, P=None):
             return codes
         return None
 
-    # Clamp away any checked value that no longer yields rows, so an empty
-    # combination can't persist (date fields aren't clamped).
+    # Clamp away any picked value that no longer yields rows, so an empty
+    # combination can't persist (date fields aren't clamped). Rewriting the
+    # multiselect's stored list here — before the widget instantiates — is legal
+    # and keeps the value ⊆ its options (which Streamlit requires).
+    reachable_by = {}
     for f in active_fields:
-        if f["kind"] == "date":
+        if f["kind"] in ("date", "starred"):
             continue
         reachable = available(f)
-        for o in list(sel[f["label"]]):
-            if o not in reachable:
-                st.session_state[_cb_key(f["wkey"], o)] = False
-                sel[f["label"]].discard(o)
+        reachable_by[f["label"]] = reachable
+        kept = [o for o in sel[f["label"]] if o in reachable]
+        if len(kept) != len(sel[f["label"]]):
+            st.session_state[_ms_key(f["wkey"])] = kept
+            sel[f["label"]] = set(kept)
 
-    # Render active filters as compact chips — [ control ][✕] — several per row.
+    # Render active filters one per row — [ control ][✕] — so each multiselect has
+    # room to show every picked value as a tag (date/starred keep compact popovers).
     selections = {}
-    per_row, chip_w, x_w = 3, 5, 1
-    unit = chip_w + x_w
-    for start in range(0, len(active_fields), per_row):
-        chunk = active_fields[start:start + per_row]
-        widths = [chip_w, x_w] * len(chunk)
-        if len(chunk) < per_row:
-            widths.append(unit * (per_row - len(chunk)))  # spacer keeps chips small
-        cols = st.columns(widths)
-        for i, f in enumerate(chunk):
-            with cols[i * 2]:
-                if f["kind"] == "date":
-                    selections[f["label"]] = _popover_daterange(f["label"], f)
-                else:
-                    selections[f["label"]] = _popover_checklist(
-                        f["label"], sorted(available(f), key=str), f["wkey"]
-                    )
-            with cols[i * 2 + 1]:
-                st.button("✕", key=f"{f['wkey']}__rm",
-                          help=f"Remove the {f['label']} filter",
-                          on_click=_remove_filter,
-                          args=(active_key, f["label"], f["wkey"], f["kind"],
-                                f.get("options", [])))
+    for f in active_fields:
+        ctrl_col, x_col = st.columns([12, 1], vertical_alignment="bottom")
+        with ctrl_col:
+            if f["kind"] == "date":
+                selections[f["label"]] = _popover_daterange(f["label"], f)
+            elif f["kind"] == "starred":
+                selections[f["label"]] = _popover_starred(f["label"], f)
+            else:
+                selections[f["label"]] = _multiselect_field(
+                    f["label"], sorted(reachable_by[f["label"]], key=str), f["wkey"]
+                )
+        with x_col:
+            st.button("✕", key=f"{f['wkey']}__rm",
+                      help=f"Remove the {f['label']} filter",
+                      on_click=_remove_filter,
+                      args=(active_key, f["label"], f["wkey"], f["kind"]))
 
     mask = pd.Series(True, index=df.index)
     for f in active_fields:
@@ -391,9 +377,191 @@ def render_filtered_table(df, key, P=None, *, style=True, column_config=None):
     (the unfiltered frame) is captured as a fragment arg and reused each rerun.
     ``column_config`` is forwarded to ``st.dataframe`` so callers can pin
     per-column widths (e.g. widen a free-text column so its text isn't clipped).
+    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
+    (display only — filtering runs on the un-prefixed frame).
     """
     filtered = filter_table(df, key, P)
+    display = mark_starred_sku(filtered)
     st.dataframe(
-        style_summary(filtered) if style else filtered,
+        style_summary(display) if style else display,
         width="stretch", hide_index=True, column_config=column_config,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Click-to-expand exception tables (condensed rows + a detail card on select)  #
+# --------------------------------------------------------------------------- #
+def _fmt_detail_value(col, val):
+    """Format one cell for the detail card, matching how style_summary renders
+    the same column in the table (dollars, signed percent, comma'd integers)."""
+    if pd.isna(val):
+        return "—"
+    if col == PRICE_COL:
+        return fmt_dollar(val, decimals=2)
+    if col == RISK_COL:
+        return fmt_dollar(val, decimals=0)
+    if col == "% Deviation":
+        return f"{int(val):,}%" if val == int(val) else f"{val:,.2f}%"
+    int_cols = {
+        "Weeks with data", "Current Projection Average",
+        "Updated Projection Average", "Projection Difference",
+    }
+    if col in int_cols:
+        return f"{val:,.0f}"
+    if col.endswith("POS/Orders Average") and isinstance(val, (int, float)):
+        return f"{val:,.0f}" if float(val).is_integer() else f"{val:,.1f}"
+    return str(val)
+
+
+def _dismiss_card(dismissed_key, label):
+    """Callback: mark a card's row-label dismissed so its detail card closes in
+    place (runs before the rerun, so the card is gone on the next render)."""
+    st.session_state.setdefault(dismissed_key, set()).add(label)
+
+
+def _render_row_detail(row, shown, detail_chart=None, key_base=None,
+                       dismissed_key=None, close_label=None, card_cols=None,
+                       row_action=None):
+    """Render a row's full detail in a bordered card beneath the table.
+
+    ``card_cols`` (if given) is the explicit, ordered list of fields to show in the
+    card, decoupled from the frame's full column set (which the condensed table,
+    sorting, and the Excel download still need). Without it the card falls back to
+    listing EVERY non-hidden field, so other callers keep their behaviour. ``shown``
+    is kept for signature stability but no longer hides columns. When ``detail_chart``
+    is given it is called with ``(row, key_base)`` to draw a chart below the fields.
+    A ✕ button (top-right) dismisses the card via ``dismissed_key``/``close_label``
+    so the user can close it without scrolling the table back up to deselect.
+    ``row_action`` (if given) is a ``{label, help, danger, callback}`` dict rendered
+    as a button at the bottom of the card; clicking it calls ``callback(row)`` (the
+    callback owns any rerun — e.g. by opening a confirmation dialog)."""
+    # SKU and Description live in the card title, so they're dropped from the grid;
+    # the remaining columns start with Customer Grouping, which fills the first slot.
+    if card_cols is not None:
+        detail_cols = [
+            c for c in card_cols
+            if c in row.index and c not in ("SKU", "Description")
+            and not str(c).startswith("_")
+        ]
+    else:
+        detail_cols = [
+            c for c in row.index
+            if c not in ("SKU", "Description") and not str(c).startswith("_")
+        ]
+    # "Note" reads as a sentence, not a stat — peel it out of the 3-per-row grid and
+    # render it full-width at the bottom (only when it carries text), so the grid's
+    # last row stays a clean pair (e.g. List Price · Weeks with data).
+    note_val = row["Note"] if "Note" in detail_cols else None
+    if "Note" in detail_cols:
+        detail_cols = [c for c in detail_cols if c != "Note"]
+    show_note = note_val is not None and not pd.isna(note_val) and str(note_val) != ""
+
+    desc = row["Description"] if "Description" in row.index else ""
+    # Mark the card title with a ★ when this row is on the active watchlist, so an
+    # opened card (in any view) shows membership without a dedicated column.
+    cust = row.get("Customer Grouping") or row.get("Customer")
+    star = STAR_PREFIX if (str(row.get("SKU", "")), str(cust)) in active_pairs() else ""
+    # Keyed so the scoped CSS in render_selectable_table can tint + space each card.
+    card_key = re.sub(r"[^0-9A-Za-z_-]+", "-", f"detailcard-{key_base}-{close_label}")
+    with st.container(border=True, key=card_key):
+        title_col, x_col = st.columns([12, 1])
+        sku_txt = f"{star}{row.get('SKU', '')}"
+        title = f"**{sku_txt}** — {desc}" if desc else f"**{sku_txt}**"
+        title_col.markdown(title)
+        if dismissed_key is not None and close_label is not None:
+            x_col.button(
+                "✕", key=f"{key_base}__close__{close_label}", help="Close this card",
+                on_click=_dismiss_card, args=(dismissed_key, close_label),
+            )
+        per_row = 3
+        for start in range(0, len(detail_cols), per_row):
+            chunk = detail_cols[start:start + per_row]
+            cols = st.columns(per_row)
+            for i, c in enumerate(chunk):
+                cols[i].markdown(f"**{c}**\n\n{_fmt_detail_value(c, row[c])}")
+        if show_note:
+            st.markdown(f"**Note**\n\n{_fmt_detail_value('Note', note_val)}")
+        if detail_chart is not None:
+            detail_chart(row, key_base)
+        if row_action is not None:
+            btn_key = re.sub(r"[^0-9A-Za-z_-]+", "-",
+                             f"{key_base}__rowaction__{close_label}")
+            if row_action.get("danger"):
+                # Scope the destructive red styling to this button's key wrapper,
+                # matching the delete-watchlist confirm button elsewhere.
+                st.markdown(
+                    f"<style>.st-key-{btn_key} button{{background-color:#dc2626;"
+                    "border-color:#dc2626;color:#fff;}"
+                    f".st-key-{btn_key} button:hover{{background-color:#b91c1c;"
+                    "border-color:#b91c1c;color:#fff;}</style>",
+                    unsafe_allow_html=True,
+                )
+            if st.button(row_action["label"], key=btn_key,
+                         help=row_action.get("help"), width="content"):
+                row_action["callback"](row)
+
+
+@st.fragment
+def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
+                            column_config=None, detail_chart=None, detail_cols=None,
+                            row_action=None):
+    """Like render_filtered_table, but shows only ``condensed_cols`` per row and
+    reveals the full row in a detail card below when a row is clicked.
+
+    The Exceptions tables use this so each row stays scannable (SKU / Customer /
+    projection / revenue risk) while every other field is one click away. Select
+    multiple rows to stack their detail cards side by side. Filtering still runs on
+    the FULL frame, so the filter chips are unaffected; the detail lookup also uses
+    the full frame, mapping each selected positional index back to ``filtered``.
+    Wrapped in a fragment so a row click reruns only this block. ``detail_chart``,
+    if given, is a ``(row, key_base)`` callback that draws a chart inside each card.
+    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
+    (display only — filtering and the detail lookup use the un-prefixed frame).
+    ``row_action`` is forwarded to each detail card (see ``_render_row_detail``) so
+    callers can add a per-row button (e.g. the watchlist's "Remove" affordance).
+    """
+    filtered = filter_table(df, key, P)
+    display_cols = [c for c in condensed_cols if c in filtered.columns]
+    display_df = mark_starred_sku(filtered[display_cols])
+    event = st.dataframe(
+        style_summary(display_df) if style else display_df,
+        width="stretch", hide_index=True, column_config=column_config,
+        on_select="rerun", selection_mode="multi-row", key=f"{key}__sel",
+    )
+    # Positional indices persist across reruns, so drop any that a filter has since
+    # pushed out of range (sorted so cards stack in table order, not click order).
+    rows = event.selection.rows if event and event.selection else []
+    rows = sorted(r for r in rows if r < len(filtered))
+
+    # Cards can be closed in place (✕) without deselecting the table row. Track the
+    # dismissed rows by their stable pandas index label (survives filtering, unlike
+    # the positional index). Prune to only still-selected rows so re-clicking a row
+    # reopens its card and a deselected row drops out of the dismissed set.
+    dismissed_key = f"{key}__dismissed"
+    selected_labels = {filtered.index[r] for r in rows}
+    dismissed = st.session_state.get(dismissed_key, set()) & selected_labels
+    st.session_state[dismissed_key] = dismissed
+
+    visible = [r for r in rows if filtered.index[r] not in dismissed]
+    if visible:
+        # Tint + space each detail card so stacked cards read as separate panels
+        # rather than one long card. Scoped to the cards' keyed wrappers; the
+        # translucent gray works on either theme.
+        st.markdown(
+            "<style>"
+            '[class*="st-key-detailcard-"]{'
+            "background-color:rgba(130,140,160,0.06);margin-bottom:0.9rem;}"
+            '[class*="st-key-detailcard-"] '
+            '[data-testid="stVerticalBlockBorderWrapper"],'
+            '[data-testid="stVerticalBlockBorderWrapper"][class*="st-key-detailcard-"]'
+            "{border-color:rgba(130,140,160,0.35);}"
+            "</style>",
+            unsafe_allow_html=True,
+        )
+        for r in visible:
+            _render_row_detail(filtered.iloc[r], shown=display_cols,
+                               detail_chart=detail_chart, key_base=key,
+                               dismissed_key=dismissed_key, close_label=filtered.index[r],
+                               card_cols=detail_cols, row_action=row_action)
+    else:
+        st.caption("Select one or more rows to see their full details.")

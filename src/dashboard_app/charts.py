@@ -226,3 +226,67 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None):
         ))
     title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
     return _base_layout(fig, title, ffw, y_title=f"Units ({source})")
+
+
+def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
+                          weekly=None):
+    """Per-SKU actuals vs the system's original projection — the Exceptions view's
+    model-agnostic chart. By default there is NO updated-forecast line (this view
+    runs no model), only the two series the view compares: actual POS or Orders
+    sell-through and the original/system projection (the plan of record).
+
+    ``agg`` is a per-SKU-week frame (``SKU, WeekDate, POS, Orders, Projection``)
+    already scoped to the one Customer Grouping. When ``date_range`` is given the
+    plotted traces are clipped to that window so the Y-axis rescales to fit. When a
+    per-SKU ``weekly`` frame (``SKU, WeekDate, projected_pos``) is passed — e.g. after
+    "Calculate Optimal Projection" — an orange dashed **Optimized forecast** line and
+    the actual→forecast connector are added, matching ``sku_chart``.
+    """
+    lb, lcw, ffw = anchors
+    col = "Orders" if source == "Orders" else "POS"
+
+    a = agg[agg["SKU"].astype(str) == str(sku)].sort_values("WeekDate")
+    hist = a[(a["WeekDate"] >= lb) & (a["WeekDate"] <= lcw)].dropna(subset=[col])
+    # Original projection: straight from the Projection column, from history start
+    # through the last week that carries a projection (its own forward horizon —
+    # no model frame needed), so the grey line runs the full width of the chart.
+    sys_proj = a[a["WeekDate"] >= lb].dropna(subset=["Projection"])
+
+    fc = None
+    if weekly is not None and not weekly.empty:
+        fc = weekly[weekly["SKU"].astype(str) == str(sku)].copy()
+        fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
+        fc = fc.sort_values("WeekDate")
+
+    hist = _clip_to_range(hist, date_range)
+    sys_proj = _clip_to_range(sys_proj, date_range)
+    if fc is not None:
+        fc = _clip_to_range(fc, date_range)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist["WeekDate"], y=hist[col], name=f"Actual {source}",
+        mode="lines+markers", line=dict(color=C_ACTUAL, width=3),
+        marker=dict(size=7),
+    ))
+    if not sys_proj.empty:
+        fig.add_trace(go.Scatter(
+            x=sys_proj["WeekDate"], y=sys_proj["Projection"],
+            name="Original projection", mode="lines+markers",
+            line=dict(color=C_ORIGINAL, width=2, dash="dot"), marker=dict(size=5),
+        ))
+    if fc is not None and not fc.empty:
+        if not hist.empty:
+            fig.add_trace(go.Scatter(
+                x=[hist["WeekDate"].iloc[-1], fc["WeekDate"].iloc[0]],
+                y=[hist[col].iloc[-1], fc["projected_pos"].iloc[0]],
+                mode="lines", showlegend=False,
+                line=dict(color=C_UPDATED, width=2, dash="dot"), hoverinfo="skip",
+            ))
+        fig.add_trace(go.Scatter(
+            x=fc["WeekDate"], y=fc["projected_pos"], name="Optimized forecast",
+            mode="lines+markers", line=dict(color=C_UPDATED, width=3, dash="dash"),
+            marker=dict(size=7),
+        ))
+    title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
+    return _base_layout(fig, title, ffw, y_title=f"Units ({source})")

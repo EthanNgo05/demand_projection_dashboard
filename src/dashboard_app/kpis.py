@@ -10,9 +10,10 @@ from dashboard_app.summaries import (
     resolve_avg_col, avg_window_phrase, historical_window, _format_generated_at,
 )
 from dashboard_app.compute import (
-    compute_by_customer_best, _agent_summaries_mtime, _agent_summaries_generated_at,
+    compute_by_customer_best, _agent_summaries_mtime, _agent_summaries_oldest_at,
     summary_to_excel,
 )
+from dashboard_app.refresh import batch_in_progress
 from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart
 from dashboard_app.tables import render_filtered_table
 
@@ -175,7 +176,10 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         finally:
             prog.empty()
         st.session_state["bestmix_result"] = result
-        st.session_state["bestmix_generated_at"] = _agent_summaries_generated_at()
+        # Oldest, not newest: the table stitches together every group's summary,
+        # and a partially-finished batch leaves most of them from the prior run.
+        # The oldest stamp says "everything here is at least this fresh."
+        st.session_state["bestmix_generated_at"] = _agent_summaries_oldest_at()
         st.session_state["bestmix_structural"] = sig
     else:
         result = st.session_state.get("bestmix_result")
@@ -184,10 +188,23 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         result if result is not None else (None, None, None, None, None, [])
     )
 
-    generated_at = st.session_state.get("bestmix_generated_at")
-    if generated_at:
+    # Freshness caption. While a batch is rewriting summaries, the table mixes
+    # freshly-recomputed and prior-run recommendations, so say so plainly rather
+    # than implying the whole set just regenerated. `oldest` is the honest "as
+    # of": every group in the table is at least this fresh.
+    oldest = st.session_state.get("bestmix_generated_at")
+    running, _ = batch_in_progress()
+    if running:
+        msg = ("⏳ A new recommendation run is in progress — this table currently "
+               "mixes freshly updated and prior-run recommendations, and fills in "
+               "as each view finishes.")
+        if oldest:
+            msg += (f" Oldest recommendation shown: "
+                    f"{_format_generated_at(oldest)}.")
+        st.caption(msg)
+    elif oldest:
         st.caption(
-            f"Recommendations last generated {_format_generated_at(generated_at)}"
+            f"All recommendations are from {_format_generated_at(oldest)} or later."
         )
 
     def _render_excluded(title):
