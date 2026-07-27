@@ -1,4 +1,6 @@
 """Summary-table styling and the Excel-style add-filter-chip table filters."""
+import re
+
 import pandas as pd
 import streamlit as st
 
@@ -418,27 +420,46 @@ def _dismiss_card(dismissed_key, label):
 
 
 def _render_row_detail(row, shown, detail_chart=None, key_base=None,
-                       dismissed_key=None, close_label=None):
+                       dismissed_key=None, close_label=None, card_cols=None):
     """Render a row's full detail in a bordered card beneath the table.
 
-    The card is self-contained: it lists EVERY field (SKU, Customer, the condensed
-    columns, and the rest) as label/value pairs, so it reads on its own. ``shown``
+    ``card_cols`` (if given) is the explicit, ordered list of fields to show in the
+    card, decoupled from the frame's full column set (which the condensed table,
+    sorting, and the Excel download still need). Without it the card falls back to
+    listing EVERY non-hidden field, so other callers keep their behaviour. ``shown``
     is kept for signature stability but no longer hides columns. When ``detail_chart``
     is given it is called with ``(row, key_base)`` to draw a chart below the fields.
     A ✕ button (top-right) dismisses the card via ``dismissed_key``/``close_label``
     so the user can close it without scrolling the table back up to deselect."""
     # SKU and Description live in the card title, so they're dropped from the grid;
     # the remaining columns start with Customer Grouping, which fills the first slot.
-    detail_cols = [
-        c for c in row.index
-        if c not in ("SKU", "Description") and not str(c).startswith("_")
-    ]
+    if card_cols is not None:
+        detail_cols = [
+            c for c in card_cols
+            if c in row.index and c not in ("SKU", "Description")
+            and not str(c).startswith("_")
+        ]
+    else:
+        detail_cols = [
+            c for c in row.index
+            if c not in ("SKU", "Description") and not str(c).startswith("_")
+        ]
+    # "Note" reads as a sentence, not a stat — peel it out of the 3-per-row grid and
+    # render it full-width at the bottom (only when it carries text), so the grid's
+    # last row stays a clean pair (e.g. List Price · Weeks with data).
+    note_val = row["Note"] if "Note" in detail_cols else None
+    if "Note" in detail_cols:
+        detail_cols = [c for c in detail_cols if c != "Note"]
+    show_note = note_val is not None and not pd.isna(note_val) and str(note_val) != ""
+
     desc = row["Description"] if "Description" in row.index else ""
     # Mark the card title with a ★ when this row is on the active watchlist, so an
     # opened card (in any view) shows membership without a dedicated column.
     cust = row.get("Customer Grouping") or row.get("Customer")
     star = STAR_PREFIX if (str(row.get("SKU", "")), str(cust)) in active_pairs() else ""
-    with st.container(border=True):
+    # Keyed so the scoped CSS in render_selectable_table can tint + space each card.
+    card_key = re.sub(r"[^0-9A-Za-z_-]+", "-", f"detailcard-{key_base}-{close_label}")
+    with st.container(border=True, key=card_key):
         title_col, x_col = st.columns([12, 1])
         sku_txt = f"{star}{row.get('SKU', '')}"
         title = f"**{sku_txt}** — {desc}" if desc else f"**{sku_txt}**"
@@ -454,13 +475,15 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
             cols = st.columns(per_row)
             for i, c in enumerate(chunk):
                 cols[i].markdown(f"**{c}**\n\n{_fmt_detail_value(c, row[c])}")
+        if show_note:
+            st.markdown(f"**Note**\n\n{_fmt_detail_value('Note', note_val)}")
         if detail_chart is not None:
             detail_chart(row, key_base)
 
 
 @st.fragment
 def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
-                            column_config=None, detail_chart=None):
+                            column_config=None, detail_chart=None, detail_cols=None):
     """Like render_filtered_table, but shows only ``condensed_cols`` per row and
     reveals the full row in a detail card below when a row is clicked.
 
@@ -498,9 +521,24 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
 
     visible = [r for r in rows if filtered.index[r] not in dismissed]
     if visible:
+        # Tint + space each detail card so stacked cards read as separate panels
+        # rather than one long card. Scoped to the cards' keyed wrappers; the
+        # translucent gray works on either theme.
+        st.markdown(
+            "<style>"
+            '[class*="st-key-detailcard-"]{'
+            "background-color:rgba(130,140,160,0.06);margin-bottom:0.9rem;}"
+            '[class*="st-key-detailcard-"] '
+            '[data-testid="stVerticalBlockBorderWrapper"],'
+            '[data-testid="stVerticalBlockBorderWrapper"][class*="st-key-detailcard-"]'
+            "{border-color:rgba(130,140,160,0.35);}"
+            "</style>",
+            unsafe_allow_html=True,
+        )
         for r in visible:
             _render_row_detail(filtered.iloc[r], shown=display_cols,
                                detail_chart=detail_chart, key_base=key,
-                               dismissed_key=dismissed_key, close_label=filtered.index[r])
+                               dismissed_key=dismissed_key, close_label=filtered.index[r],
+                               card_cols=detail_cols)
     else:
         st.caption("Select one or more rows to see their full details.")

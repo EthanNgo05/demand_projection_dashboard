@@ -12,17 +12,32 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_app.compute import (
+    ALL_HIST_AVG_COL,
+    EIGHT_WK_AVG_COL,
     _agent_summaries_mtime,
     _agent_summaries_oldest_at,
     compute_by_customer_best,
 )
-from dashboard_app.config import BEST_MODEL_COMBINED_VIEW
+from dashboard_app.config import BEST_MODEL_COMBINED_VIEW, PRICE_COL
 from dashboard_app.exceptions import _render_exception_chart, sku_week_by_group
 from dashboard_app.tables import render_selectable_table
 from dashboard_app.watchlist import (
     DEFAULT_NAME, active_name, active_pairs, create_watchlist, delete_watchlist,
     is_starred, list_names, rename_watchlist, set_active, toggle_star,
 )
+
+# Detail-card field order for the watchlist (decoupled from the best-model table's
+# full column set). Renders as three rows:
+#   Customer Grouping · Region · Data Source
+#   All-History Avg · 8-Week Avg · Current Projection Average
+#   List Price · Weeks with data
+# The projection change (new value, difference, revenue risk) comes from the card's
+# "Calculate Optimal Projection" button, so it's intentionally left off the grid.
+WATCHLIST_CARD_COLS = [
+    "Customer Grouping", "Region", "Data Source",
+    ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL, "Current Projection Average",
+    PRICE_COL, "Weeks with data",
+]
 
 
 def _best_model_table(df, today_ts, today_str, prices, n_excluded_rows):
@@ -231,10 +246,18 @@ def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, 
         chart_cb = functools.partial(
             _render_exception_chart, agg, anchors, df, prices, today_ts
         )
+        # Region isn't in the best-model table; derive it for the detail card.
+        # .assign copies, so the shared best-model cache stays untouched.
+        watch_df = watch_df.assign(
+            Region=watch_df["Customer Grouping"].map(
+                lambda g: str(P.region_for_group(g))
+            )
+        )
         render_selectable_table(
             watch_df, "watchlist", P,
             condensed_cols=["SKU", "Customer Grouping"],
             detail_chart=chart_cb,
+            detail_cols=WATCHLIST_CARD_COLS,
         )
 
     missing = sorted(p for p in pairs if p not in present)

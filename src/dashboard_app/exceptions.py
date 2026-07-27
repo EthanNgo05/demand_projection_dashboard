@@ -26,7 +26,7 @@ import streamlit as st
 from dashboard_app.compute import (
     EIGHT_WK_AVG_COL, _descriptive_averages, optimal_projection_for, summary_to_excel,
 )
-from dashboard_app.config import ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL
+from dashboard_app.config import ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, fmt_dollar
 from dashboard_app.dataquality import (
     render_discontinued_section,
     render_inactive_section,
@@ -72,18 +72,32 @@ STATUS_SHORT = {UNDER: "Under-projected", OVER: "Over-projected", ON_PLAN: "On-p
 # user-facing label never silently reuses another view's cache entry.
 EXCEPTIONS_VIEW_SIG = "exceptions-v1"
 
+STATUS_COL = "Status"           # short direction label (Under/Over/On-plan)
+WEEKS_COL = "Weeks with data"   # weeks with any POS/Orders activity for this SKU
+
 _DISPLAY_COLS = [
-    "SKU", "Description", "Customer Grouping", "Region", "Data Source",
-    RECENT_COL, PROJ_COL, GAP_COL, PCT_COL, PRICE_COL, IMPACT_COL, FLAG_COL,
+    "SKU", "Description", "Customer Grouping", "Region", "Data Source", STATUS_COL,
+    RECENT_COL, PROJ_COL, WEEKS_COL, GAP_COL, PCT_COL, PRICE_COL, IMPACT_COL, FLAG_COL,
 ]
 
 # The Key SKUs watchlist table: the same columns as the All-Exceptions table
 # (so names stay consistent across tabs) plus a Status column for the direction,
 # minus the Flag column.
-STATUS_COL = "Status"
 KEY_DISPLAY_COLS = [
     "SKU", "Description", "Customer Grouping", "Region", STATUS_COL, "Data Source",
-    RECENT_COL, PROJ_COL, PRICE_COL, IMPACT_COL, PCT_COL, FLAG_COL,
+    RECENT_COL, PROJ_COL, WEEKS_COL, PRICE_COL, IMPACT_COL, PCT_COL, FLAG_COL,
+]
+
+# The detail-card field order (both Exceptions tabs), decoupled from the frame's
+# full column set above. "Note" is peeled to a full-width bottom row by the card
+# renderer, so the grid renders as three rows:
+#   Customer Grouping · Region · Data Source
+#   Status · 8-Week Avg · Current Projection Average
+#   List Price · Weeks with data
+EXCEPTION_CARD_COLS = [
+    "Customer Grouping", "Region", "Data Source",
+    STATUS_COL, RECENT_COL, PROJ_COL,
+    PRICE_COL, WEEKS_COL, FLAG_COL,
 ]
 
 # Per-column widths for the exception tables. Without these, st.dataframe
@@ -217,10 +231,23 @@ def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
         if opt["status"] == "ok":
             weekly = opt["weekly"]
             current = row.get(PROJ_COL)
-            delta = (None if current is None or pd.isna(current)
-                     else f"{opt['optimized_avg'] - current:+,.0f} vs current")
+            has_current = current is not None and not pd.isna(current)
+            diff = opt["optimized_avg"] - current if has_current else None
+            delta = None if diff is None else f"{diff:+,.0f} vs current"
             st.metric("Optimized Projection (avg/wk)",
                       f"{opt['optimized_avg']:,.0f}", delta=delta, delta_color="off")
+            # Revenue impact of moving the projection to the optimized value, valued
+            # at list price. Green when the change adds revenue, red when it removes it.
+            price = pd.to_numeric(row.get(PRICE_COL), errors="coerce")
+            if diff is not None and not pd.isna(price):
+                risk = diff * price
+                colour = "#16a34a" if risk >= 0 else "#dc2626"
+                st.markdown(
+                    f"**Revenue Risk (avg/wk):** "
+                    f"<span style='color:{colour};font-weight:600'>"
+                    f"{fmt_dollar(risk, decimals=0)}</span>",
+                    unsafe_allow_html=True,
+                )
             st.caption(f"Winning model: {opt['label']}")
         elif opt["status"] == "no_model":
             st.info("Couldn't determine a best model for this view — its history is "
@@ -323,6 +350,17 @@ def compute_exceptions(df, today_ts, prices, P):
     frame["Data Source"] = frame["Data Source"].fillna("Orders")
     frame["Region"] = frame["Customer Grouping"].map(lambda g: str(P.region_for_group(g)))
 
+    # Weeks with any POS/Orders activity (a coverage signal for the detail card —
+    # a genuine count of active weeks, not any one model's windowed weeks_with_data).
+    active = agg_by_group.assign(
+        _active=(agg_by_group[["POS", "Orders"]].fillna(0) != 0).any(axis=1)
+    )
+    weeks = (
+        active.groupby(["Customer Grouping", "SKU"])["_active"].sum()
+        .reset_index(name=WEEKS_COL)
+    )
+    frame = frame.merge(weeks, on=["Customer Grouping", "SKU"], how="left")
+
     # Description (first non-null per SKU from the aggregates).
     desc = (
         agg_by_group.dropna(subset=["Description"])
@@ -340,11 +378,13 @@ def compute_exceptions(df, today_ts, prices, P):
         "Data Source": frame["Data Source"],
         RECENT_COL: frame[RECENT_COL].round().astype("Int64"),
         PROJ_COL: frame["_proj"].round().astype("Int64"),
+        WEEKS_COL: pd.to_numeric(frame[WEEKS_COL], errors="coerce").fillna(0).astype("Int64"),
         GAP_COL: frame["_gap"].round().astype("Int64"),
         PCT_COL: (frame["_pct"] * 100).round(2),
         IMPACT_COL: frame["_impact"].round(),
         FLAG_COL: frame[FLAG_COL],
         PRICE_COL: pd.to_numeric(frame[PRICE_COL], errors="coerce"),
+        STATUS_COL: frame[DIRECTION_COL].map(STATUS_SHORT).fillna(frame[DIRECTION_COL]),
         DIRECTION_COL: frame[DIRECTION_COL],
         # Sort worst-first by $ impact where known, else by unit gap magnitude.
         "_sort": frame["_impact"].abs().fillna(frame["_gap"].abs()),
@@ -394,7 +434,7 @@ def _section(frame, direction, key, P, today_str, slug, label, cols=None,
     st.caption(f"{len(sub):,} SKUs flagged")
     render_selectable_table(sub[cols], key, P, condensed_cols=CONDENSED_EXCEPTION_COLS,
                             style=True, column_config=_CONDENSED_COLUMN_CONFIG,
-                            detail_chart=chart_cb)
+                            detail_chart=chart_cb, detail_cols=EXCEPTION_CARD_COLS)
     _download_button(sub[cols], slug, label, today_str)
 
 
@@ -492,9 +532,7 @@ def _render_key_skus_tab(frame, P, today_str, chart_cb=None):
         st.info("None of the key SKUs appear in the current demand data.")
         return
 
-    key_frame[STATUS_COL] = key_frame[DIRECTION_COL].map(STATUS_SHORT).fillna(
-        key_frame[DIRECTION_COL]
-    )
+    # Status is set centrally in compute_exceptions (shown on both tabs now).
 
     # Split into the two planning actions, same layout as the All-Exceptions tab.
     _section(key_frame, UNDER, "exc_key_under", P, today_str,
@@ -517,7 +555,7 @@ def _render_key_skus_tab(frame, P, today_str, chart_cb=None):
             render_selectable_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
                                     condensed_cols=CONDENSED_EXCEPTION_COLS,
                                     style=True, column_config=_CONDENSED_COLUMN_CONFIG,
-                                    detail_chart=chart_cb)
+                                    detail_chart=chart_cb, detail_cols=EXCEPTION_CARD_COLS)
             _download_button(on_plan[KEY_DISPLAY_COLS], "key_skus_on-plan",
                              "On-plan Key SKUs table", today_str)
 
