@@ -421,7 +421,7 @@ def _dismiss_card(dismissed_key, label):
 
 def _render_row_detail(row, shown, detail_chart=None, key_base=None,
                        dismissed_key=None, close_label=None, card_cols=None,
-                       row_action=None):
+                       row_action=None, title_col="SKU"):
     """Render a row's full detail in a bordered card beneath the table.
 
     ``card_cols`` (if given) is the explicit, ordered list of fields to show in the
@@ -435,18 +435,21 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
     ``row_action`` (if given) is a ``{label, help, danger, callback}`` dict rendered
     as a button at the bottom of the card; clicking it calls ``callback(row)`` (the
     callback owns any rerun — e.g. by opening a confirmation dialog)."""
-    # SKU and Description live in the card title, so they're dropped from the grid;
-    # the remaining columns start with Customer Grouping, which fills the first slot.
+    # The title-bearing column (``title_col``, default SKU) and Description live in
+    # the card title, so they're dropped from the grid; the remaining columns start
+    # with the first stat. At a rolled-up grain ``title_col`` is the group key
+    # (e.g. Customer Grouping / Region) so it isn't repeated as a grid cell.
+    _title_drop = {"SKU", "Description", title_col}
     if card_cols is not None:
         detail_cols = [
             c for c in card_cols
-            if c in row.index and c not in ("SKU", "Description")
+            if c in row.index and c not in _title_drop
             and not str(c).startswith("_")
         ]
     else:
         detail_cols = [
             c for c in row.index
-            if c not in ("SKU", "Description") and not str(c).startswith("_")
+            if c not in _title_drop and not str(c).startswith("_")
         ]
     # "Note" reads as a sentence, not a stat — peel it out of the 3-per-row grid and
     # render it full-width at the bottom (only when it carries text), so the grid's
@@ -464,10 +467,10 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
     # Keyed so the scoped CSS in render_selectable_table can tint + space each card.
     card_key = re.sub(r"[^0-9A-Za-z_-]+", "-", f"detailcard-{key_base}-{close_label}")
     with st.container(border=True, key=card_key):
-        title_col, x_col = st.columns([12, 1])
-        sku_txt = f"{star}{row.get('SKU', '')}"
-        title = f"**{sku_txt}** — {desc}" if desc else f"**{sku_txt}**"
-        title_col.markdown(title)
+        title_c, x_col = st.columns([12, 1])
+        title_txt = f"{star}{row.get(title_col, '')}"
+        title = f"**{title_txt}** — {desc}" if desc else f"**{title_txt}**"
+        title_c.markdown(title)
         if dismissed_key is not None and close_label is not None:
             x_col.button(
                 "✕", key=f"{key_base}__close__{close_label}", help="Close this card",
@@ -504,7 +507,7 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
 @st.fragment
 def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
                             column_config=None, detail_chart=None, detail_cols=None,
-                            row_action=None):
+                            row_action=None, title_col="SKU"):
     """Like render_filtered_table, but shows only ``condensed_cols`` per row and
     reveals the full row in a detail card below when a row is clicked.
 
@@ -562,6 +565,7 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
             _render_row_detail(filtered.iloc[r], shown=display_cols,
                                detail_chart=detail_chart, key_base=key,
                                dismissed_key=dismissed_key, close_label=filtered.index[r],
-                               card_cols=detail_cols, row_action=row_action)
+                               card_cols=detail_cols, row_action=row_action,
+                               title_col=title_col)
     else:
         st.caption("Select one or more rows to see their full details.")

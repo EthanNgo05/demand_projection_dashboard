@@ -11,11 +11,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dashboard_app.config import DEFAULT_MODEL, MODEL_OPTIONS
+from dashboard_app.config import DEFAULT_MODEL, MODEL_OPTIONS, PRICE_COL
 from dashboard_app.pipeline import load_pipeline
 from dashboard_app.exceptions import (
-    CONTAINER_IMPACT_COL, RECENT_COL, SPIKE_FIRST_WEEK_COL,
-    SPIKE_WEEKS_SINCE_COL, WOS_COL, compute_spikes, sku_week_by_group,
+    CONTAINER_IMPACT_COL, DIRECTION_COL, FLAG_COL, GAP_COL, GROUP_CUSTOMER,
+    GROUP_DETAIL, GROUP_REGION, GROUP_SKU, IMPACT_COL, OVER, PCT_COL, PROJ_COL,
+    RECENT_COL, SPIKE_FIRST_WEEK_COL, SPIKE_WEEKS_SINCE_COL, STATUS_COL, UNDER,
+    WEEKS_COL, WOS_COL, aggregate_exceptions, aggregate_spikes, compute_spikes,
+    sku_week_by_group,
 )
 
 TODAY = pd.Timestamp("2026-07-22")          # Wednesday
@@ -209,6 +212,115 @@ def test_container_load_from_plytix():
     assert cl["ZERO"] == 100          # trailing '*' stripped to match demand SKUs
     assert "NOLOAD" not in cl.index   # blank load dropped
     assert container_load_from_plytix(pd.DataFrame({"SKU": ["X"]})) is None
+
+
+# --------------------------------------------------------------------------- #
+# "Group by" roll-up: aggregate_exceptions / aggregate_spikes                  #
+# --------------------------------------------------------------------------- #
+def _exc_frame():
+    """A hand-built compute_exceptions-style frame: 2 SKUs × 2 customers in 2
+    regions (each customer in one region), with known recent/projection/price so
+    the roll-up sums and re-derivations are exact."""
+    def row(sku, cust, region, recent, proj, price):
+        gap = recent - proj
+        return {
+            "SKU": sku, "Description": f"Widget {sku}", "Customer Grouping": cust,
+            "Region": region, "Data Source": "Orders",
+            RECENT_COL: recent, PROJ_COL: proj, WEEKS_COL: 8, GAP_COL: gap,
+            PCT_COL: (gap / proj * 100) if proj else np.nan,
+            IMPACT_COL: float(gap * price), FLAG_COL: "", PRICE_COL: float(price),
+            STATUS_COL: "x", DIRECTION_COL: "x", "_sort": abs(gap * price),
+        }
+    df = pd.DataFrame([
+        row("SKUA", "CUST1", "US", 100, 50, 2.0),   # under
+        row("SKUA", "CUST2", "EU", 10, 40, 2.0),    # over
+        row("SKUB", "CUST1", "US", 0, 20, 3.0),     # over ("No recent sales")
+        row("SKUB", "CUST2", "EU", 5, 0, 3.0),      # under ("No forecasts given")
+    ])
+    for c in (RECENT_COL, PROJ_COL, WEEKS_COL, GAP_COL):
+        df[c] = df[c].astype("Int64")
+    return df
+
+
+def test_aggregate_exceptions_detail_is_identity():
+    frame = _exc_frame()
+    assert aggregate_exceptions(frame, GROUP_DETAIL) is frame
+
+
+def test_aggregate_exceptions_by_sku_sums_and_rederives():
+    out = aggregate_exceptions(_exc_frame(), GROUP_SKU).set_index("SKU")
+    assert len(out) == 2
+    a = out.loc["SKUA"]
+    # recent 100+10=110, proj 50+40=90 → gap 20 (under); impact 50·2 + (−30·2)=40.
+    assert int(a[RECENT_COL]) == 110 and int(a[PROJ_COL]) == 90
+    assert int(a[GAP_COL]) == 20 and a[DIRECTION_COL] == UNDER
+    assert a[IMPACT_COL] == pytest.approx(40.0)
+    assert a[PCT_COL] == pytest.approx(round(20 / 90 * 100, 2))
+    assert a[PRICE_COL] == pytest.approx(2.0)          # price kept at the SKU grain
+    assert a["Region"] == "EU, US"                     # sorted comma-separated regions
+    assert a["Customer Grouping"] == "2 customers"
+    b = out.loc["SKUB"]
+    # recent 0+5=5, proj 20+0=20 → gap −15 (over); impact (−20·3)+(5·3)=−45.
+    assert int(b[GAP_COL]) == -15 and b[DIRECTION_COL] == OVER
+    assert b[IMPACT_COL] == pytest.approx(-45.0)
+
+
+def test_aggregate_exceptions_by_customer_and_region():
+    for grain, key in ((GROUP_CUSTOMER, "Customer Grouping"), (GROUP_REGION, "Region")):
+        out = aggregate_exceptions(_exc_frame(), grain).set_index(key)
+        assert len(out) == 2
+        # CUST1/US: recent 100+0=100, proj 50+20=70 → gap 30 (under); impact 100−60=40.
+        one = out.loc["CUST1" if grain == GROUP_CUSTOMER else "US"]
+        assert int(one[RECENT_COL]) == 100 and int(one[PROJ_COL]) == 70
+        assert int(one[GAP_COL]) == 30 and one[DIRECTION_COL] == UNDER
+        assert one[IMPACT_COL] == pytest.approx(40.0)
+        assert pd.isna(one[PRICE_COL])                 # no blended price off the SKU grain
+
+
+def _spike_frame():
+    """A hand-built compute_spikes-style frame: SKUX spiking at two customers in
+    two regions (SKU-level Container Impact 3.0 / WOS 2.0) + SKUY at one customer."""
+    def row(sku, cust, region, recent, first_wk, weeks_since, ci, wos):
+        return {
+            "SKU": sku, "Description": f"Widget {sku}", "Region": region,
+            "Region Code": region, "Active in": "US", "Customer Grouping": cust,
+            "Data Source": "Orders",
+            SPIKE_FIRST_WEEK_COL: pd.Timestamp(first_wk).date(),
+            SPIKE_WEEKS_SINCE_COL: weeks_since, RECENT_COL: float(recent),
+            PROJ_COL: 0, PRICE_COL: 10.0, CONTAINER_IMPACT_COL: ci, WOS_COL: wos,
+            "_sort": ci,
+        }
+    return pd.DataFrame([
+        row("SKUX", "CUST1", "US", 30, "2026-06-28", 3, 3.0, 2.0),
+        row("SKUX", "CUST2", "EU", 60, "2026-06-21", 4, 3.0, 2.0),
+        row("SKUY", "CUST1", "US", 10, "2026-07-05", 2, 1.0, 0.5),
+    ])
+
+
+def test_aggregate_spikes_by_sku():
+    out = aggregate_spikes(_spike_frame(), GROUP_SKU).set_index("SKU")
+    x = out.loc["SKUX"]
+    assert x[RECENT_COL] == pytest.approx(90.0)                 # 30 + 60
+    assert x[CONTAINER_IMPACT_COL] == pytest.approx(3.0)        # SKU-level, one SKU
+    assert x[WOS_COL] == pytest.approx(2.0)                     # kept at SKU grain
+    assert pd.Timestamp(x[SPIKE_FIRST_WEEK_COL]) == pd.Timestamp("2026-06-21")  # min onset
+    assert int(x[SPIKE_WEEKS_SINCE_COL]) == 4                   # max weeks-since
+
+
+def test_aggregate_spikes_by_customer_sums_distinct_sku_container_impact():
+    out = aggregate_spikes(_spike_frame(), GROUP_CUSTOMER).set_index("Customer Grouping")
+    # CUST1: distinct SKUs SKUX(3.0)+SKUY(1.0)=4.0; WOS blanked off the SKU grain.
+    assert out.loc["CUST1", CONTAINER_IMPACT_COL] == pytest.approx(4.0)
+    assert pd.isna(out.loc["CUST1", WOS_COL])
+    # CUST2: only SKUX → 3.0.
+    assert out.loc["CUST2", CONTAINER_IMPACT_COL] == pytest.approx(3.0)
+
+
+def test_aggregate_spikes_by_region():
+    out = aggregate_spikes(_spike_frame(), GROUP_REGION).set_index("Region")
+    assert out.loc["US", CONTAINER_IMPACT_COL] == pytest.approx(4.0)   # SKUX + SKUY
+    assert out.loc["EU", CONTAINER_IMPACT_COL] == pytest.approx(3.0)
+    assert out.loc["US", RECENT_COL] == pytest.approx(40.0)            # 30 + 10
 
 
 def test_onhand_by_sku_takes_latest_week_and_sums_customers():
