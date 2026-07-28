@@ -977,7 +977,7 @@ def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
     )
     c1, _ = st.columns([1, 3])
     min_container_impact = c1.number_input(
-        "Minimum container impact", min_value=0.0, max_value=100_000.0, value=0.0,
+        "Minimum container impact", min_value=0.0, max_value=100_000.0, value=0.2,
         step=0.5, key=f"spike_ci{key_suffix}",
         help="Hide SKUs whose total unplanned demand is below this many containers "
              "(units sold since the spike ÷ Container Load). SKUs without a Container "
