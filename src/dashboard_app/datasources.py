@@ -99,6 +99,8 @@ compute_discontinued_projections = data_io.compute_discontinued_projections
 compute_missing_projections = data_io.compute_missing_projections
 compute_missing_pos_orders = data_io.compute_missing_pos_orders
 active_allocation_pairs = data_io.active_allocation_pairs
+container_load_from_plytix = data_io.container_load_from_plytix
+onhand_by_sku = data_io.onhand_by_sku
 
 
 # Cleaning lives in agent/data_io.py (shared with the agent's ingest node);
@@ -166,6 +168,26 @@ def load_allocation_pairs_from_bytes(_data, name, _week_key):
     """(SKU, Customer) combos in the current allocation, from uploaded bytes."""
     raw = pd.read_excel(BytesIO(_data), header=2)
     return data_io.active_allocation_pairs(raw)
+
+
+@st.cache_data(show_spinner=False)
+def load_onhand_by_sku_from_path(path, _mtime, _week_key):
+    """SKU -> current total On Hand Series, read from disk.
+
+    Reads the RAW demand snapshot (the inventory columns _clean drops still live
+    there) and returns data_io.onhand_by_sku. Feeds the Exceptions spikes table's
+    WOS column. ``_mtime`` busts the cache on a new snapshot; ``_week_key``
+    (current week-start ISO) busts it weekly so 'current On Hand' rolls forward.
+    """
+    raw = data_io.read_raw_frame(path)  # Parquet sidecar when present, else xlsx
+    return data_io.onhand_by_sku(raw)
+
+
+@st.cache_data(show_spinner=False)
+def load_onhand_by_sku_from_bytes(_data, name, _week_key):
+    """SKU -> current total On Hand Series, from uploaded bytes."""
+    raw = pd.read_excel(BytesIO(_data), header=2)
+    return data_io.onhand_by_sku(raw)
 
 
 @st.cache_data(show_spinner="Loading list prices…")

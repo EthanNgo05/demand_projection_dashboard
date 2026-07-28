@@ -130,6 +130,7 @@ from dashboard_app.datasources import (  # noqa: F401
     discover_key_skus_file,
     discover_price_file, discover_raw_files, fetch_plytix_from_url, load_key_skus,
     load_allocation_pairs_from_bytes, load_allocation_pairs_from_path,
+    load_onhand_by_sku_from_bytes, load_onhand_by_sku_from_path,
     load_prices_from_bytes, load_prices_from_path, load_raw_from_bytes,
     load_raw_from_path, load_warehouse_from_paths, load_warehouse_from_uploads,
     price_glob, raw_glob, read_plytix_from_bytes, read_plytix_from_path,
@@ -675,6 +676,10 @@ def main():
         # rows from the missing-projections table. Keyed on the current week so
         # its trailing-3-month window rolls forward without stale caching.
         allocation_pairs = None
+        # SKU -> current total On Hand, for the Exceptions spikes table's WOS column.
+        # Same raw-frame source as allocation_pairs; also week-keyed so the "current"
+        # on-hand week rolls forward.
+        onhand_by_sku = None
         _week_key = data_io._this_week_start().isoformat()
 
         # Background pulls are coordinated through lock files, so their state
@@ -884,6 +889,9 @@ def main():
             allocation_pairs = load_allocation_pairs_from_path(
                 path, os.path.getmtime(path), _week_key
             )
+            onhand_by_sku = load_onhand_by_sku_from_path(
+                path, os.path.getmtime(path), _week_key
+            )
         elif override:
             with data_exp:
                 st.info("Upload the Demand Planning Details and Plytix files below.")
@@ -898,6 +906,9 @@ def main():
                     data = up.getvalue()
                     df = load_raw_from_bytes(data, up.name, pipeline_path())
                     allocation_pairs = load_allocation_pairs_from_bytes(
+                        data, up.name, _week_key
+                    )
+                    onhand_by_sku = load_onhand_by_sku_from_bytes(
                         data, up.name, _week_key
                     )
                     today_str = _date_from_name(up.name)
@@ -1333,7 +1344,7 @@ def main():
             warehouse_df=warehouse_df, plytix_df=plytix_df, check_ran=check_ran,
             inactive_df=inactive_df, excluded_counts_by_key=excluded_counts_by_key,
             disc_check_ran=disc_check_ran, discontinued_df=discontinued_df,
-            allocation_pairs=allocation_pairs,
+            allocation_pairs=allocation_pairs, onhand_by_sku=onhand_by_sku,
         )
         st.stop()
 
