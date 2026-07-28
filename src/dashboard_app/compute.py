@@ -90,12 +90,40 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
     return summary, weekly, agg
 
 
+def _format_sheet(ws, df, max_width=60, padding=2):
+    """Make a written worksheet easy to read: bold+centered header row,
+    AutoFilter over the data range, a frozen header row, and columns wide
+    enough that the header and every cell value show in full (capped at
+    ``max_width`` so one long text column can't blow out the sheet)."""
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
+
+    header_font = Font(bold=True)
+    header_align = Alignment(horizontal="center", vertical="center")
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.alignment = header_align
+
+    # AutoFilter across the whole used range so users can sort/filter in Excel.
+    ws.auto_filter.ref = ws.dimensions
+    # Keep the header row visible while scrolling.
+    ws.freeze_panes = "A2"
+
+    for i, col in enumerate(df.columns, start=1):
+        header_len = len(str(col))
+        cell_len = df[col].map(lambda v: len(str(v))).max() if len(df) else 0
+        width = min(max(header_len, int(cell_len)) + padding, max_width)
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+
 def view_to_excel(summary_df, weekly_df):
     """Build an in-memory .xlsx (same two-sheet layout as the pipeline output)."""
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         summary_df.to_excel(w, sheet_name="summary", index=False)
         weekly_df.to_excel(w, sheet_name="weekly_forecast", index=False)
+        _format_sheet(w.sheets["summary"], summary_df)
+        _format_sheet(w.sheets["weekly_forecast"], weekly_df)
     buf.seek(0)
     return buf.getvalue()
 
@@ -109,6 +137,7 @@ def summary_to_excel(summary_df, sheet_name="summary"):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         summary_df.to_excel(w, sheet_name=sheet_name, index=False)
+        _format_sheet(w.sheets[sheet_name], summary_df)
     buf.seek(0)
     return buf.getvalue()
 

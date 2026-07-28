@@ -676,6 +676,24 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     if combos.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)
 
+    # --- Keep only combos that are actually being forecast ---------------------
+    # A gone-silent channel only matters if the forecast is still carrying it. Drop
+    # combos with no forward projection or a projection of 0 (e.g. BT1028 @ AAFES):
+    # nothing is being carried forward, so there is no active gap to surface. Forward
+    # weeks are WeekDate >= current_week_start (the first forecast week); NaN
+    # projections count as 0, so "no projection" and "0 projection" both net to 0.
+    fwd = m[m["WeekDate"] >= current_week_start]
+    fwd_proj = (
+        fwd.groupby(["SKU", "Customer"])["Projection"].apply(lambda s: s.fillna(0).sum())
+    )
+    projected = set(fwd_proj[fwd_proj > 0].index)
+    combos = combos[[
+        (sku, cust) in projected
+        for sku, cust in zip(combos["SKU"], combos["Customer"])
+    ]]
+    if combos.empty:
+        return pd.DataFrame(columns=MISSING_POS_COLS)
+
     # --- Each combo's last REAL-SALE week + the POS/Orders recorded on it -------
     # Only a POSITIVE POS or Orders counts as a real sale; a week that nets zero,
     # negative (returns/credits), or NaN is treated as missing, so a trailing 0 or

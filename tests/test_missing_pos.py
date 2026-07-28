@@ -25,29 +25,33 @@ GONE_LAST = LCW - pd.Timedelta(weeks=3)    # last week the "gone silent" combo h
 LONG_DEAD = LCW - pd.Timedelta(weeks=20)   # last sale >3mo ago -> excluded by the floor
 
 
-def _row(sku, cust, week, pos=np.nan, orders=np.nan):
+def _row(sku, cust, week, pos=np.nan, orders=np.nan, proj=np.nan):
     return {
         "SKU": sku, "Description": "d", "Customer": cust, "WeekDate": week,
-        "POS": pos, "Orders": orders, "Projection": np.nan,
+        "POS": pos, "Orders": orders, "Projection": proj,
         "Customer Grouping": P.COMBINED_GROUPING.get(cust, cust),
     }
 
 
 def _demand_df():
     rows = [
-        # SKUGONE @ TARGET-HQ (US): data at EARLIEST + GONE_LAST, blank row at LCW
+        # SKUGONE @ TARGET-HQ (US): data at EARLIEST + GONE_LAST, blank row at LCW.
+        # A forward projection at CWS keeps it in scope (the forecast still carries it).
         _row("SKUGONE", "TARGET-HQ", EARLIEST, pos=5),
         _row("SKUGONE", "TARGET-HQ", GONE_LAST, pos=2),
         _row("SKUGONE", "TARGET-HQ", LCW),                 # exists but no data
+        _row("SKUGONE", "TARGET-HQ", CWS, proj=4),         # forward projection -> forecast
         # SKUGONE @ AMAZON-EU (EU): stale, but SKU is US-only -> must NOT flag
         _row("SKUGONE", "AMAZON-EU", GONE_LAST),
         # SKUORD @ TARGET-HQ (US): last sold via Orders (no POS) -> Orders source
         _row("SKUORD", "TARGET-HQ", GONE_LAST, orders=9),
+        _row("SKUORD", "TARGET-HQ", CWS, proj=5),          # forward projection -> forecast
         # SKUZERO @ TARGET-HQ (US): real sale (POS=6) at GONE_LAST, then a trailing
         # 0 at LCW. The 0 is a zero-sale week -> still flagged, Last Value = 6, and
         # the gap starts after GONE_LAST (not after the 0).
         _row("SKUZERO", "TARGET-HQ", GONE_LAST, pos=6),
         _row("SKUZERO", "TARGET-HQ", LCW, pos=0),
+        _row("SKUZERO", "TARGET-HQ", CWS, proj=3),         # forward projection -> forecast
         # SKUZONLY @ TARGET-HQ (US): only ever a 0 -> no real sale -> excluded like
         # a never-sold combo.
         _row("SKUZONLY", "TARGET-HQ", GONE_LAST, pos=0),
@@ -56,6 +60,7 @@ def _demand_df():
         # Value = 8, gap starts after GONE_LAST.
         _row("SKUNEG", "TARGET-HQ", GONE_LAST, orders=8),
         _row("SKUNEG", "TARGET-HQ", LCW, orders=-2),
+        _row("SKUNEG", "TARGET-HQ", CWS, proj=2),          # forward projection -> forecast
         # SKUNEGONLY @ TARGET-HQ (US): only ever a return (negative) -> no real sale
         # -> excluded.
         _row("SKUNEGONLY", "TARGET-HQ", GONE_LAST, pos=-5),
@@ -68,6 +73,14 @@ def _demand_df():
         _row("SKUDEAD", "TARGET-HQ", LONG_DEAD, pos=4),
         # SKUIN @ TARGET-HQ: last sold exactly at the 3-month cutoff -> kept
         _row("SKUIN", "TARGET-HQ", JUST_IN, pos=3),
+        _row("SKUIN", "TARGET-HQ", CWS, proj=1),           # forward projection -> forecast
+        # SKUNOPROJ @ TARGET-HQ: recently gone silent like SKUGONE, but NO forward
+        # projection -> not being forecast -> excluded (the BT1028 @ AAFES bug).
+        _row("SKUNOPROJ", "TARGET-HQ", GONE_LAST, pos=7),
+        # SKUZEROPROJ @ TARGET-HQ: recently gone silent, but its forward projection
+        # is 0 -> nothing carried forward -> excluded.
+        _row("SKUZEROPROJ", "TARGET-HQ", GONE_LAST, pos=7),
+        _row("SKUZEROPROJ", "TARGET-HQ", CWS, proj=0),
         # SKUOUT @ TARGET-HQ: last sold one week past the cutoff -> dropped
         # (the BT1028 regression: LCW-3mo is one week too early to qualify)
         _row("SKUOUT", "TARGET-HQ", JUST_OUT, pos=3),
@@ -96,6 +109,8 @@ def _plytix():
         {"SKU": "SKUDEAD",  "SKU Status": "Active",       "SKU Type": "Product", "Active in": "US"},
         {"SKU": "SKUIN",    "SKU Status": "Active",       "SKU Type": "Product", "Active in": "US"},
         {"SKU": "SKUOUT",   "SKU Status": "Active",       "SKU Type": "Product", "Active in": "US"},
+        {"SKU": "SKUNOPROJ","SKU Status": "Active",       "SKU Type": "Product", "Active in": "US"},
+        {"SKU": "SKUZEROPROJ","SKU Status": "Active",     "SKU Type": "Product", "Active in": "US"},
         {"SKU": "SKUPART",  "SKU Status": "Active",       "SKU Type": "Part",    "Active in": "US"},
         {"SKU": "LSPART1",  "SKU Status": "Active",       "SKU Type": "Part",    "Active in": "US"},
         {"SKU": "SKUDISC",  "SKU Status": "Discontinued", "SKU Type": "Product", "Active in": "US"},
@@ -122,6 +137,19 @@ def test_flags_recently_gone_silent_only():
     assert "LSPART1" not in flagged   # never had data
     assert "SKULIVE" not in flagged  # has data at the reference week
     assert "SKUDISC" not in flagged  # not an active SKU
+    assert "SKUNOPROJ" not in flagged   # gone silent but no forward projection
+    assert "SKUZEROPROJ" not in flagged  # gone silent but forward projection is 0
+
+
+def test_excludes_combos_with_no_or_zero_projection():
+    """A gone-silent combo only matters if the forecast still carries it. Combos
+    with no forward projection (BT1028 @ AAFES) or a 0 forward projection are noise,
+    not actionable gaps, so they must be dropped even though they recently sold."""
+    out = data_io.compute_missing_pos_orders(_demand_df(), _plytix(), P, anchors=P.week_anchors(TODAY))
+    flagged = set(out["SKU"])
+    assert "SKUNOPROJ" not in flagged    # no forward projection -> not forecast
+    assert "SKUZEROPROJ" not in flagged  # 0 forward projection -> not forecast
+    assert "SKUGONE" in flagged          # same recency, but has a forward projection
 
 
 def test_region_restricted_to_active_in():
