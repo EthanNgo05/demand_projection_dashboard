@@ -5,6 +5,7 @@ import json
 import inspect
 from io import BytesIO
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -16,6 +17,7 @@ from dashboard_app.pipeline import (
     load_pipeline, pipeline_path,
     _supports_prices, _supports_smoothing, _supports_min_weeks, _supports_autofit,
 )
+from dashboard_app import forecast_cache
 
 
 def _region_frame(df, P, region):
@@ -39,9 +41,29 @@ def list_views(df):
     return by_region
 
 
+def _cache_key(data_sig, view, model_path, today_ts, alpha, beta, phi,
+               min_weeks, kind):
+    """Disk-cache key, or None when we must not use the disk cache.
+
+    ``data_sig`` is threaded down from dashboard.py (which is the only layer that
+    knows the snapshot/price file identities). It is an explicit argument rather
+    than module state on purpose: Streamlit runs each browser session's script in
+    its own thread against these same module objects, so a shared global could
+    let one session's snapshot signature key another session's forecast. Absent a
+    signature we simply skip the disk tier — the in-process ``@st.cache_data``
+    layer still applies.
+    """
+    if not data_sig or not forecast_cache.enabled():
+        return None
+    return forecast_cache.forecast_key(
+        data_sig, view, model_path, pd.Timestamp(today_ts).date().isoformat(),
+        alpha=alpha, beta=beta, phi=phi, min_weeks=min_weeks, kind=kind,
+    )
+
+
 @st.cache_data(show_spinner="Building forecast…")
 def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
-                 beta=None, phi=None, min_weeks=None):
+                 beta=None, phi=None, min_weeks=None, data_sig=None):
     """Recompute summary + weekly + per-week aggregate for the selected view.
 
     Returns (summary_df, weekly_df, agg_frame) where agg_frame is the SKU-week
@@ -54,7 +76,20 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
     ``min_weeks`` overrides MIN_WEEKS_FOR_TREND (all are part of the cache key, so
     moving a slider recomputes the forecast). ``model_path`` selects the
     pipeline and keys the cache, so toggling the model recomputes too.
+
+    Two cache tiers sit in front of the fit: this ``@st.cache_data`` decorator
+    (per process, per session) and — when ``data_sig`` is supplied — the on-disk
+    ``forecast_cache``, which survives restarts and is shared across sessions and
+    warmed by the nightly ``agent.batch``. On a disk hit the fit is skipped
+    entirely and the frames are read back from Parquet.
     """
+    ck = _cache_key(data_sig, view, model_path, today_ts, alpha, beta, phi,
+                    min_weeks, "view")
+    if ck:
+        hit = forecast_cache.get(ck)
+        if hit is not None:
+            return hit["summary"], hit["weekly"], hit["agg"]
+
     P = load_pipeline(model_path)
     kwargs = {}
     if prices is not None and _supports_prices(P):
@@ -87,6 +122,11 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
         summary, weekly = P.fit_regression(
             agg, today_ts, grouping_label=view, **kwargs
         )
+    if ck:
+        forecast_cache.put(
+            ck, {"summary": summary, "weekly": weekly, "agg": agg},
+            {"view": view, "model": os.path.basename(str(model_path)), "kind": "view"},
+        )
     return summary, weekly, agg
 
 
@@ -116,8 +156,17 @@ def _format_sheet(ws, df, max_width=60, padding=2):
         ws.column_dimensions[get_column_letter(i)].width = width
 
 
+@st.cache_data(show_spinner=False)
 def view_to_excel(summary_df, weekly_df):
-    """Build an in-memory .xlsx (same two-sheet layout as the pipeline output)."""
+    """Build an in-memory .xlsx (same two-sheet layout as the pipeline output).
+
+    Cached because ``st.download_button``'s ``data=`` argument is EAGER — it takes
+    bytes, not a callable, so the workbook is rebuilt on every rerun whether or
+    not anyone clicks. ``_format_sheet``'s per-column width scan is the expensive
+    part (a Python ``len(str(v))`` over every cell), which made this ~0.6s of
+    pure waste per widget interaction. Keyed on the frames themselves, so the
+    bytes rebuild exactly when the table changes.
+    """
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         summary_df.to_excel(w, sheet_name="summary", index=False)
@@ -128,11 +177,17 @@ def view_to_excel(summary_df, weekly_df):
     return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False)
 def summary_to_excel(summary_df, sheet_name="summary"):
     """Build an in-memory single-sheet .xlsx of a summary table.
 
     Used for the by-SKU-and-customer table, which mirrors the pipeline's
     ALL_CUSTOMERS_demand_projections file (a single concatenated summary sheet).
+
+    Cached for the same reason as ``view_to_excel``: every ``st.download_button``
+    evaluates its ``data=`` eagerly, and the Exceptions view alone renders ~15 of
+    them per rerun (two Under/Over sections × two tabs, the spikes table × two
+    tabs, and four data-quality sections × two tabs).
     """
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -143,16 +198,33 @@ def summary_to_excel(summary_df, sheet_name="summary"):
 
 
 @st.cache_data(show_spinner=False)
-def run_autofit(df, view, today_ts, model_path, min_weeks=None):
+def run_autofit(df, view, today_ts, model_path, min_weeks=None, data_sig=None):
     """Grid-search the best alpha/beta/phi for the selected view (cached).
 
     Builds the same SKU-week aggregate ``compute_view`` fits on, then delegates
     to the pipeline's ``autofit_smoothing`` backtest. Cached on
     (data, view, snapshot, model, min_weeks) so clicking Autofit twice — or
     returning to a view already fitted this session — is instant.
+
+    Also persisted to the on-disk cache when ``data_sig`` is given: the search is
+    ~5s per view and Optimized Projections runs it for every group whose winning
+    model supports it, so without persistence that cost returned on every
+    restart. The result is a handful of floats, so it is stored as JSON rather
+    than Parquet (``forecast_cache.get_params`` / ``put_params``).
     """
+    ck = _cache_key(data_sig, view, model_path, today_ts, None, None, None,
+                    min_weeks, "autofit")
+    if ck:
+        hit = forecast_cache.get_params(ck)
+        if hit is not None:
+            # An empty dict is how we record "this pipeline has no autofit" so the
+            # miss isn't retried; map it back to the None the callers expect.
+            return hit or None
+
     P = load_pipeline(model_path)
     if not _supports_autofit(P):
+        if ck:
+            forecast_cache.put_params(ck, {}, {"view": view, "kind": "autofit"})
         return None
     if view == ALL_CUSTOMERS_VIEW:
         agg = P.aggregate_to_sku_week(df)
@@ -165,13 +237,20 @@ def run_autofit(df, view, today_ts, model_path, min_weeks=None):
         P.autofit_smoothing
     ).parameters:
         kwargs["min_weeks_for_trend"] = min_weeks
-    return P.autofit_smoothing(agg, today_ts, **kwargs)
+    fitted = P.autofit_smoothing(agg, today_ts, **kwargs)
+    if ck:
+        forecast_cache.put_params(
+            ck, fitted if fitted is not None else {},
+            {"view": view, "model": os.path.basename(str(model_path)),
+             "kind": "autofit"},
+        )
+    return fitted
 
 
 @st.cache_data(show_spinner=False)
 def _forecast_one_group(df_group, today_ts, model_path, group_label,
                         prices=None, alpha=None, beta=None, phi=None,
-                        min_weeks=None):
+                        min_weeks=None, data_sig=None):
     """Forecast a single customer group's SKUs. Cached; calls NO Streamlit
     element, so it is safe to replay on a cache hit. ``group_label`` is a
     normal (hashable) argument so distinct groups get distinct cache entries.
@@ -179,7 +258,19 @@ def _forecast_one_group(df_group, today_ts, model_path, group_label,
     Returns ``(summary, weekly, agg)`` — the same three frames ``compute_view``
     produces for a single view, so callers that stitch groups together (the
     Optimal Projections combined view) can build charts, not just the summary.
+
+    Backed by the same two tiers as ``compute_view``: ``@st.cache_data`` in
+    process, plus the on-disk ``forecast_cache`` when ``data_sig`` is supplied.
+    The disk tier matters most here — the by-customer loop runs this ~64 times,
+    which is where Optimized Projections' ~55s went.
     """
+    ck = _cache_key(data_sig, group_label, model_path, today_ts, alpha, beta, phi,
+                    min_weeks, "group")
+    if ck:
+        hit = forecast_cache.get(ck)
+        if hit is not None:
+            return hit["summary"], hit["weekly"], hit["agg"]
+
     P = load_pipeline(model_path)
     kwargs = {}
     if prices is not None and _supports_prices(P):
@@ -192,11 +283,18 @@ def _forecast_one_group(df_group, today_ts, model_path, group_label,
     summary, weekly = P.fit_regression(
         agg, today_ts, grouping_label=group_label, **kwargs
     )
+    if ck:
+        forecast_cache.put(
+            ck, {"summary": summary, "weekly": weekly, "agg": agg},
+            {"view": group_label, "model": os.path.basename(str(model_path)),
+             "kind": "group"},
+        )
     return summary, weekly, agg
 
 
 def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
-                        beta=None, phi=None, min_weeks=None, progress_cb=None):
+                        beta=None, phi=None, min_weeks=None, progress_cb=None,
+                        data_sig=None):
     """Per-(SKU, Customer Grouping) summary — the rows behind ALL_CUSTOMERS.
 
     The pipeline's ``ALL_CUSTOMERS_demand_projections`` file is just a
@@ -222,7 +320,7 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
         sub = df[df["Customer Grouping"] == group]
         summary, _, _ = _forecast_one_group(
             sub, today_ts, model_path, group,
-            prices, alpha, beta, phi, min_weeks,
+            prices, alpha, beta, phi, min_weeks, data_sig,
         )
         if summary is not None and not summary.empty:
             frames.append(summary)
@@ -307,8 +405,15 @@ ALL_HIST_AVG_COL = "All-History POS/Orders Average"
 EIGHT_WK_AVG_COL = "8-Week POS/Orders Average"
 
 
+@st.cache_data(show_spinner=False)
 def _descriptive_averages(agg_by_group, today_ts):
     """Per-(Customer Grouping, SKU) all-history and 8-week demand averages.
+
+    Cached: this is a ~11,000-iteration Python groupby loop (~7s on the live
+    snapshot) and three separate callers ask for it with the same inputs on one
+    pass through the Exceptions view — ``compute_exceptions``, ``compute_spikes``
+    and ``compute_by_customer_best`` all pass the same ``sku_week_by_group``
+    frame and the same ``today_ts``, so only the first pays.
 
     Computed straight from the stitched per-group SKU-week aggregates so BOTH
     averages exist for every group regardless of which model won its backtest.
@@ -336,24 +441,82 @@ def _descriptive_averages(agg_by_group, today_ts):
     A = A[~A["SKU"].str.endswith("*")]
     A["WeekDate"] = pd.to_datetime(A["WeekDate"])
 
+    key = ["Customer Grouping", "SKU"]
+
     def _avg(start, out_col):
+        """Vectorised equivalent of the original per-(group, SKU) Python loop.
+
+        The loop it replaces sliced the window frame once per (group, SKU) pair —
+        ~11,000 slices, ~7s on the live snapshot — and this runs on the critical
+        path of the Exceptions scan, the spikes scan and Optimized Projections.
+
+        Same three decisions, now as whole-column operations:
+          * source = POS when the pair has ANY non-null POS in the window, else
+            Orders; a pair with neither is dropped (``keep`` below);
+          * the span starts at the first week of the CHOSEN source, not of the
+            pair, which is why the two sources are aggregated separately rather
+            than coalesced first;
+          * output row order is first-appearance order, matching the original's
+            ``groupby(..., sort=False)`` iteration.
+
+        The final ``round`` stays Python's, applied per value, rather than
+        ``np.round``: the two use different algorithms (correctly-rounded decimal
+        vs. scale-rint-unscale) and disagree on some halfway values, and these
+        numbers are displayed. ~11k cheap C-level calls, not 11k frame slices.
+        ``tests/test_perf_parity.py::test_descriptive_averages_golden`` holds the
+        whole thing to exact equality with the original output.
+        """
         win = A[(A["WeekDate"] >= start) & (A["WeekDate"] <= last_complete_week)]
-        rows = []
-        for (grp, sku), g in win.groupby(["Customer Grouping", "SKU"], sort=False):
-            pos = g[g["POS"].notna()]
-            if not pos.empty:
-                vals, weeks = pos["POS"], pos["WeekDate"]
-            else:
-                orders = g[g["Orders"].notna()]
-                if orders.empty:
-                    continue  # no POS and no Orders -> nothing to average
-                vals, weeks = orders["Orders"], orders["WeekDate"]
-            weeks_span = int(round((last_complete_week - weeks.min()).days / 7)) + 1
-            rows.append({
-                "Customer Grouping": grp, "SKU": sku,
-                out_col: round(vals.sum() / max(weeks_span, 1), 1),
-            })
-        return pd.DataFrame(rows, columns=["Customer Grouping", "SKU", out_col])
+        if win.empty:
+            return pd.DataFrame(columns=key + [out_col])
+
+        # First-appearance order of the pairs, so row order is unchanged.
+        idx = pd.MultiIndex.from_frame(win[key].drop_duplicates())
+
+        def _agg(col):
+            """(sum, first week) per pair over the rows where ``col`` is present.
+
+            The empty case must keep its dtypes: a plain ``pd.Series()`` defaults
+            to float64, and reindexing that in place of the week-start column
+            would leave np.where trying to promote float64 against datetime64
+            (which has no common dtype) whenever a window happens to contain no
+            POS rows at all, or no Orders rows at all.
+            """
+            src = win[win[col].notna()]
+            if src.empty:
+                empty_idx = pd.MultiIndex.from_arrays([[], []], names=key)
+                return (pd.Series(dtype="float64", index=empty_idx),
+                        pd.Series(dtype=win["WeekDate"].dtype, index=empty_idx))
+            g = src.groupby(key, sort=False)
+            return g[col].sum(), g["WeekDate"].min()
+
+        pos_sum, pos_first = _agg("POS")
+        ord_sum, ord_first = _agg("Orders")
+
+        has_pos = idx.isin(pos_sum.index)
+        keep = has_pos | idx.isin(ord_sum.index)
+        if not keep.any():
+            return pd.DataFrame(columns=key + [out_col])
+
+        totals = np.where(has_pos, pos_sum.reindex(idx).to_numpy(),
+                          ord_sum.reindex(idx).to_numpy())
+        firsts = np.where(has_pos, pos_first.reindex(idx).to_numpy(),
+                          ord_first.reindex(idx).to_numpy())
+
+        # Floor-divide to whole days, mirroring Timedelta.days (both bounds are
+        # week-start dates, and the window guarantees first <= last_complete_week,
+        # so this is exact rather than a truncation).
+        days = (last_complete_week.to_datetime64() - firsts[keep]) \
+            // np.timedelta64(1, "D")
+        spans = np.round(days / 7).astype("int64") + 1
+        np.maximum(spans, 1, out=spans)
+
+        kept = idx[keep]
+        return pd.DataFrame({
+            "Customer Grouping": kept.get_level_values(0),
+            "SKU": kept.get_level_values(1),
+            out_col: [round(v, 1) for v in totals[keep] / spans],
+        })
 
     all_hist = _avg(hist_start, ALL_HIST_AVG_COL)
     eight_wk = _avg(eight_wk_start, EIGHT_WK_AVG_COL)
@@ -361,7 +524,7 @@ def _descriptive_averages(agg_by_group, today_ts):
 
 
 def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
-                             progress_cb=None):
+                             progress_cb=None, data_sig=None):
     """Per-(SKU, Customer Grouping) summary using each group's BEST model.
 
     Like ``compute_by_customer``, but instead of one model for every group it
@@ -419,11 +582,20 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         alpha = beta = phi = None
         P = load_pipeline(path)
         if _supports_autofit(P):
-            fitted = run_autofit(df, group, today_ts, path, min_weeks)
+            # Pass the group slice, not the whole frame: run_autofit's non-region
+            # branch filters by `Customer Grouping == view`, and re-filtering an
+            # already-filtered slice by the same predicate is a no-op — so the
+            # aggregate it fits is byte-identical while the full-frame filter and
+            # aggregate stop being repeated here (they were already done above,
+            # and again inside _forecast_one_group). It also narrows the cache key
+            # from "the whole snapshot" to "this group's rows", which is what the
+            # result actually depends on.
+            fitted = run_autofit(sub, group, today_ts, path, min_weeks, data_sig)
             if fitted:
                 alpha, beta, phi = fitted.get("alpha"), fitted.get("beta"), fitted.get("phi")
         summary, weekly, agg = _forecast_one_group(
             sub, today_ts, path, group, prices, alpha, beta, phi, min_weeks,
+            data_sig,
         )
         if summary is not None and not summary.empty:
             summary = summary.copy()
@@ -538,7 +710,8 @@ def _live_best_model(df, group, today_ts, prices=None):
     return label, path
 
 
-def optimal_projection_for(df, group, sku, today_ts, prices=None, min_weeks=None):
+def optimal_projection_for(df, group, sku, today_ts, prices=None, min_weeks=None,
+                           data_sig=None):
     """Optimized (best-model) 15-week forecast for ONE (SKU, Customer Grouping).
 
     Reuses the Optimized Projections view's machinery so a group already forecast
@@ -564,11 +737,14 @@ def optimal_projection_for(df, group, sku, today_ts, prices=None, min_weeks=None
     alpha = beta = phi = None
     P = load_pipeline(path)
     if _supports_autofit(P):
-        fitted = run_autofit(df, group, today_ts, path, min_weeks)
+        # Group slice, not the whole frame — see the note in
+        # compute_by_customer_best: same aggregate, narrower cache key, and it
+        # shares the entry that view already populated for this group.
+        fitted = run_autofit(sub, group, today_ts, path, min_weeks, data_sig)
         if fitted:
             alpha, beta, phi = fitted.get("alpha"), fitted.get("beta"), fitted.get("phi")
     _, weekly, _ = _forecast_one_group(
-        sub, today_ts, path, group, prices, alpha, beta, phi, min_weeks
+        sub, today_ts, path, group, prices, alpha, beta, phi, min_weeks, data_sig
     )
     if weekly is None or weekly.empty:
         return {"status": "no_data", "label": label}

@@ -136,7 +136,7 @@ def _render_kpis(summary, agg, anchors, stacked=False):
 
 
 def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows,
-                                anchors, P=None):
+                                anchors, P=None, data_sig=None):
     """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
 
     Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
@@ -172,6 +172,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
                 )
             result = compute_by_customer_best(
                 df, today_ts, prices, min_weeks=None, progress_cb=_bump,
+                data_sig=data_sig,
             )
             prog.progress(1.0, text="Done")
         finally:

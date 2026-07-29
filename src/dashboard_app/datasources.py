@@ -36,9 +36,21 @@ def discover_key_skus_file():
     return data_io.discover_key_skus_file()
 
 
+# --------------------------------------------------------------------------- #
+# Cache-key note: the invalidation arguments below (``mtime`` / ``mtimes`` /   #
+# ``nonce`` / ``week_key`` / ``data``) deliberately carry NO leading           #
+# underscore. Streamlit excludes underscore-prefixed parameters from a         #
+# @st.cache_data key, so while these were named ``_mtime`` etc. they were      #
+# documented as busting the cache but silently did not: an incremental refresh #
+# rewriting the same snapshot path kept serving the old frame, "Refresh from   #
+# Plytix" never re-fetched, the weekly rollover of the allocation/on-hand      #
+# readers never happened, and two uploads sharing a filename collided. Do not  #
+# re-add the underscores.                                                      #
+# --------------------------------------------------------------------------- #
+
 @st.cache_data(show_spinner=False)
-def load_key_skus(path, _mtime):
-    """Cached read of the key-SKU list into a frozenset of SKU strings. ``_mtime``
+def load_key_skus(path, mtime):
+    """Cached read of the key-SKU list into a frozenset of SKU strings. ``mtime``
     is part of the cache key so a freshly extracted list invalidates the cache."""
     return data_io.read_key_skus(path)
 
@@ -61,22 +73,22 @@ def discover_raw_files():
 # Streamlit-only.                                                              #
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner="Reading Plytix export…")
-def read_plytix_from_path(path, _mtime):
+def read_plytix_from_path(path, mtime):
     """Read the raw Plytix export from disk (for the 'Active in' check)."""
     return data_io.read_plytix(path)
 
 
 @st.cache_data(show_spinner="Reading Plytix export…")
-def read_plytix_from_bytes(_data, name):
+def read_plytix_from_bytes(data, name):
     """Read the raw Plytix export from uploaded bytes (for the 'Active in' check)."""
-    return data_io.read_plytix(BytesIO(_data))
+    return data_io.read_plytix(BytesIO(data))
 
 
 @st.cache_data(show_spinner="Fetching Plytix feed…")
-def fetch_plytix_from_url(url, _nonce):
+def fetch_plytix_from_url(url, nonce):
     """Fetch the raw Plytix export from the channel feed URL (CSV).
 
-    ``_nonce`` busts the cache when the user clicks "Refresh from Plytix" — a URL
+    ``nonce`` busts the cache when the user clicks "Refresh from Plytix" — a URL
     has no mtime to key on. Returns the raw Plytix frame; list prices are derived
     from it cheaply via ``data_io.prices_from_plytix``."""
     return data_io.read_plytix(url)
@@ -109,8 +121,8 @@ _clean = data_io._clean
 
 
 @st.cache_data(show_spinner="Loading raw data…")
-def load_raw_from_path(path, _mtime, model_path):
-    """Read + clean a raw file from disk. ``_mtime`` busts the cache on change.
+def load_raw_from_path(path, mtime, model_path):
+    """Read + clean a raw file from disk. ``mtime`` busts the cache on change.
 
     ``model_path`` keys the cache on the selected model, since each pipeline
     owns its own cleaning rules.
@@ -121,18 +133,18 @@ def load_raw_from_path(path, _mtime, model_path):
 
 
 @st.cache_data(show_spinner="Loading raw data…")
-def load_raw_from_bytes(_data, name, model_path):
+def load_raw_from_bytes(data, name, model_path):
     """Read + clean an uploaded raw file (cached on its bytes + model)."""
     P = load_pipeline(model_path)
-    raw = pd.read_excel(BytesIO(_data), header=2)
+    raw = pd.read_excel(BytesIO(data), header=2)
     return _clean(raw, P)
 
 
 @st.cache_data(show_spinner="Cleaning warehouse projections…")
-def load_warehouse_from_paths(paths, _mtimes):
+def load_warehouse_from_paths(paths, mtimes):
     """Clean + combine warehouse exports from disk into one long frame.
 
-    ``_mtimes`` (a tuple aligned with ``paths``) busts the cache when any file
+    ``mtimes`` (a tuple aligned with ``paths``) busts the cache when any file
     changes. Used by the 'missing future projections' table only.
     """
     return data_io.combine_warehouse_projections([(p, p) for p in paths])
@@ -145,18 +157,18 @@ def load_warehouse_from_uploads(items):
     ``items`` is a tuple of (name, bytes) pairs, one per uploaded file.
     """
     return data_io.combine_warehouse_projections(
-        [(BytesIO(data), name) for name, data in items]
+        [(BytesIO(blob), name) for name, blob in items]
     )
 
 
 @st.cache_data(show_spinner=False)
-def load_allocation_pairs_from_path(path, _mtime, _week_key):
+def load_allocation_pairs_from_path(path, mtime, week_key):
     """(SKU, Customer) combos in the current allocation, read from disk.
 
     Reads the RAW demand snapshot (the inventory columns _clean drops still live
     there) and returns data_io.active_allocation_pairs. Used to drop phantom
-    combos from the missing-projections table. ``_mtime`` busts the cache on a
-    new snapshot; ``_week_key`` (current week-start ISO) busts it weekly so the
+    combos from the missing-projections table. ``mtime`` busts the cache on a
+    new snapshot; ``week_key`` (current week-start ISO) busts it weekly so the
     trailing-3-month window rolls forward.
     """
     raw = data_io.read_raw_frame(path)  # Parquet sidecar when present, else xlsx
@@ -164,19 +176,19 @@ def load_allocation_pairs_from_path(path, _mtime, _week_key):
 
 
 @st.cache_data(show_spinner=False)
-def load_allocation_pairs_from_bytes(_data, name, _week_key):
+def load_allocation_pairs_from_bytes(data, name, week_key):
     """(SKU, Customer) combos in the current allocation, from uploaded bytes."""
-    raw = pd.read_excel(BytesIO(_data), header=2)
+    raw = pd.read_excel(BytesIO(data), header=2)
     return data_io.active_allocation_pairs(raw)
 
 
 @st.cache_data(show_spinner=False)
-def load_onhand_by_sku_from_path(path, _mtime, _week_key):
+def load_onhand_by_sku_from_path(path, mtime, week_key):
     """SKU -> current total On Hand Series, read from disk.
 
     Reads the RAW demand snapshot (the inventory columns _clean drops still live
     there) and returns data_io.onhand_by_sku. Feeds the Exceptions spikes table's
-    WOS column. ``_mtime`` busts the cache on a new snapshot; ``_week_key``
+    WOS column. ``mtime`` busts the cache on a new snapshot; ``week_key``
     (current week-start ISO) busts it weekly so 'current On Hand' rolls forward.
     """
     raw = data_io.read_raw_frame(path)  # Parquet sidecar when present, else xlsx
@@ -184,15 +196,15 @@ def load_onhand_by_sku_from_path(path, _mtime, _week_key):
 
 
 @st.cache_data(show_spinner=False)
-def load_onhand_by_sku_from_bytes(_data, name, _week_key):
+def load_onhand_by_sku_from_bytes(data, name, week_key):
     """SKU -> current total On Hand Series, from uploaded bytes."""
-    raw = pd.read_excel(BytesIO(_data), header=2)
+    raw = pd.read_excel(BytesIO(data), header=2)
     return data_io.onhand_by_sku(raw)
 
 
 @st.cache_data(show_spinner="Loading list prices…")
-def load_prices_from_path(path, _mtime, model_path):
-    """Load a SKU -> List Price (USD) Series from disk. ``_mtime`` busts cache."""
+def load_prices_from_path(path, mtime, model_path):
+    """Load a SKU -> List Price (USD) Series from disk. ``mtime`` busts cache."""
     P = load_pipeline(model_path)
     if not hasattr(P, "load_list_prices"):
         return None
@@ -200,7 +212,7 @@ def load_prices_from_path(path, _mtime, model_path):
 
 
 @st.cache_data(show_spinner="Loading list prices…")
-def load_prices_from_bytes(_data, name, model_path):
+def load_prices_from_bytes(data, name, model_path):
     """Load list prices from an uploaded workbook (cached on its bytes).
 
     Writes to a temp file so the pipeline's own reader/cleaner is reused
@@ -211,7 +223,7 @@ def load_prices_from_bytes(_data, name, model_path):
         return None
 
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
-        tf.write(_data)
+        tf.write(data)
         tmp = tf.name
     try:
         return P.load_list_prices(tmp)

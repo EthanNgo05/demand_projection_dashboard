@@ -26,7 +26,9 @@ import streamlit as st
 from dashboard_app.compute import (
     EIGHT_WK_AVG_COL, _descriptive_averages, optimal_projection_for, summary_to_excel,
 )
-from dashboard_app.config import ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, fmt_dollar
+from dashboard_app.config import (
+    ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, bounded_put, fmt_dollar,
+)
 from dashboard_app.dataquality import (
     render_discontinued_section,
     render_inactive_section,
@@ -266,7 +268,8 @@ def sku_week_by_group(df, P):
     return agg_by_group[~agg_by_group["SKU"].astype(str).str.endswith("*")]
 
 
-def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
+def _render_exception_chart(agg, anchors, df, prices, today_ts, data_sig,
+                            row, key_base):
     """Detail-card chart + "Calculate Optimal Projection" for one (SKU, group).
 
     Draws this SKU's actual sell-through vs the system projection with its own
@@ -302,7 +305,7 @@ def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
                       "available; otherwise backtests live (can be slow)."):
         with st.spinner("Finding the best model and forecasting…"):
             st.session_state[opt_key] = optimal_projection_for(
-                df, group, sku, today_ts, prices
+                df, group, sku, today_ts, prices, data_sig=data_sig,
             )
     opt = st.session_state.get(opt_key)
     weekly = None
@@ -946,6 +949,52 @@ def _section(frame, direction, key, P, today_str, slug, label, cols=None,
     _download_button(sub[cols], slug, label, today_str)
 
 
+# Distinct container-impact thresholds held at once (the two tabs have their own
+# widget, and a planner nudging the stepper walks through values). Each entry is
+# one spikes frame — a few thousand rows — so a small cap keeps memory flat.
+SPIKE_CACHE_MAX = 6
+
+
+def _spikes_cached(agg, today_ts, prices, P, sku_active_in, container_load,
+                   onhand_by_sku, min_container_impact):
+    """``compute_spikes`` memoised per (structural signature, threshold).
+
+    Streamlit executes the body of EVERY ``st.tabs`` branch on every rerun, and
+    both Exceptions tabs render the spikes table — so an ungated call meant two
+    full scans (~8s each on the live snapshot) for every widget interaction, even
+    a threshold nudge that changes nothing about the scan.
+
+    The tabs differ only in the key-SKU filter and the group-by rollup, and both
+    are applied to the RESULT of the scan (see ``_render_spikes_section``), so one
+    shared frame is exactly equivalent to computing it per tab.
+
+    Keyed on ``exceptions_structural`` — the same signature guarding the
+    exceptions frame, which already covers today / prices / data / warehouse /
+    allocation and now on-hand — plus the threshold, which is the only other live
+    input ``compute_spikes`` reads. Cached per threshold rather than as a single
+    slot so two tabs sitting at different thresholds don't thrash the cache.
+    """
+    store = st.session_state.setdefault("exceptions_spikes", {})
+    sig = st.session_state.get("exceptions_structural")
+    if st.session_state.get("exceptions_spikes_sig") != sig:
+        store.clear()                       # new data -> every threshold is stale
+        st.session_state["exceptions_spikes_sig"] = sig
+
+    key = float(min_container_impact)
+    if key not in store:
+        frame = compute_spikes(
+            agg, today_ts, prices, P, sku_active_in,
+            container_load=container_load, onhand_by_sku=onhand_by_sku,
+            min_container_impact=min_container_impact,
+        )
+        bounded_put(store, key, frame, SPIKE_CACHE_MAX)
+    # Hand out a copy, so the two tabs keep the independent frames they had when
+    # each called compute_spikes itself. aggregate_spikes returns its input
+    # unchanged at the default grain, so without this both tabs would share one
+    # object and any future in-place edit in one would leak into the other.
+    return store[key].copy()
+
+
 def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
                            key_skus=None, key_suffix="", chart_cb=None,
                            container_load=None, onhand_by_sku=None,
@@ -984,9 +1033,8 @@ def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
              "Load are always shown.",
     )
 
-    frame = compute_spikes(agg, today_ts, prices, P, sku_active_in,
-                           container_load=container_load, onhand_by_sku=onhand_by_sku,
-                           min_container_impact=min_container_impact)
+    frame = _spikes_cached(agg, today_ts, prices, P, sku_active_in,
+                           container_load, onhand_by_sku, min_container_impact)
     if key_skus is not None:
         frame = frame[frame["SKU"].isin(key_skus)]
     if frame.empty:
@@ -1219,6 +1267,7 @@ def _render_data_quality_expanders(
 
 
 def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors, P=None,
+                      data_sig=None,
                       *, warehouse_df=None, plytix_df=None, check_ran=False,
                       inactive_df=None, excluded_counts_by_key=None,
                       disc_check_ran=False, discontinued_df=None,
@@ -1255,8 +1304,13 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     price_marker = None if prices is None else int(len(prices))
     wh_marker = None if warehouse_df is None else int(len(warehouse_df))
     alloc_marker = None if allocation_pairs is None else len(allocation_pairs)
+    # On-hand feeds the spikes table's WOS column and is threaded in from the
+    # caller rather than derived here, so it needs its own marker — otherwise a
+    # new snapshot's on-hand would not invalidate _spikes_cached, which keys off
+    # this signature.
+    onhand_marker = None if onhand_by_sku is None else int(len(onhand_by_sku))
     sig = (EXCEPTIONS_VIEW_SIG, today_str, price_marker, n_excluded_rows,
-           wh_marker, alloc_marker)
+           wh_marker, alloc_marker, onhand_marker)
     if st.session_state.get("exceptions_structural") != sig:
         with st.spinner("Scanning for exceptions…"):
             frame = compute_exceptions(df, today_ts, prices, P)
@@ -1311,7 +1365,7 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     # per-SKU-week frame, anchors, and the cleaned df / prices / today (needed for the
     # optimized forecast); called as (row, key_base) per the detail_chart contract.
     chart_cb = partial(_render_exception_chart, st.session_state.get("exceptions_agg"),
-                       anchors, df, prices, today_ts)
+                       anchors, df, prices, today_ts, data_sig)
 
     spike_kw = dict(agg=agg, prices=prices, sku_active_in=sku_active_in, today_ts=today_ts,
                     container_load=container_load, onhand_by_sku=onhand_by_sku,

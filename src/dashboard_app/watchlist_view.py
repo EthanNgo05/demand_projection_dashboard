@@ -45,7 +45,8 @@ WATCHLIST_CARD_COLS = [
 ]
 
 
-def _best_model_table(df, today_ts, today_str, prices, n_excluded_rows):
+def _best_model_table(df, today_ts, today_str, prices, n_excluded_rows,
+                      data_sig=None):
     """The best-model-per-group combined table, sharing the Optimized view's
     session cache so switching between the two views never recomputes it.
 
@@ -57,7 +58,8 @@ def _best_model_table(df, today_ts, today_str, prices, n_excluded_rows):
            _agent_summaries_mtime())
     if st.session_state.get("bestmix_structural") != sig:
         with st.spinner("Forecasting each group with its best model…"):
-            result = compute_by_customer_best(df, today_ts, prices, min_weeks=None)
+            result = compute_by_customer_best(df, today_ts, prices, min_weeks=None,
+                                              data_sig=data_sig)
         st.session_state["bestmix_result"] = result
         # Oldest stamp — see kpis.py: the shared "bestmix_generated_at" cache must
         # mean the same thing whichever view populated it (the freshness caption
@@ -212,7 +214,8 @@ def _list_controls():
         st.rerun()  # full: the table + ★ marker elsewhere must refresh
 
 
-def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, P):
+def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, P,
+                     data_sig=None):
     """Render the WATCHLIST_VIEW. Signature mirrors render_exceptions /
     _render_best_model_combined so main()'s dispatch call is uniform."""
     st.subheader("Watchlist")
@@ -279,7 +282,8 @@ def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, 
         )
         return
 
-    combined, *_ = _best_model_table(df, today_ts, today_str, prices, n_excluded_rows)
+    combined, *_ = _best_model_table(df, today_ts, today_str, prices, n_excluded_rows,
+                                     data_sig)
     if combined is None or getattr(combined, "empty", True):
         st.warning(
             "No customer group has a recommended model yet, so watchlist detail "
@@ -306,7 +310,7 @@ def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, 
         # leading args; the (row, key_base) tail matches the detail_chart contract.
         agg = _watchlist_agg(df, P, today_str)
         chart_cb = functools.partial(
-            _render_exception_chart, agg, anchors, df, prices, today_ts
+            _render_exception_chart, agg, anchors, df, prices, today_ts, data_sig
         )
         # Region isn't in the best-model table; derive it for the detail card.
         # .assign copies, so the shared best-model cache stays untouched.

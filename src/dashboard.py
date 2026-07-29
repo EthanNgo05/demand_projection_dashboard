@@ -106,7 +106,7 @@ from dashboard_app.config import (  # noqa: F401
     PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
     SCOPE_LABELS, WATCHLIST_VIEW,
     _ENV_PIPELINE,
-    fmt_dollar, model_display, region_all_view, region_from_view,
+    bounded_put, fmt_dollar, model_display, region_all_view, region_from_view,
 )
 from dashboard_app.pipeline import (  # noqa: F401
     _load_pipeline_cached, _supports_autofit, _supports_min_weeks, _supports_prices,
@@ -161,6 +161,7 @@ from dashboard_app.kpis import (  # noqa: F401
 from dashboard_app.exceptions import (  # noqa: F401
     compute_exceptions, render_exceptions,
 )
+from dashboard_app import forecast_cache  # noqa: F401
 from dashboard_app.watchlist_view import render_watchlist  # noqa: F401
 
 
@@ -186,14 +187,10 @@ def _logo_data_uri():
         return None
 
 
-def _bounded_put(store, key, value, cap):
-    """Insert ``key -> value`` into an insertion-ordered dict, evicting the
-    oldest entries once ``cap`` is exceeded. Popping the key first gives
-    refreshed keys move-to-end (LRU-ish) semantics."""
-    store.pop(key, None)
-    store[key] = value
-    while len(store) > cap:
-        del store[next(iter(store))]
+# Moved to dashboard_app.config so exceptions.py can bound its own session cache
+# with the same semantics; kept as a module-level alias because dashboard.py is a
+# facade and callers/tests resolve it as dashboard._bounded_put.
+_bounded_put = bounded_put
 
 
 def main():
@@ -685,6 +682,13 @@ def main():
         # Same raw-frame source as allocation_pairs; also week-keyed so the "current"
         # on-hand week rolls forward.
         onhand_by_sku = None
+        # Path of the on-disk snapshot in play, or None when the user has
+        # overridden the data with an upload. It identifies the demand input for
+        # the persistent forecast cache's key (see the data_sig block below);
+        # uploaded bytes have no stable file identity, so that path deliberately
+        # leaves the disk cache out of the picture and only the in-session caches
+        # apply.
+        snapshot_path = None
         _week_key = data_io._this_week_start().isoformat()
 
         # Background pulls are coordinated through lock files, so their state
@@ -890,6 +894,7 @@ def main():
                 # auto-select target), no widget shown.
                 choice = list(labels.keys())[0]
             today_str, path = labels[choice]
+            snapshot_path = path
             df = load_raw_from_path(path, os.path.getmtime(path), pipeline_path())
             allocation_pairs = load_allocation_pairs_from_path(
                 path, os.path.getmtime(path), _week_key
@@ -1134,6 +1139,33 @@ def main():
             excl.n_disc_rows, excl.n_disc_skus,
         )
 
+    # ----- Persistent forecast-cache signature -----------------------------
+    # Identifies the inputs every forecast on this page derives from, so results
+    # can be cached to disk (outputs/.cache) and survive a restart, a browser
+    # refresh, or a different planner opening the app — and so the nightly
+    # agent.batch can warm them. Built HERE, after exclusions, because `df` from
+    # this point on is the post-exclusion frame: the excluded row count and the
+    # final row count are what make the cleaned frame reproducible, on top of the
+    # file identities (mtime + size, so an in-place incremental refresh of the
+    # same filename invalidates too).
+    #
+    # Threaded explicitly into the compute functions rather than held in module
+    # state: Streamlit runs each browser session's script on its own thread
+    # against the same module objects, so a shared global could let one session's
+    # snapshot key another session's forecast. None (an upload override, or no
+    # snapshot on disk) simply disables the disk tier.
+    data_sig = None
+    if snapshot_path is not None:
+        data_sig = forecast_cache.snapshot_signature(
+            snapshot_path,
+            n_excluded_rows=n_excluded_rows,
+            n_rows=len(df) if df is not None else None,
+            # Content-hashed rather than file-stat'd: prices arrive from an
+            # upload, the Plytix feed, or a local xlsx, so no path identifies
+            # them, and they land in the revenue-risk columns.
+            prices=forecast_cache.content_signature(prices),
+        )
+
     # ----- View selector (By-Region sub-selectors) -------------------------
     # The scope buttons rendered at the top of the page (into view_slot) already
     # set `view` for the three scopes that don't need data. The "By region" scope
@@ -1335,7 +1367,8 @@ def main():
     # stitched per-group best-model table and stops.
     if view == BEST_MODEL_COMBINED_VIEW:
         _render_best_model_combined(
-            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P
+            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P,
+            data_sig=data_sig,
         )
         st.stop()
 
@@ -1349,6 +1382,7 @@ def main():
             inactive_df=inactive_df, excluded_counts_by_key=excluded_counts_by_key,
             disc_check_ran=disc_check_ran, discontinued_df=discontinued_df,
             allocation_pairs=allocation_pairs, onhand_by_sku=onhand_by_sku,
+            data_sig=data_sig,
         )
         st.stop()
 
@@ -1358,7 +1392,8 @@ def main():
     # table and stops before the single-model compute/charts/KPIs below.
     if view == WATCHLIST_VIEW:
         render_watchlist(
-            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P
+            df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P,
+            data_sig=data_sig,
         )
         st.stop()
 
@@ -1406,7 +1441,8 @@ def main():
         ):
             _bounded_put(autofit_tried_map, autofit_key, True, AUTOFIT_CACHE_MAX)
             with st.spinner("Tuning the forecast for this view…"):
-                best = run_autofit(df, view, today_ts, pipeline_path(), mw0)
+                best = run_autofit(df, view, today_ts, pipeline_path(), mw0,
+                                   data_sig)
             if best is not None:
                 logger.info(
                     "Autofit [%s]: alpha=%.2f beta=%.2f phi=%.2f "
@@ -1469,7 +1505,7 @@ def main():
             prog.progress(0.15, text="Building forecast for this view…")
             summary, weekly, agg = compute_view(
                 df, view, today_ts, pipeline_path(),
-                prices, alpha, beta, phi, min_weeks,
+                prices, alpha, beta, phi, min_weeks, data_sig,
             )
 
             by_cust = None
@@ -1487,6 +1523,7 @@ def main():
                 by_cust = compute_by_customer(
                     src, today_ts, pipeline_path(),
                     prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
+                    data_sig=data_sig,
                 )
             prog.progress(1.0, text="Done")
         finally:

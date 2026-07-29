@@ -183,6 +183,23 @@ def fmt_dollar(v, decimals=0, signed=False):
     sign = "-" if v < 0 else ("+" if signed else "")
     return f"{sign}${abs(v):,.{decimals}f}"
 
+
+def bounded_put(store, key, value, cap):
+    """Insert ``key -> value`` into an insertion-ordered dict, evicting the
+    oldest entries once ``cap`` is exceeded. Popping the key first gives
+    refreshed keys move-to-end (LRU-ish) semantics.
+
+    Lives here (rather than in dashboard.py, where it started) so every module
+    holding a per-session cache in ``st.session_state`` can bound it the same
+    way — dashboard.py's forecast/autofit caches and exceptions.py's spike-scan
+    cache all share these semantics.
+    """
+    store.pop(key, None)
+    store[key] = value
+    while len(store) > cap:
+        del store[next(iter(store))]
+
+
 # Chart palette -- actuals are the anchor (solid), the two projections are
 # de-emphasised dashed/dotted lines so the eye reads "history -> forecast".
 C_ACTUAL = "#2563eb"   # blue   - historical actual demand (POS or Orders)

@@ -31,10 +31,16 @@ python src/extract_warehouse_projections.py   # ~2 min -> 5 regional <REGION>_wa
 python src/extract_key_skus.py                # ~seconds -> dated key_skus/key_skus_<date>.xlsx (the "Key SKUs" watchlist)
 python src/active_missing_projections.py      # batch: active SKUs missing forward projections -> outputs/missing_projections
 
-# Tests (~120 fast tests). The agent package lives under src/; pytest.ini puts src/ on sys.path.
+# Tests (~290 fast tests). The agent package lives under src/; pytest.ini puts src/ on sys.path.
 pytest tests/ -v
 pytest tests/test_phase3_select.py::test_name   # single test
 pytest --runslow                                # include the 7 slow full-matrix parity tests
+
+# Performance: time every compute path against the live snapshot (before/after a change)
+python scripts/bench_dashboard.py               # flags: --skip-slow, --json out.json
+
+# Regenerate the golden masters — ONLY when a change to the numbers is intended
+REGEN_GOLDENS=1 pytest tests/test_perf_parity.py
 
 # Agent end-to-end for one view (run from src/ so `python -m agent.run` resolves the package)
 cd src && python -m agent.run --view "All customers (combined)"
@@ -67,6 +73,19 @@ Forecast **views** offered by both front-ends: `All customers (combined)`, one `
 - **`dataquality.py`** — the inactive / missing-projection / discontinued / no-POS data-quality section renderers.
 - **`refresh.py`** — subprocess-backed manual refresh (demand / warehouse / key-SKUs / agent batch) with lock/log files and progress polling.
 - **`agent_summary.py`** — read + render the precomputed agent-summary JSON, the live single-view run, and the `_model_fit_callout` reconciliation.
+- **`forecast_cache.py`** *(streamlit-free)* — the **persistent** forecast cache under `outputs/.cache/forecasts/<key>/` (`summary`/`weekly`/`agg` as Parquet + a `meta.json` marker written last; `params.json` for autofit's scalars). Keyed on `snapshot_signature` (basename + `st_mtime_ns` + size of the snapshot, so an in-place `--incremental` rewrite invalidates) folded with a content hash of the list prices, the view, the model file's mtime, α/β/φ/min-weeks and the run date. Streamlit-free so `agent/batch.py` can warm it from a worker. Every read/write is best-effort: a missing pyarrow, a corrupt file or a half-written entry is a **miss** (recompute), never an exception — deleting `outputs/.cache` at any moment is safe. Disable with `DEMAND_FORECAST_CACHE=0` (what `scripts/bench_dashboard.py` does so a warm cache can't flatter a timing run).
+
+### Caching layers (why a revisited view is instant)
+
+Three tiers sit in front of every forecast, cheapest first:
+
+1. **`st.session_state`** — `dashboard.py`'s `fc_cache` (per view, bounded by `FC_CACHE_MAX`), `autofit_params`, `exceptions_structural`/`exceptions_spikes`, `bestmix_*`. Per browser session; lost on refresh.
+2. **`@st.cache_data`** — per process. Note `compute_view`/`_forecast_one_group` take the full frame as a hashed argument, which is why tier 1 exists on top.
+3. **`forecast_cache`** — on disk, survives restarts, shared across sessions, and **warmed nightly**: `agent.batch`'s `_warm_forecast_cache` persists the frames `run_all_models` already computed for all five models per view (previously discarded — only `best_model` was published). The dashboard's `data_sig` and the batch's must stay identical or the warm-up silently stops being found; `tests/test_forecast_cache.py` pins that, and `AgentState.n_excluded_rows` exists solely so the batch can reproduce the dashboard's key.
+
+`data_sig` is threaded explicitly through `compute_view` / `_forecast_one_group` / `compute_by_customer{,_best}` / `run_autofit` / `optimal_projection_for` rather than held in module state — Streamlit runs each session's script on its own thread against the same module objects, so a shared global could let one session's snapshot key another session's forecast. `None` (an upload override) disables the disk tier.
+
+**Cache-key gotcha:** Streamlit **excludes underscore-prefixed parameters** from a `@st.cache_data` key. `datasources.py`'s invalidation args (`mtime`/`mtimes`/`nonce`/`week_key`/`data`) must therefore carry no underscore — they once did, and the cache silently never invalidated (an incremental refresh kept serving the pre-refresh frame; "Refresh from Plytix" never re-fetched). `tests/test_datasource_cache_keys.py` guards it.
 
 ### The agent pipeline (target architecture)
 
@@ -132,7 +151,7 @@ Within one view the models fit **serially** — Holt-Winters dominates the runti
 
 ### Data flow & inputs
 
-- **Nightly job** (`refresh_demand_data.ps1`, registered with Windows Task Scheduler): full demand pull → warehouse pull (independent — runs even if the demand pull failed) → key-SKUs pull (`extract_key_skus.py`) → `agent.batch` precompute (only if the demand pull succeeded). The nightly demand pull is deliberately the **full 36-month pull** — the self-healing baseline that picks up restated actuals, item renames, and customer remaps; the dashboard's refresh button runs the fast `--incremental` pull instead. Worst exit code wins so Task Scheduler flags a failure in any step. Logs to `logs/<date>/logs_refresh.txt`.
+- **Nightly job** (`refresh_demand_data.ps1`, registered with Windows Task Scheduler): full demand pull → warehouse pull (independent — runs even if the demand pull failed) → key-SKUs pull (`extract_key_skus.py`) → `agent.batch` precompute (only if the demand pull succeeded). The nightly demand pull is deliberately the **full 36-month pull** — the self-healing baseline that picks up restated actuals, item renames, and customer remaps; the dashboard's refresh button runs the fast `--incremental` pull instead. Worst exit code wins so Task Scheduler flags a failure in any step. Logs to `logs/<date>/logs_refresh.txt`. The batch step also **warms `forecast_cache`** (and prunes it), so the first person in each morning reads forecasts off disk instead of recomputing. Warm hits require the batch's `today_ts` (wall clock) to match the snapshot's date label, which the pull-then-batch ordering gives; if they diverge the dashboard simply recomputes and writes its own entry — a miss, never a wrong number.
 - `sql/demand_details_optimized.sql` is the **default** query behind the demand extract (`DEFAULT_SQL` in `extract_demand_details.py`); `--incremental` only works against it (it rewrites a marker line in the batch to narrow the date window). The legacy `sql/demand_details.sql` is **UTF-16 encoded** (opens as garbled/spaced text in some tools — that's expected, per `.gitattributes`). Region "Others - <country>" buckets attach at `Custnmbr` grain via `MIN(Customer)` — don't drop them when touching the SQL.
 - **Parquet sidecars**: the demand extract writes a `.parquet` sidecar next to each snapshot `.xlsx` (same basename). The `.xlsx` stays the source of truth; `data_io.read_raw_frame` prefers the sidecar when it's at least as new, else reads the xlsx and backfills the sidecar. Sidecar writes are best-effort (no pyarrow → logged and skipped). Snapshot pruning keeps the newest `KEEP_SNAPSHOTS` files (default 3, `DEMAND_KEEP_SNAPSHOTS` env var) and deletes each pruned snapshot's sidecar with it.
 - Raw inputs live at the repo root under `raw_inputs/`: `demand_projections/all_demand_projections_<date>.xlsx` (written by the extract; PowerBI exports also work), `list_prices/list_prices_*.xlsx` (Plytix export — drives revenue-risk columns *and* the two data-quality checks below), `warehouse_projections/<REGION>_*.xlsx` (normally written by `extract_warehouse_projections.py` from `sql/warehouse_projections.sql`; manual PowerBI exports also work — `data_io.warehouse_wide_to_long` sniffs whether a file is the legacy wide matrix or the long table layout, and for long files reconstructs the missing SKU×customer×week cells that drive the missing-projections table), and `key_skus/key_skus_<date>.xlsx` (single `SKU` column from `extract_key_skus.py` via `sql/key_skus.sql`; the dashboard discovers the newest via `data_io.discover_key_skus_file`/`read_key_skus` to populate the "Key SKUs" watchlist).
@@ -151,4 +170,6 @@ Within one view the models fit **serially** — Holt-Winters dominates the runti
 - Phases 1–3 are deterministic; parity tests (`test_phase2_parity`, `test_phase6_full_parity`) diff the agent's numbers against `dashboard.compute_view` with **exact-match** assertions (both call the same `fit_regression`). These are marked `slow` and skipped unless you pass `--runslow`.
 - Phase 4 (LLM) tests mock the model; one API-key-gated live smoke test exists for manual use.
 - Beyond the phase suites: `test_warehouse_extract` / `test_warehouse_reader` cover the regional pull and wide/long layout sniffing, `test_incremental_refresh` covers the `--incremental` SQL rewrite and snapshot merge, `test_region_all_view` covers the per-region rollup views, and `test_datawarehouse_integration` covers the demand extract end-to-end.
+- **`test_perf_parity.py` is the guard for performance work.** Golden masters in `tests/fixtures/golden/*.parquet` pin the exact output of every model's `fit_regression`/`aggregate_to_sku_week`/`cleanse_series`, plus `compute_exceptions`, `compute_spikes`, `_descriptive_averages` and `compute_by_customer`, at `check_exact=True`. They are built from `tests/fixtures/make_perf_fixture.py` — a seeded ~3-year, 24-SKU frame with promo spikes, stockout dips, dead SKUs and late starters, so outlier cleansing, Holt-Winters seasonality (≥104 weeks) and gap densification all actually engage. The tiny Phase-2 fixture (9 weeks) reaches none of that. Both sides of each comparison are round-tripped through Parquet so serialisation can't masquerade as a numeric diff. Two functions that were optimised also keep their **original implementation** in the test file as an executable reference (`_reference_rolling`, `_descriptive_averages_reference`) and are checked against it on adversarial inputs — that is what caught the empty-POS/empty-Orders dtype case the goldens missed.
+- If you optimise anything on the compute path, run `pytest tests/test_perf_parity.py` **before and after**. Regenerate goldens only with `REGEN_GOLDENS=1` and only when a number change is intended.
 - Dashboard tests use Streamlit's `AppTest`; its `session_state` is a proxy without `.get()` — use `in` checks / subscripting.
