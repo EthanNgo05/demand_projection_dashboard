@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dashboard_app.config import C_ACTUAL, C_UPDATED, C_ORIGINAL, C_GRID
+from dashboard_app.config import C_ACTUAL, C_UPDATED, C_ORIGINAL, C_GRID, fmt_dollar
 from dashboard_app.summaries import historical_window
 
 
@@ -31,11 +31,16 @@ def _base_layout(fig, title, forecast_start, y_title="Units (POS / Orders)"):
         legend=dict(orientation="h", yanchor="bottom", y=0.98, x=0),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
+        # namelength=-1 shows the full trace name in the unified-hover box (Plotly's
+        # default of 15 chars truncated "Updated forecast (from POS)" to "Updated fore…").
+        hoverlabel=dict(namelength=-1),
     )
     # Translucent grid/divider colors read correctly on both light and dark
-    # surfaces, so these stay explicit.
+    # surfaces, so these stay explicit. tickformat=",.0f" prints plain grouped
+    # integers (83,895) instead of Plotly's default SI abbreviation (83.895k).
     fig.update_xaxes(gridcolor=C_GRID, title=None)
-    fig.update_yaxes(gridcolor=C_GRID, rangemode="tozero", title=y_title)
+    fig.update_yaxes(gridcolor=C_GRID, rangemode="tozero", title=y_title,
+                     tickformat=",.0f")
     if forecast_start is not None:
         fig.add_vline(
             x=forecast_start, line_width=1, line_dash="dot",
@@ -60,6 +65,85 @@ def _clip_to_range(df, date_range):
         return df
     s, e = date_range
     return df[(df["WeekDate"] >= s) & (df["WeekDate"] <= e)]
+
+
+# --------------------------------------------------------------------------- #
+# Hover revenue-difference helpers                                            #
+# --------------------------------------------------------------------------- #
+# Setting an explicit hovertemplate suppresses "x unified" mode's automatic
+# trace-name label, so each data line's template must carry its OWN
+# "<label>: <value>" text (otherwise a hovered row shows just a colored swatch +
+# number, with no telling which line is which). The "Revenue Risk: $X" figure is
+# NOT a <br> line on the Original-projection trace — that would tie it to the grey
+# swatch — but a separate, swatch-less companion trace (see _revenue_risk_trace)
+# so it reads as its own bottom row, color-coded green (>=0) / red (<0).
+
+_RISK_POS = "#16a34a"   # green — plan gap adds revenue (matches Exceptions card)
+_RISK_NEG = "#dc2626"   # red   — plan gap removes revenue
+
+
+def _hover_template(label):
+    """A unified-hover template showing ``<label>: <value>`` (comma-grouped).
+    ``<extra></extra>`` suppresses Plotly's secondary trace-name box."""
+    return f"{label}: %{{y:,.0f}}<extra></extra>"
+
+
+def _as_price_map(prices):
+    """Normalize a SKU->price input (dict, pandas Series, or None) to
+    ``{str(sku): float}``. Returns ``{}`` when nothing usable is supplied, so a
+    caller with no list prices simply gets plain (value-only) hovers."""
+    if prices is None:
+        return {}
+    if isinstance(prices, (pd.Series, dict)):
+        items = prices.items()
+    else:
+        return {}
+    out = {}
+    for k, v in items:
+        val = pd.to_numeric(v, errors="coerce")
+        if not pd.isna(val):
+            out[str(k)] = float(val)
+    return out
+
+
+def _rev_by_week(frame, unit_col, price_map):
+    """Per-week revenue = Σ(units × that SKU's price), as a WeekDate-indexed
+    Series. Empty when no price map (so the caller shows plain hovers)."""
+    if not price_map or frame is None or frame.empty:
+        return pd.Series(dtype="float64")
+    f = frame[["SKU", "WeekDate", unit_col]].copy()
+    f["_rev"] = (pd.to_numeric(f[unit_col], errors="coerce")
+                 * f["SKU"].astype(str).map(price_map))
+    return f.groupby("WeekDate")["_rev"].sum(min_count=1)
+
+
+def _revenue_risk_trace(week_series, risk_by_week):
+    """An invisible companion Scatter that renders "Revenue Risk: $X" as its OWN
+    swatch-less row in the unified hover — a ``<br>`` on the Original line would
+    tie the figure to the grey swatch. Points sit at y=0 (the axis already
+    includes 0 via rangemode="tozero", so no visual/range change) which sorts the
+    row to the bottom; the dollar figure is color-coded green (>=0) / red (<0) via
+    an inline ``<span>``. Returns ``None`` when there is no risk to show (no prices
+    loaded, or no week where both compared lines have a value)."""
+    if risk_by_week is None or len(risk_by_week) == 0:
+        return None
+    lookup = dict(risk_by_week)
+    xs, cd = [], []
+    for w in week_series:
+        v = lookup.get(pd.Timestamp(w))
+        if v is None or pd.isna(v):
+            continue
+        colour = _RISK_POS if v >= 0 else _RISK_NEG
+        xs.append(w)
+        cd.append([f"<span style='color:{colour}'>{fmt_dollar(v, signed=True)}</span>"])
+    if not xs:
+        return None
+    return go.Scatter(
+        x=xs, y=[0] * len(xs), mode="markers",
+        marker=dict(color="rgba(0,0,0,0)", size=0.1), showlegend=False,
+        customdata=cd,
+        hovertemplate="Revenue Risk: %{customdata[0]}<extra></extra>",
+    )
 
 
 def chart_range_control(agg, weekly, lcw, key):
@@ -111,14 +195,20 @@ def chart_range_control(agg, weekly, lcw, key):
     return max(data_min, lcw - RANGE_PRESETS[preset]), horizon_end
 
 
-def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None):
+def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None,
+                    prices=None):
     """Total actual demand (historical window) flowing into total forecast (15 wks).
 
     Historical demand uses each SKU's forecast source (POS or Orders) so the
     actual total is comparable to the forecast total. When date_range is given,
     the plotted traces are clipped to that window so the Y-axis rescales to fit.
+    ``prices`` (a SKU->list-price map/Series) adds a "Revenue Risk: $X" row to
+    the Original-projection line's hover — the totals are summed across SKUs, so
+    revenue is computed per SKU (units × that SKU's price) BEFORE the groupby and
+    then summed.
     """
     lb, lcw, ffw = anchors
+    pm = _as_price_map(prices)
 
     hist = historical_window(agg, summary, anchors)
     hist_tot = hist.groupby("WeekDate")["demand"].sum(min_count=1).reset_index()
@@ -138,6 +228,17 @@ def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None):
     ].dropna(subset=["Projection"])
     sys_tot = sys_proj.groupby("WeekDate")["Projection"].sum().reset_index()
 
+    # Revenue Risk = the plan-gap valued at each SKU's list price and summed (so
+    # it matches the difference of the two plotted total lines): Actual − plan in
+    # history weeks, forecast − plan in forecast weeks. Subtraction aligns on
+    # WeekDate → NaN where either side is absent → dropna; the two ranges are
+    # disjoint so concat gives one risk-per-week series for the Original line.
+    rev_orig = _rev_by_week(sys_proj, "Projection", pm)
+    risk_by_week = pd.concat([
+        (_rev_by_week(hist, "demand", pm) - rev_orig).dropna(),
+        (_rev_by_week(fc, "projected_pos", pm) - rev_orig).dropna(),
+    ])
+
     # Clip every plotted trace to the chosen chart window so the Y-axis auto-fits
     # the visible weeks (does not affect the summary/forecast math).
     hist_tot = _clip_to_range(hist_tot, date_range)
@@ -148,7 +249,7 @@ def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None):
     fig.add_trace(go.Scatter(
         x=hist_tot["WeekDate"], y=hist_tot["demand"], name="Actual demand",
         mode="lines+markers", line=dict(color=C_ACTUAL, width=3),
-        marker=dict(size=6),
+        marker=dict(size=6), hovertemplate=_hover_template("Actual demand"),
     ))
     if not hist_tot.empty and not fc_tot.empty:
         fig.add_trace(go.Scatter(
@@ -160,25 +261,32 @@ def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None):
     fig.add_trace(go.Scatter(
         x=fc_tot["WeekDate"], y=fc_tot["projected_pos"], name="Updated forecast",
         mode="lines+markers", line=dict(color=C_UPDATED, width=3, dash="dash"),
-        marker=dict(size=6),
+        marker=dict(size=6), hovertemplate=_hover_template("Updated forecast"),
     ))
     if not sys_tot.empty:
         fig.add_trace(go.Scatter(
             x=sys_tot["WeekDate"], y=sys_tot["Projection"], name="Original projection",
             mode="lines+markers", line=dict(color=C_ORIGINAL, width=2, dash="dot"),
             marker=dict(size=5),
+            hovertemplate=_hover_template("Original projection"),
         ))
+    rr = _revenue_risk_trace(sys_tot["WeekDate"], risk_by_week)
+    if rr is not None:
+        fig.add_trace(rr)
     return _base_layout(fig, f"Total weekly demand — {view}", ffw)
 
 
-def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None):
+def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None,
+              prices=None):
     """Per-SKU: actuals (historical window, from its source) + updated forecast + original proj.
 
     When date_range is given, the plotted traces are clipped to that window so the
-    Y-axis rescales to fit the visible weeks.
+    Y-axis rescales to fit the visible weeks. ``prices`` (a SKU->list-price
+    map/Series) adds the "Revenue Risk: $X" row to the Original-projection hover.
     """
     lb, lcw, ffw = anchors
     col = "Orders" if source == "Orders" else "POS"
+    pm = _as_price_map(prices)
 
     a = agg[agg["SKU"].astype(str) == str(sku)].sort_values("WeekDate")
     hist = a[(a["WeekDate"] >= lb) & (a["WeekDate"] <= lcw)].dropna(subset=[col])
@@ -194,6 +302,15 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None):
     fc = weekly[weekly["SKU"].astype(str) == str(sku)].copy()
     fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
 
+    # Revenue Risk (this SKU's price × plan-gap), shown on the Original line: it
+    # appears once per hover and is Actual − plan in history weeks, forecast − plan
+    # in forecast weeks. Empty when no prices supplied.
+    rev_orig = _rev_by_week(sys_proj, "Projection", pm)
+    risk_by_week = pd.concat([
+        (_rev_by_week(hist, col, pm) - rev_orig).dropna(),
+        (_rev_by_week(fc, "projected_pos", pm) - rev_orig).dropna(),
+    ])
+
     # Clip every plotted trace to the chosen chart window so the Y-axis auto-fits.
     hist = _clip_to_range(hist, date_range)
     fc = _clip_to_range(fc, date_range)
@@ -203,7 +320,7 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None):
     fig.add_trace(go.Scatter(
         x=hist["WeekDate"], y=hist[col], name=f"Actual {source}",
         mode="lines+markers", line=dict(color=C_ACTUAL, width=3),
-        marker=dict(size=7),
+        marker=dict(size=7), hovertemplate=_hover_template(f"Actual {source}"),
     ))
     if not hist.empty and not fc.empty:
         fig.add_trace(go.Scatter(
@@ -217,19 +334,24 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None):
         name=f"Updated forecast (from {source})",
         mode="lines+markers", line=dict(color=C_UPDATED, width=3, dash="dash"),
         marker=dict(size=7),
+        hovertemplate=_hover_template(f"Updated forecast (from {source})"),
     ))
     if not sys_proj.empty:
         fig.add_trace(go.Scatter(
             x=sys_proj["WeekDate"], y=sys_proj["Projection"],
             name="Original projection", mode="lines+markers",
             line=dict(color=C_ORIGINAL, width=2, dash="dot"), marker=dict(size=5),
+            hovertemplate=_hover_template("Original projection"),
         ))
+    rr = _revenue_risk_trace(sys_proj["WeekDate"], risk_by_week)
+    if rr is not None:
+        fig.add_trace(rr)
     title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
     return _base_layout(fig, title, ffw, y_title=f"Units ({source})")
 
 
 def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
-                          weekly=None):
+                          weekly=None, prices=None):
     """Per-SKU actuals vs the system's original projection — the Exceptions view's
     model-agnostic chart. By default there is NO updated-forecast line (this view
     runs no model), only the two series the view compares: actual POS or Orders
@@ -240,10 +362,13 @@ def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
     plotted traces are clipped to that window so the Y-axis rescales to fit. When a
     per-SKU ``weekly`` frame (``SKU, WeekDate, projected_pos``) is passed — e.g. after
     "Calculate Optimal Projection" — an orange dashed **Optimized forecast** line and
-    the actual→forecast connector are added, matching ``sku_chart``.
+    the actual→forecast connector are added, matching ``sku_chart``. ``prices`` (a
+    SKU->list-price map/Series) adds the "Revenue Risk: $X" row to the
+    Original-projection hover.
     """
     lb, lcw, ffw = anchors
     col = "Orders" if source == "Orders" else "POS"
+    pm = _as_price_map(prices)
 
     a = agg[agg["SKU"].astype(str) == str(sku)].sort_values("WeekDate")
     hist = a[(a["WeekDate"] >= lb) & (a["WeekDate"] <= lcw)].dropna(subset=[col])
@@ -258,6 +383,16 @@ def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
         fc["WeekDate"] = pd.to_datetime(fc["WeekDate"])
         fc = fc.sort_values("WeekDate")
 
+    # Revenue Risk (this SKU's price × plan-gap), shown on the Original line: it
+    # appears once per hover and is Actual − plan in history weeks, forecast − plan
+    # in forecast weeks (the latter only when an Optimized forecast is overlaid).
+    # Empty when no prices supplied.
+    rev_orig = _rev_by_week(sys_proj, "Projection", pm)
+    risk_parts = [(_rev_by_week(hist, col, pm) - rev_orig).dropna()]
+    if fc is not None:
+        risk_parts.append((_rev_by_week(fc, "projected_pos", pm) - rev_orig).dropna())
+    risk_by_week = pd.concat(risk_parts)
+
     hist = _clip_to_range(hist, date_range)
     sys_proj = _clip_to_range(sys_proj, date_range)
     if fc is not None:
@@ -267,13 +402,14 @@ def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
     fig.add_trace(go.Scatter(
         x=hist["WeekDate"], y=hist[col], name=f"Actual {source}",
         mode="lines+markers", line=dict(color=C_ACTUAL, width=3),
-        marker=dict(size=7),
+        marker=dict(size=7), hovertemplate=_hover_template(f"Actual {source}"),
     ))
     if not sys_proj.empty:
         fig.add_trace(go.Scatter(
             x=sys_proj["WeekDate"], y=sys_proj["Projection"],
             name="Original projection", mode="lines+markers",
             line=dict(color=C_ORIGINAL, width=2, dash="dot"), marker=dict(size=5),
+            hovertemplate=_hover_template("Original projection"),
         ))
     if fc is not None and not fc.empty:
         if not hist.empty:
@@ -287,6 +423,10 @@ def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
             x=fc["WeekDate"], y=fc["projected_pos"], name="Optimized forecast",
             mode="lines+markers", line=dict(color=C_UPDATED, width=3, dash="dash"),
             marker=dict(size=7),
+            hovertemplate=_hover_template("Optimized forecast"),
         ))
+    rr = _revenue_risk_trace(sys_proj["WeekDate"], risk_by_week)
+    if rr is not None:
+        fig.add_trace(rr)
     title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
     return _base_layout(fig, title, ffw, y_title=f"Units ({source})")

@@ -345,7 +345,7 @@ def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
     date_range = chart_range_control(ag, horizon, lcw, key=key)
     fig = actuals_vs_plan_chart(sku, row.get("Description"), source, ag,
                                 (chart_lb, lcw, ffw), date_range=date_range,
-                                weekly=weekly)
+                                weekly=weekly, prices=prices)
     st.plotly_chart(fig, width="stretch", key=f"{key}_plot")
 
 

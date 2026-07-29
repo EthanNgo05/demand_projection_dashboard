@@ -413,14 +413,21 @@ def _fmt_detail_value(col, val):
     return str(val)
 
 
-def _dismiss_card(dismissed_key, label):
-    """Callback: mark a card's row-label dismissed so its detail card closes in
-    place (runs before the rerun, so the card is gone on the next render)."""
-    st.session_state.setdefault(dismissed_key, set()).add(label)
+def _dismiss_card(sel_key, pos):
+    """Callback: deselect this card's table row so the card closes AND its
+    table checkbox clears together (runs before the rerun, so both are gone on
+    the next render). Streamlit 1.58+ lets us set st.dataframe row selection
+    through Session State (see the DataframeState docstring in
+    streamlit/elements/arrow.py)."""
+    state = st.session_state.get(sel_key)
+    current = []
+    if state and "selection" in state:
+        current = list(state["selection"].get("rows", []))
+    st.session_state[sel_key] = {"selection": {"rows": [r for r in current if r != pos]}}
 
 
 def _render_row_detail(row, shown, detail_chart=None, key_base=None,
-                       dismissed_key=None, close_label=None, card_cols=None,
+                       sel_key=None, close_label=None, close_pos=None, card_cols=None,
                        row_action=None, title_col="SKU"):
     """Render a row's full detail in a bordered card beneath the table.
 
@@ -430,8 +437,9 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
     listing EVERY non-hidden field, so other callers keep their behaviour. ``shown``
     is kept for signature stability but no longer hides columns. When ``detail_chart``
     is given it is called with ``(row, key_base)`` to draw a chart below the fields.
-    A ✕ button (top-right) dismisses the card via ``dismissed_key``/``close_label``
-    so the user can close it without scrolling the table back up to deselect.
+    A ✕ button (top-right) closes the card by deselecting its table row via
+    ``sel_key``/``close_pos`` (so the row's checkbox clears too, matching an
+    in-table deselect), letting the user close it without scrolling back up.
     ``row_action`` (if given) is a ``{label, help, danger, callback}`` dict rendered
     as a button at the bottom of the card; clicking it calls ``callback(row)`` (the
     callback owns any rerun — e.g. by opening a confirmation dialog)."""
@@ -471,10 +479,10 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
         title_txt = f"{star}{row.get(title_col, '')}"
         title = f"**{title_txt}** — {desc}" if desc else f"**{title_txt}**"
         title_c.markdown(title)
-        if dismissed_key is not None and close_label is not None:
+        if sel_key is not None and close_pos is not None:
             x_col.button(
                 "✕", key=f"{key_base}__close__{close_label}", help="Close this card",
-                on_click=_dismiss_card, args=(dismissed_key, close_label),
+                on_click=_dismiss_card, args=(sel_key, close_pos),
             )
         per_row = 3
         for start in range(0, len(detail_cols), per_row):
@@ -536,17 +544,11 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     rows = event.selection.rows if event and event.selection else []
     rows = sorted(r for r in rows if r < len(filtered))
 
-    # Cards can be closed in place (✕) without deselecting the table row. Track the
-    # dismissed rows by their stable pandas index label (survives filtering, unlike
-    # the positional index). Prune to only still-selected rows so re-clicking a row
-    # reopens its card and a deselected row drops out of the dismissed set.
-    dismissed_key = f"{key}__dismissed"
-    selected_labels = {filtered.index[r] for r in rows}
-    dismissed = st.session_state.get(dismissed_key, set()) & selected_labels
-    st.session_state[dismissed_key] = dismissed
-
-    visible = [r for r in rows if filtered.index[r] not in dismissed]
-    if visible:
+    # The dataframe selection is the single source of truth: each selected row gets
+    # a card, and a card's ✕ deselects its row (see _dismiss_card) so closing a card
+    # and unchecking its row are the same action.
+    sel_key = f"{key}__sel"
+    if rows:
         # Tint + space each detail card so stacked cards read as separate panels
         # rather than one long card. Scoped to the cards' keyed wrappers; the
         # translucent gray works on either theme.
@@ -561,11 +563,11 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
             "</style>",
             unsafe_allow_html=True,
         )
-        for r in visible:
+        for r in rows:
             _render_row_detail(filtered.iloc[r], shown=display_cols,
                                detail_chart=detail_chart, key_base=key,
-                               dismissed_key=dismissed_key, close_label=filtered.index[r],
-                               card_cols=detail_cols, row_action=row_action,
-                               title_col=title_col)
+                               sel_key=sel_key, close_label=filtered.index[r],
+                               close_pos=r, card_cols=detail_cols,
+                               row_action=row_action, title_col=title_col)
     else:
         st.caption("Select one or more rows to see their full details.")

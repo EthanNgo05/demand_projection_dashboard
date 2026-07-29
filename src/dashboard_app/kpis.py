@@ -8,6 +8,7 @@ from dashboard_app.config import (
 )
 from dashboard_app.summaries import (
     resolve_avg_col, avg_window_phrase, historical_window, _format_generated_at,
+    price_map_from_summary,
 )
 from dashboard_app.compute import (
     compute_by_customer_best, _agent_summaries_mtime, _agent_summaries_oldest_at,
@@ -238,6 +239,9 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
 
     _, lcw, ffw = anchors
     view_label = "Optimized Projections"
+    # SKU->list-price map for the charts' "vs plan" revenue-difference hover
+    # (empty when list prices weren't loaded → plain hovers).
+    pm = price_map_from_summary(combined)
 
     # Chart-only anchors: the passed-in `anchors` come from the sidebar model's
     # week_anchors, whose lookback start (lb) is as short as 8 weeks (8-Week
@@ -263,7 +267,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         agg_range = chart_range_control(agg_all, weekly_all, lcw, key="range_agg_best")
     st.plotly_chart(
         aggregate_chart(agg_all, combined, weekly_all, chart_anchors, view_label,
-                        date_range=agg_range),
+                        date_range=agg_range, prices=pm),
         width="stretch",
     )
     st.caption(
@@ -290,7 +294,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
             aggregate_chart(
                 agg_c, summary_c, wk_c,
                 (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw),
-                customer, date_range=cust_range,
+                customer, date_range=cust_range, prices=pm,
             ),
             width="stretch",
         )
@@ -341,7 +345,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         sku_range = chart_range_control(sku_agg, sku_weekly, lcw, key="range_sku_best")
         st.plotly_chart(
             sku_chart(sku, desc, source, sku_agg, sku_weekly, chart_anchors,
-                      date_range=sku_range),
+                      date_range=sku_range, prices=pm),
             width="stretch",
         )
         # One line per group, annotated with the best model used for that group

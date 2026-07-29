@@ -1541,7 +1541,8 @@ def main():
     with agg_ctrl:
         agg_range = chart_range_control(agg, weekly, lcw, key="range_agg")
     st.plotly_chart(
-        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view, date_range=agg_range),
+        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view,
+                        date_range=agg_range, prices=prices),
         width="stretch",
     )
 
@@ -1558,7 +1559,8 @@ def main():
         # Per-chart date-range picker (own key => independent from the aggregate chart).
         sku_range = chart_range_control(agg, weekly, lcw, key="range_sku")
         st.plotly_chart(
-            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw), date_range=sku_range),
+            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw),
+                      date_range=sku_range, prices=prices),
             width="stretch",
         )
     with cR:

@@ -4,6 +4,8 @@ import datetime
 import numpy as np
 import pandas as pd
 
+from dashboard_app.config import PRICE_COL
+
 
 # --------------------------------------------------------------------------- #
 # Demand-signal helpers (POS-then-Orders, matching the pipeline)              #
@@ -54,6 +56,23 @@ def customer_source_map(summary):
             summary["SKU"],
             summary["Data Source"],
         )
+    }
+
+
+def price_map_from_summary(df):
+    """SKU -> list price (USD) from a summary/combined frame's ``PRICE_COL``.
+
+    Returns ``{}`` when the frame is empty or carries no price column (list prices
+    not loaded), so a chart built from it simply shows plain hovers. Keys are
+    str-normalized to match the chart frames' str SKU comparisons.
+    """
+    if df is None or df.empty or PRICE_COL not in df.columns:
+        return {}
+    prices = pd.to_numeric(df[PRICE_COL], errors="coerce")
+    return {
+        str(s): float(p)
+        for s, p in zip(df["SKU"].astype(str), prices)
+        if not pd.isna(p)
     }
 
 
