@@ -514,15 +514,20 @@ def main():
         _on_model_change()
 
     # Help text for the forecasting-model selector (rendered later in the panel).
-    _MODEL_HELP = """
-        **Forecasting models**
-
-        - **8-Week Moving Average** – Simple baseline model that forecasts using the average demand over the previous 8 weeks.
-        - **Holt's Exponential Smoothing** – Standard time series forecasting model that captures both level and trend.
-        - **Holt-Winters Exponential Smoothing** – Extends Holt's method by also modeling seasonality, making it well suited for recurring demand patterns.
-        - **XGBoost** – Machine learning model that can capture complex relationships and nonlinear patterns in demand data. Best when sufficient historical data and predictive features are available.
-        - **TSB (Teunter-Syntetos-Babai)** – Designed for intermittent demand, where products have many zero-demand periods with occasional sales.
-        """
+    # Must be flush-left: Markdown treats lines indented 4+ spaces as a code
+    # block, which would show the literal ** and never wrap (horizontal scroll).
+    _MODEL_HELP = (
+        "**Forecasting models**\n\n"
+        "- **8-Week Moving Average** – Simple baseline that forecasts using the "
+        "average demand over the previous 8 weeks.\n"
+        "- **Holt's Exponential Smoothing** – Captures both level and trend.\n"
+        "- **Holt-Winters Exponential Smoothing** – Extends Holt's method with "
+        "seasonality; well suited for recurring demand patterns.\n"
+        "- **XGBoost** – Machine-learning model that captures complex, nonlinear "
+        "patterns. Best with ample history and predictive features.\n"
+        "- **TSB (Teunter-Syntetos-Babai)** – For intermittent demand, where "
+        "products have many zero-demand weeks with occasional sales."
+    )
 
     P = load_pipeline(pipeline_path())
     # Brand header: the simplehuman logo mark left of the H1 title, replacing the
@@ -1167,7 +1172,7 @@ def main():
         # Forecasting model: only the single-model views use a chosen model
         # (Optimized Projections picks per group; Exceptions is model-agnostic).
         if scope in (ALL_CUSTOMERS_VIEW, "By region"):
-            st.subheader("Forecasting model")
+            st.subheader("Forecasting model", help=_MODEL_HELP)
             # The model dropdown and the "Recommend best model" button sit side by
             # side — the button is short, so it takes a narrow column. The no-key
             # warning is folded into the (disabled) button's hover tooltip instead
@@ -1179,7 +1184,6 @@ def main():
                     "Forecasting model", list(MODEL_OPTIONS.keys()),
                     key="model_choice", on_change=_on_model_change,
                     format_func=model_display, label_visibility="collapsed",
-                    help=_MODEL_HELP,
                 )
             with b_col:
                 run_agent = st.button(
