@@ -82,27 +82,23 @@ EXCEPTIONS_VIEW = "Exceptions"
 # group table (BEST_MODEL_COMBINED_VIEW).
 WATCHLIST_VIEW = "Watchlist"
 
-# Dashboard-only top-level selector token that groups the two standard
-# single-model views (ALL_CUSTOMERS_VIEW + "By region") under one tab with a
-# nested sub-selector. It is NOT a forecast `view` ID — it never reaches the
-# compute path (the sub-selector resolves `scope` back to one of the real view
-# IDs) and is never returned by list_views/enumerate_views.
+# Dashboard-only top-level selector token for the standard single-model scope. It
+# is NOT a forecast `view` ID — it never reaches the compute path and is never
+# returned by list_views/enumerate_views, so the agent never forecasts it. Two
+# plain selectboxes rendered under the tab strip (Region, then Customer group)
+# resolve it to a real view ID: ALL_CUSTOMERS_VIEW, a region_all_view(<region>)
+# rollup, or a bare Customer Grouping. `scope` itself stays QUICK_VIEW for the
+# whole run, so the model selector and the page body branch on it directly.
 QUICK_VIEW = "Quick Projections"
 
-# Friendly labels shown in the Scope selector. The keys are the stable internal
+# Friendly labels shown in the view tab strip. The keys are the stable internal
 # view IDs (also the agent-summary filenames / agent config), so we rename only
-# what the planner sees, never the ID. One dict serves both selector levels:
-# QUICK_VIEW / BEST_MODEL_COMBINED_VIEW / EXCEPTIONS_VIEW label the top-level
-# pill bar, while ALL_CUSTOMERS_VIEW / "By region" label the nested sub-selector
-# shown under Quick Projections.
+# what the planner sees, never the ID.
 SCOPE_LABELS = {
     QUICK_VIEW: "Quick Projections",
     BEST_MODEL_COMBINED_VIEW: "Optimized Projections",
     EXCEPTIONS_VIEW: "Exceptions",
     WATCHLIST_VIEW: "Watchlist",
-    # Quick Projections sub-views:
-    ALL_CUSTOMERS_VIEW: "All Customers",
-    "By region": "By Region",
 }
 
 # One-line description shown as a caption under the view tab strip — describes the
@@ -110,16 +106,9 @@ SCOPE_LABELS = {
 # listed all four at once). Keyed by the same internal view IDs as SCOPE_LABELS.
 SCOPE_CAPTIONS = {
     QUICK_VIEW: (
-        "Standard 15-week forecasts — all customer groups combined, or drill "
-        "into a single fulfillment region or customer group."
-    ),
-    ALL_CUSTOMERS_VIEW: (
-        "Forecasts all customer groups as one combined demand series using the "
-        "model selected below."
-    ),
-    "By region": (
-        "Forecasts only the selected fulfillment region (or a customer group "
-        "within it) using the model selected below."
+        "Standard 15-week forecasts using the model selected below — all customer "
+        "groups combined, or drill into a single fulfillment region or customer "
+        "group with the dropdowns above."
     ),
     BEST_MODEL_COMBINED_VIEW: (
         "Forecasts each customer group with its own most-accurate model, combined "
@@ -146,6 +135,12 @@ SCOPE_CAPTIONS = {
 # works unchanged. Mirrored in agent/config.py (must match exactly).
 REGION_ALL_PREFIX = "All Customers - "
 
+# UI-only sentinel for the Quick Projections Region dropdown's "don't filter by
+# region" option. NEVER a view ID and never persisted: picking it just means the
+# Customer-group dropdown offers ALL_CUSTOMERS_VIEW plus every group, so the
+# selected value is always one of the real view IDs.
+ALL_REGIONS = "All regions"
+
 
 def region_all_view(region):
     """The synthetic per-region combined view string for ``region``."""
@@ -157,6 +152,21 @@ def region_from_view(view):
     if isinstance(view, str) and view.startswith(REGION_ALL_PREFIX):
         return view[len(REGION_ALL_PREFIX):]
     return None
+
+
+def quick_group_label(view):
+    """Friendly label for a Quick Projections Customer-group option.
+
+    Derived from the view string itself, never from the separately-selected
+    region: the Customer-group selectbox is re-optioned whenever Region changes,
+    and Streamlit decides whether a stored value is still offered by comparing its
+    FORMATTED form — so a label that closed over the region would make that reset
+    behaviour depend on which region happened to be selected.
+    """
+    if view == ALL_CUSTOMERS_VIEW:
+        return "All customers (combined)"
+    region = region_from_view(view)
+    return f"All customers in {region} (combined)" if region is not None else str(view)
 
 
 # The warehouse regions we check "Active in" against. A SKU should only be

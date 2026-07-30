@@ -41,6 +41,7 @@ import sys
 import time
 import base64
 import datetime
+import functools
 import glob
 import html
 import json
@@ -101,12 +102,14 @@ if not logger.handlers:
 # in the dashboard_app/ package; this file stays the Streamlit entrypoint.    #
 # --------------------------------------------------------------------------- #
 from dashboard_app.config import (  # noqa: F401
-    ALL_CUSTOMERS_VIEW, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID, C_ORIGINAL, C_UPDATED,
+    ALL_CUSTOMERS_VIEW, ALL_REGIONS, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID,
+    C_ORIGINAL, C_UPDATED,
     DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, LOGO_PATH, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
     PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
     SCOPE_LABELS, WATCHLIST_VIEW,
     _ENV_PIPELINE,
-    bounded_put, fmt_dollar, model_display, region_all_view, region_from_view,
+    bounded_put, fmt_dollar, model_display, quick_group_label, region_all_view,
+    region_from_view,
 )
 from dashboard_app.pipeline import (  # noqa: F401
     _load_pipeline_cached, _supports_autofit, _supports_min_weeks, _supports_prices,
@@ -114,13 +117,13 @@ from dashboard_app.pipeline import (  # noqa: F401
 )
 from dashboard_app.summaries import (  # noqa: F401
     _format_generated_at, avg_window_phrase, historical_window,
-    resolve_avg_col, source_map,
+    historical_window_label, resolve_avg_col, source_map,
 )
 from dashboard_app.charts import (  # noqa: F401
     _base_layout, _clip_to_range, aggregate_chart, chart_range_control, sku_chart,
 )
 from dashboard_app.tables import (  # noqa: F401
-    render_filtered_table, style_summary,
+    render_filtered_table, render_selectable_table, style_summary,
 )
 from dashboard_app.datasources import (  # noqa: F401
     DISCONTINUED_COLS, INACTIVE_COLS, MISSING_COLS, MISSING_POS_COLS, WAREHOUSE_REGIONS,
@@ -136,10 +139,12 @@ from dashboard_app.datasources import (  # noqa: F401
     price_glob, raw_glob, read_plytix_from_bytes, read_plytix_from_path,
 )
 from dashboard_app.compute import (  # noqa: F401
+    ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL,
     _agent_summaries_generated_at, _agent_summaries_mtime, _agent_summary_path,
     _best_model_for_group, _forecast_one_group, _load_agent_summary, _region_frame,
-    compute_by_customer, compute_by_customer_best, compute_view, list_views, run_autofit,
-    summary_to_excel, view_to_excel,
+    attach_descriptive_averages, compute_by_customer, compute_by_customer_best,
+    compute_by_customer_frames, compute_view, list_views, run_autofit,
+    single_group_frames, summary_to_excel, view_to_excel,
 )
 from dashboard_app.refresh import (  # noqa: F401
     BATCH_STALE_SECONDS, EXTRACT_SCRIPT, REFRESH_STALE_SECONDS, WAREHOUSE_EXTRACT_SCRIPT,
@@ -156,7 +161,8 @@ from dashboard_app.agent_summary import (  # noqa: F401
     _confirm_run_all_dialog, _model_fit_callout, _render_agent_summary, _run_agent_job,
 )
 from dashboard_app.kpis import (  # noqa: F401
-    _render_best_model_combined, _render_kpis,
+    BEST_MIX_CARD_COLS, BEST_MIX_CONDENSED_COLS,
+    _render_best_model_combined, _render_kpis, render_sku_detail_card,
 )
 from dashboard_app.exceptions import (  # noqa: F401
     compute_exceptions, render_exceptions,
@@ -170,8 +176,29 @@ from dashboard_app.watchlist_view import render_watchlist  # noqa: F401
 # view-hopping while leaving plenty of headroom for a normal set of visited
 # views. Forecast results carry DataFrames (kept smaller), autofit params are a
 # few floats (kept larger).
-FC_CACHE_MAX = 16
+#
+# FC_CACHE_MAX is deliberately small. Each entry now holds the per-group SKU-week
+# aggregate that the Customer-detail chart and the summary table's detail cards
+# draw from — ~500k rows / ~34 MB for the all-customers scope — so 16 slots would
+# reach ~700 MB of session_state per browser session. Four keeps it near the
+# ~100 MB the 4-frame tuples used to cost. An eviction is cheap: the fits
+# themselves stay memoised in _forecast_one_group (in process AND on disk), so a
+# revisited view pays only ~1.5s of re-stitching, never a refit. (If four proves
+# tight, the per-group aggregate is model- and parameter-independent, so it could
+# move to its own small cache with these tuples holding a shared reference.)
+FC_CACHE_MAX = 4
 AUTOFIT_CACHE_MAX = 64
+
+# Quick Projections' main table mirrors Optimized Projections: the same five
+# scannable columns per row, with everything else one click away in the detail
+# card. There is no "Model Used" column here (one chosen model fits the whole
+# view, named in the Forecasting model selector), so the card carries the
+# long-run average in its place — the 8-week run-rate is already in the row, and
+# both ship in the Excel download, so both have to be visible somewhere.
+QUICK_CONDENSED_COLS = ["SKU", "Customer Grouping", EIGHT_WK_AVG_COL,
+                        "Current Projection Average", RISK_COL]
+QUICK_CARD_COLS = ["Customer Grouping", "Data Source",
+                   ALL_HIST_AVG_COL, "Weeks with data"]
 
 
 @st.cache_data(show_spinner=False)
@@ -256,62 +283,6 @@ def main():
             color: inherit !important;
             font-weight: 700;
             border-bottom-color: var(--primary-color, #000000) !important;
-        }}
-
-        /* ---- Nested "Quick Projections" sub-selector --------------------- */
-        /* The All Customers / By Region control is a second segmented_control, so
-           without this it inherits the tab-strip look above and reads as a second
-           row of main tabs. Scoped to its widget key (.st-key-quick_subview,
-           key="quick_subview"), these rules override that into a compact, slightly
-           indented, fully-rounded "iOS segmented track": a tinted pill track that
-           shrink-wraps its options, with the active option a filled chip. Reads as
-           a control nested under the Quick Projections tab. */
-        .st-key-quick_subview {{
-            margin: -0.35rem 0 0.9rem 0.15rem;   /* pull up under the tab + small indent */
-        }}
-        .st-key-quick_subview div[data-testid="stButtonGroup"] {{
-            display: inline-flex;
-            width: auto;                          /* shrink-wrap, not full width */
-            background: rgba(128,128,128,0.14);   /* the rounded track */
-            border: 1px solid rgba(128,128,128,0.20);
-            border-radius: 999px;
-            padding: 3px;
-            margin-bottom: 0;
-        }}
-        .st-key-quick_subview div[data-testid="stButtonGroup"] > div {{ gap: 2px; }}
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button {{
-            border: none !important;
-            border-bottom: none !important;       /* drop the tab underline slot */
-            border-radius: 999px !important;      /* rounded chip */
-            margin-bottom: 0;
-            padding: 0.2rem 0.9rem !important;
-            font-size: 0.85rem !important;        /* smaller than the main tabs */
-            font-weight: 500;
-            color: rgba(148,163,184,1);           /* muted inactive label — slate-400, matches the main tabs and stays legible on the dark track */
-        }}
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button p {{
-            font-size: 0.85rem !important;        /* undo the 1.15rem global bump */
-        }}
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button:hover {{
-            color: inherit !important;
-            border-bottom-color: transparent !important;
-        }}
-        /* Active option: a solid chip filled with the theme accent (primaryColor),
-           label in the theme background color — an inverted pill. Both fill and
-           label are pinned to theme variables (not left to `inherit`), so contrast
-           inside the chip is guaranteed and the chip pops off the track in BOTH
-           modes: graphite fill + white label in light, near-white fill + dark label
-           in dark. Replaces the underline used by the main tabs. */
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"],
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"]:hover {{
-            background: var(--primary-color, #000000) !important;
-            color: var(--background-color, #ffffff) !important;
-            font-weight: 600;
-            border: 1px solid var(--primary-color, #000000) !important;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.18);
-        }}
-        .st-key-quick_subview div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_controlActive"] p {{
-            color: var(--background-color, #ffffff) !important;   /* label text lives in a <p>; pin it too */
         }}
 
         /* Replace Streamlit's top-right "running" status graphic — which cycles
@@ -472,8 +443,7 @@ def main():
     # pending-model switch must write that key before the selectbox is
     # instantiated (Streamlit forbids setting a widget-keyed value once its
     # widget exists this run). The selectbox itself is rendered into the top
-    # control panel further down, and only for the single-model views
-    # (Executive Overview / By Region).
+    # control panel further down, and only for the Quick Projections scope.
     if not MODEL_OPTIONS:
         st.error(
             "No forecasting pipeline found — expected "
@@ -595,11 +565,9 @@ def main():
     anthropic_no_key = False
 
     with view_slot:
-        # The three top-level views as a button-bar segmented control. Keeps
+        # The four top-level views as a button-bar segmented control. Keeps
         # key="scope" and the same internal view IDs the rest of the app reads
-        # (the model-selection logic above resolves the pipeline off it). The two
-        # standard single-model views (Executive Overview + By Region) are nested
-        # under one "Quick Projections" pill and chosen via the sub-selector below.
+        # (the model-selection logic above resolves the pipeline off it).
         scope = st.segmented_control(
             "View",
             [QUICK_VIEW, BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW, WATCHLIST_VIEW],
@@ -614,50 +582,16 @@ def main():
         if scope is None:
             scope = st.session_state.get("scope") or QUICK_VIEW
 
-        # Quick Projections is a container tab, not a real view: a nested
-        # sub-selector resolves it back to one of the standard single-model view
-        # IDs (ALL_CUSTOMERS_VIEW / "By region"), so every downstream branch keyed
-        # on `scope` sees the same values as before and the compute path is
-        # unchanged (exactly one view renders per run). It's a second
-        # segmented_control, but CSS scoped to its widget key (.st-key-quick_subview,
-        # see the <style> block above) overrides the global tab-strip styling to
-        # render it as a compact, indented, rounded "iOS segmented track" — so it
-        # reads as a control nested under the tab, not a second row of main tabs.
-        if scope == QUICK_VIEW:
-            sub = st.segmented_control(
-                "Quick Projections view",
-                [ALL_CUSTOMERS_VIEW, "By region"],
-                default=ALL_CUSTOMERS_VIEW,
-                key="quick_subview",
-                format_func=lambda s: SCOPE_LABELS.get(s, s),
-                label_visibility="collapsed",
-            )
-            if sub is None:
-                sub = st.session_state.get("quick_subview") or ALL_CUSTOMERS_VIEW
-            scope = sub
-
-        # Contextual help: one line describing the active (sub-)view, in place of
-        # the old "About these views" expander that listed everything at once.
+        # Contextual help: one line describing the active view, in place of the
+        # old "About these views" expander that listed everything at once.
         st.caption(SCOPE_CAPTIONS.get(scope, ""))
 
-    # Resolve the view for the three scopes that don't need `df`. "By region"
-    # depends on list_views(df), so it's resolved once the Data source block has
-    # loaded the frame (see the region_slot fill below).
-    if scope == ALL_CUSTOMERS_VIEW:
-        view = ALL_CUSTOMERS_VIEW
-        region = None
-    elif scope == BEST_MODEL_COMBINED_VIEW:
-        view = BEST_MODEL_COMBINED_VIEW
-        region = None
-    elif scope == EXCEPTIONS_VIEW:
-        view = EXCEPTIONS_VIEW
-        region = None
-    elif scope == WATCHLIST_VIEW:
-        view = WATCHLIST_VIEW
-        region = None
-    else:
-        view = None  # filled from region_slot once df is available
-        region = None
+    # Optimized Projections / Exceptions / Watchlist are their own view IDs, so
+    # `scope` IS the view. Quick Projections is a container tab: its Region /
+    # Customer-group dropdowns need list_views(df), so it resolves to a real view
+    # ID only once the Data source block has loaded the frame — see the
+    # region_slot fill below, which is also where `view` gets set for it.
+    view = None if scope == QUICK_VIEW else scope
 
     # ----- Data source (very top of the page) ------------------------------
     # Promoted above the view tabs because the chosen snapshot/warehouse/Plytix
@@ -1166,27 +1100,49 @@ def main():
             prices=forecast_cache.content_signature(prices),
         )
 
-    # ----- View selector (By-Region sub-selectors) -------------------------
+    # ----- View selector (Quick Projections Region / Customer group) --------
     # The scope buttons rendered at the top of the page (into view_slot) already
-    # set `view` for the three scopes that don't need data. The "By region" scope
-    # needs list_views(df), so its Region / Customer-group dropdowns are filled
-    # here — into region_slot, which reserved its spot directly under the buttons.
-    if scope == "By region":
+    # set `view` for the three scopes that ARE view IDs. Quick Projections needs
+    # list_views(df), so its two dropdowns are filled here — into region_slot,
+    # which reserved its spot directly under the buttons.
+    #
+    # Between them they reach every scope a planner wants, with no nested toggle:
+    # everything (ALL_REGIONS + "All customers"), one region combined, or one
+    # customer group. Each resolves to one of the same three view-string shapes
+    # the app has always used, so nothing downstream of `view` changes.
+    if scope == QUICK_VIEW:
         with region_slot:
             by_region = list_views(df)
             c1, c2 = st.columns(2)
             # key=str: a custom pipeline's region_for_group may return non-string
             # labels; sorting by their string form keeps the selectbox from
-            # crashing on mixed types (see logs.txt, 2026-07-06).
-            region = c1.selectbox("Region", sorted(by_region.keys(), key=str))
-            # First entry is the synthetic per-region rollup ("All Customers"),
-            # every group in this region combined. Its stored value embeds the
-            # region so caches/keys stay unique across regions; format_func
-            # shows the short label the user expects.
-            all_view = region_all_view(region)
+            # crashing on mixed types (see logs.txt, 2026-07-06). The RAW key
+            # indexes by_region below — region_all_view()'s f-string does the str
+            # coercion _region_frame expects.
+            region = c1.selectbox(
+                "Region", [ALL_REGIONS] + sorted(by_region.keys(), key=str),
+                key="quick_region",
+            )
+            if region == ALL_REGIONS:
+                # Every group across every region, plus the all-customers combined
+                # fit. The flattened list is exactly the group list
+                # compute_by_customer iterates, so the table's groups match.
+                options = [ALL_CUSTOMERS_VIEW] + sorted(
+                    {g for groups in by_region.values() for g in groups}, key=str
+                )
+            else:
+                # First entry is the synthetic per-region rollup, every group in
+                # this region combined. Its stored value embeds the region so
+                # caches/keys stay unique across regions.
+                options = [region_all_view(region)] + by_region[region]
+            # Changing Region re-options this selectbox. A keyed selectbox keeps
+            # the options list out of its element identity, and Streamlit resets a
+            # no-longer-offered value to the first option (writing it back in the
+            # same run), so switching region lands on that region's rollup without
+            # an exception or an extra rerun. Pinned by test_phase5_dashboard.
             view = c2.selectbox(
-                "Customer group", [all_view] + by_region[region],
-                format_func=lambda v: f"All Customers - {region}" if v == all_view else v,
+                "Customer group", options, key="quick_group",
+                format_func=quick_group_label, help="Type to search",
             )
 
     # ----- Agent summary (LangGraph pipeline) ------------------------------
@@ -1201,9 +1157,9 @@ def main():
     # irrelevant there and would only confuse. Skip it entirely for that view.
     # ----- Forecasting model + Model analysis (left column of the panel) ----
     with col_model:
-        # Forecasting model: only the single-model views use a chosen model
-        # (Optimized Projections picks per group; Exceptions is model-agnostic).
-        if scope in (ALL_CUSTOMERS_VIEW, "By region"):
+        # Forecasting model: only Quick Projections uses a chosen model (Optimized
+        # Projections picks one per group; Exceptions is model-agnostic).
+        if scope == QUICK_VIEW:
             st.subheader("Forecasting model", help=_MODEL_HELP)
             # The model dropdown and the "Recommend best model" button sit side by
             # side — the button is short, so it takes a narrow column. The no-key
@@ -1232,14 +1188,14 @@ def main():
                     ),
                 )
             # Blurb describing the selected model (computed near the title). Only
-            # the single-model views reach here, which matches its old suppression
+            # Quick Projections reaches here, which matches its old suppression
             # (combined/best-model and Exceptions supply their own captions).
             st.caption(header_caption)
 
         # Model analysis: only Optimized Projections keeps its own section — the
-        # global all-views recommendation run. Executive Overview / By Region
-        # render their "Recommend best model" button inline beside the model
-        # dropdown above; Exceptions is model-agnostic (no analysis apparatus).
+        # global all-views recommendation run. Quick Projections renders its
+        # "Recommend best model" button inline beside the model dropdown above;
+        # Exceptions is model-agnostic (no analysis apparatus).
         if scope == BEST_MODEL_COMBINED_VIEW:
             st.subheader("Model analysis")
             # Optimized Projections is the only place the global all-views run
@@ -1498,7 +1454,7 @@ def main():
         # Move-to-end so a revisited view isn't the next eviction victim.
         stored = fc_cache.pop(cache_key)
         fc_cache[cache_key] = stored
-        summary, weekly, agg, by_cust = stored
+        summary, weekly, agg, by_cust, weekly_by_group, agg_by_group = stored
     else:
         prog = st.progress(0.0, text="Preparing…")
         try:
@@ -1508,29 +1464,45 @@ def main():
                 prices, alpha, beta, phi, min_weeks, data_sig,
             )
 
-            by_cust = None
+            # Every view now needs the per-(SKU, customer) breakdown — it is the
+            # page's main table — plus the un-summed per-group frames its Customer
+            # detail chart and per-row detail cards draw from.
+            by_cust = weekly_by_group = agg_by_group = None
             region_all = region_from_view(view)
             is_combined = view == ALL_CUSTOMERS_VIEW or region_all is not None
-            if is_combined and summary is not None and not summary.empty:
-                def _bump(done, total, group):
-                    frac = 0.4 + 0.55 * (done / max(total, 1))
-                    prog.progress(
-                        min(frac, 0.98),
-                        text=f"Per-customer forecast… ({done}/{total})",
+            if summary is not None and not summary.empty:
+                if is_combined:
+                    def _bump(done, total, group):
+                        frac = 0.4 + 0.55 * (done / max(total, 1))
+                        prog.progress(
+                            min(frac, 0.98),
+                            text=f"Per-customer forecast… ({done}/{total})",
+                        )
+                    # A region rollup breaks out only its own region's groups.
+                    src = df if region_all is None else _region_frame(df, P, region_all)
+                    by_cust, weekly_by_group, agg_by_group = (
+                        compute_by_customer_frames(
+                            src, today_ts, pipeline_path(),
+                            prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
+                            data_sig=data_sig,
+                        )
                     )
-                # A region rollup breaks out only its own region's groups.
-                src = df if region_all is None else _region_frame(df, P, region_all)
-                by_cust = compute_by_customer(
-                    src, today_ts, pipeline_path(),
-                    prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
-                    data_sig=data_sig,
-                )
+                else:
+                    # The view IS one customer group, so compute_view already fit
+                    # exactly what the per-group loop would (same slice, same
+                    # aggregate, same grouping_label). Reuse those frames instead of
+                    # paying a second fit under a different cache key.
+                    by_cust, weekly_by_group, agg_by_group = single_group_frames(
+                        summary, weekly, agg, view, today_ts,
+                    )
             prog.progress(1.0, text="Done")
         finally:
             prog.empty()
 
         _bounded_put(
-            fc_cache, cache_key, (summary, weekly, agg, by_cust), FC_CACHE_MAX
+            fc_cache, cache_key,
+            (summary, weekly, agg, by_cust, weekly_by_group, agg_by_group),
+            FC_CACHE_MAX,
         )
 
     if summary is None or summary.empty:
@@ -1541,7 +1513,7 @@ def main():
         st.stop()
 
     # ----- Header / windows -------------------------------------------------
-    st.subheader(view)
+    st.subheader(quick_group_label(view))
     w1, w2 = st.columns(2)
     # The window's nominal lower bound (lb) can sit earlier than the first week
     # the data actually reaches — e.g. the all-history pipelines anchor lb a few
@@ -1574,148 +1546,182 @@ def main():
     )
 
     # ----- KPIs -------------------------------------------------------------
-    _render_kpis(summary, agg, (lb, lcw, ffw))
+    # Window label for the historical-demand KPI's help text: taken from
+    # compute_view's summary, which carries exactly the selected model's own
+    # average column, so it always describes the (lb, lcw) span the metric uses.
+    # by_cust carries BOTH averages, so its stacked KPIs must be told explicitly.
+    anchors_avg_col = resolve_avg_col(summary)
+    _render_kpis(summary, agg, (lb, lcw, ffw), avg_col=anchors_avg_col)
 
     # ----- Aggregate chart --------------------------------------------------
-    # Per-chart date-range picker (own key => independent from the SKU chart).
+    # Per-chart date-range picker (own key => independent from the other charts).
     agg_ctrl, _ = st.columns([1, 2])
     with agg_ctrl:
         agg_range = chart_range_control(agg, weekly, lcw, key="range_agg")
     st.plotly_chart(
-        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), view,
+        aggregate_chart(agg, summary, weekly, (lb, lcw, ffw), quick_group_label(view),
                         date_range=agg_range, prices=prices),
         width="stretch",
     )
 
-    # ----- Per-SKU detail ---------------------------------------------------
-    st.markdown("### SKU detail")
-    skus = summary["SKU"].astype(str).tolist()
-    sku = st.selectbox("SKU", skus, help="Type to search")
-    row = summary.loc[summary["SKU"].astype(str) == sku].iloc[0]
-    desc = row["Description"] if isinstance(row["Description"], str) else ""
-    source = row["Data Source"] if "Data Source" in summary.columns else "POS"
-
-    cL, cR = st.columns([3, 1])
-    with cL:
-        # Per-chart date-range picker (own key => independent from the aggregate chart).
-        sku_range = chart_range_control(agg, weekly, lcw, key="range_sku")
-        st.plotly_chart(
-            sku_chart(sku, desc, source, agg, weekly, (lb, lcw, ffw),
-                      date_range=sku_range, prices=prices),
-            width="stretch",
-        )
-    with cR:
-        st.metric("Data Source", source)
-        avg_col = resolve_avg_col(summary)
-        phrase = avg_window_phrase(avg_col)
-        window_label = "All-Time" if phrase == "All-History" \
-            else phrase.replace(" Week", "-Week")
-        st.metric(
-            f"{window_label} Historical Demand (avg/wk)",
-            f"{row[avg_col]:,.1f}",
-        )
-        sysv = row.get("Current Projection Average")
-        st.metric(
-            "Current Forecast (avg/wk)",
-            "—" if pd.isna(sysv) else f"{sysv:,.0f}",
-        )
-        st.metric(
-            "Updated Forecast (avg/wk)",
-            f"{row['Updated Projection Average']:,.0f}",
-        )
-        st.metric(
-            "Projection Difference (avg/wk)",
-            f"{row['Projection Difference']:+,.0f}"
-            if pd.notna(row["Projection Difference"]) else "—",
-        )
-        if RISK_COL in summary.columns:
-            pv = row.get(PRICE_COL)
-            rv = row.get(RISK_COL)
-            st.metric("List Price", fmt_dollar(pv, decimals=2))
-            st.metric(
-                "Revenue Risk (avg/wk)",
-                fmt_dollar(rv, signed=True),
-                help="Projection difference × list price.",
-            )
-            prv = pv * row["Updated Projection Average"] if pd.notna(pv) else None
-            st.metric(
-                "Projected Revenue (avg/wk)",
-                fmt_dollar(prv),
-                help="List price × updated weekly-avg forecast — the gross value "
-                     "at list price of this SKU's forecasted weekly demand.",
-            )
-        if "Top Volume Customer Groups" in summary.columns:
-            st.markdown("**Top Volume Groups**")
-            st.caption(row["Top Volume Customer Groups"])
-
-    # ----- Summary table ----------------------------------------------------
-    st.markdown("### Summary table by SKU")
-    summary_table = summary
-    if RISK_COL in summary.columns and summary[RISK_COL].notna().any():
-        # Largest revenue risk first, by magnitude (a big drop is as much a
-        # "risk" as a big gain); SKUs with no price (blank risk) sort to the end.
-        summary_table = (
-            summary.assign(_abs_risk=summary[RISK_COL].abs())
-            .sort_values("_abs_risk", ascending=False, na_position="last")
-            .drop(columns="_abs_risk")
-            .reset_index(drop=True)
-        )
-        st.caption("Ordered by largest revenue risk (by magnitude); blanks last.")
-    render_filtered_table(summary_table, "filter_by_sku", P)
-    st.download_button(
-        "⬇️ Download the summary table by SKU",
-        data=view_to_excel(summary_table, weekly),
-        file_name=f"{view.replace('/', '-').replace(' ', '_')}"
-                  f"_demand_projections_{today_str}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_by_sku",
+    has_by_cust = by_cust is not None and not by_cust.empty
+    groups = (
+        sorted(by_cust["Customer Grouping"].astype(str).unique())
+        if has_by_cust else []
+    )
+    # Chart-only anchors for the per-group charts below, mirroring Optimized
+    # Projections: `lb` is as short as 8 weeks with the 8-Week Moving Average
+    # model, which would trap their date-range pickers inside that window. The
+    # KPIs keep the model's own anchors so no number shifts — only how much
+    # history the charts are ALLOWED to show changes.
+    chart_anchors = (
+        (pd.to_datetime(agg_by_group["WeekDate"]).min(), lcw, ffw)
+        if has_by_cust else (lb, lcw, ffw)
     )
 
-    # ----- Summary table by SKU and Customer (ALL CUSTOMERS view only) ------
-    # Mirrors the pipeline's ALL_CUSTOMERS_demand_projections file: every SKU
-    # broken out by customer group. Computed alongside the main forecast in the
-    # recompute block above (and cached in session_state) so it stays on the
-    # same snapshot / prices / parameters as the SKU table.
-    if view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None:
-        st.markdown("### Summary table by SKU and Customer")
-        if by_cust is None or by_cust.empty:
-            st.info("No per-customer forecasts to show for this snapshot.")
+    # ----- Per-customer detail ----------------------------------------------
+    # One customer group's total weekly demand, drawn from that group's un-summed
+    # frames. Skipped when the view resolves to a single group: the KPI row and the
+    # total-demand chart above already ARE that group.
+    if len(groups) > 1:
+        st.markdown("### Customer detail")
+        customer = st.selectbox(
+            "Customer", groups, help="Type to search", key="quick_customer"
+        )
+        agg_c = agg_by_group[
+            agg_by_group["Customer Grouping"].astype(str) == customer
+        ]
+        wk_c = weekly_by_group[
+            weekly_by_group["Customer Grouping"].astype(str) == customer
+        ]
+        summary_c = by_cust[by_cust["Customer Grouping"].astype(str) == customer]
+        ccL, ccR = st.columns([3, 1])
+        with ccL:
+            cust_range = chart_range_control(agg_c, wk_c, lcw, key="range_cust_quick")
+            st.plotly_chart(
+                aggregate_chart(
+                    agg_c, summary_c, wk_c,
+                    (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw),
+                    customer, date_range=cust_range, prices=prices,
+                ),
+                width="stretch",
+            )
+        with ccR:
+            # Same seven metrics as the top of the view, scoped to this group and
+            # stacked to fit the side column. Uses the section's original anchors
+            # (not the widened chart range) so the historical-demand window lines
+            # up with the KPI row above.
+            _render_kpis(summary_c, agg_c, (lb, lcw, ffw), stacked=True,
+                         avg_col=anchors_avg_col)
+
+    # ----- Summary table by SKU and customer --------------------------------
+    # The page's main table: every SKU broken out by customer group, mirroring the
+    # pipeline's ALL_CUSTOMERS_demand_projections file. Computed alongside the main
+    # forecast above (and cached in session_state) so it stays on the same
+    # snapshot / prices / parameters as the KPIs and charts.
+    st.markdown("### Summary table by SKU and customer")
+    if not has_by_cust:
+        st.info("No per-customer forecasts to show for this snapshot.")
+    else:
+        if RISK_COL in by_cust.columns and by_cust[RISK_COL].notna().any():
+            # Keep each SKU's customers together; within a SKU show the largest
+            # revenue risk (by magnitude) first, blanks last.
+            by_cust_table = (
+                by_cust.assign(_abs_risk=by_cust[RISK_COL].abs())
+                .sort_values(
+                    ["SKU", "_abs_risk"],
+                    ascending=[True, False],
+                    na_position="last",
+                )
+                .drop(columns="_abs_risk")
+                .reset_index(drop=True)
+            )
+            st.caption(
+                "Each SKU broken out by customer group; within a SKU, largest "
+                "revenue risk first (by magnitude). Click a row to open its chart "
+                "and metrics."
+            )
         else:
-            if RISK_COL in by_cust.columns and by_cust[RISK_COL].notna().any():
-                # Keep each SKU's customers together; within a SKU show the
-                # largest revenue risk (by magnitude) first, blanks last.
-                by_cust_table = (
-                    by_cust.assign(_abs_risk=by_cust[RISK_COL].abs())
-                    .sort_values(
-                        ["SKU", "_abs_risk"],
-                        ascending=[True, False],
-                        na_position="last",
-                    )
+            by_cust_table = (
+                by_cust.sort_values(["SKU", "Customer Grouping"])
+                .reset_index(drop=True)
+            )
+            st.caption("Each SKU broken out by customer group. Click a row to open "
+                       "its chart and metrics.")
+
+        # Top-volume breakdown exists only on compute_view's summary, and only for
+        # the combined / region-rollup fits (the per-group fits pass no
+        # breakdown_df). It is a whole-view figure keyed by SKU; the card labels it
+        # as such.
+        top_groups = (
+            dict(zip(summary["SKU"].astype(str),
+                     summary["Top Volume Customer Groups"]))
+            if "Top Volume Customer Groups" in summary.columns else None
+        )
+        # Condensed rows (five scannable columns); clicking one reveals that exact
+        # (SKU, customer group) combination's chart, date range and metrics — what
+        # the standalone "SKU detail" section used to hold. The filter chips and the
+        # Excel download still run on the full frame.
+        sku_card = functools.partial(
+            render_sku_detail_card, agg_by_group, weekly_by_group,
+            (lb, lcw, ffw), chart_anchors, prices,
+            model_label=model_display(st.session_state.get("model_choice")),
+            top_groups=top_groups, avg_col=anchors_avg_col,
+        )
+        render_selectable_table(
+            by_cust_table, "filter_by_customer", P,
+            condensed_cols=QUICK_CONDENSED_COLS, style=True,
+            detail_chart=sku_card, detail_cols=QUICK_CARD_COLS,
+        )
+        st.download_button(
+            "⬇️ Download the summary table by SKU and Customer",
+            data=view_to_excel(by_cust_table, weekly),
+            file_name=(
+                f"{view.replace('/', '-').replace(' ', '_')}"
+                f"_demand_projections_{today_str}.xlsx"
+                if view != ALL_CUSTOMERS_VIEW
+                else f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx"
+            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_by_customer",
+        )
+
+    # ----- Summary table by SKU (view total), collapsed ---------------------
+    # One row per SKU for the whole view. Kept because it is a genuinely different
+    # number from the table above — the combined/region fit, not the sum of the
+    # per-group fits — and because it is the only place the top-volume breakdown
+    # appears as a column. Collapsed so it doesn't compete with the main table.
+    # Skipped for a single customer group, where it would just duplicate it.
+    if view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None:
+        with st.expander("Summary table by SKU (view total)"):
+            st.caption(
+                "One row per SKU for the whole view, forecast as a single combined "
+                "series — not the sum of the per-group forecasts above, so the two "
+                "tables will not tie out exactly. Its demand average is the one the "
+                "selected model reports; the table above shows both a recent 8-week "
+                "run-rate and an all-history average for every row."
+            )
+            summary_table = summary
+            if RISK_COL in summary.columns and summary[RISK_COL].notna().any():
+                # Largest revenue risk first, by magnitude (a big drop is as much a
+                # "risk" as a big gain); SKUs with no price (blank risk) sort last.
+                summary_table = (
+                    summary.assign(_abs_risk=summary[RISK_COL].abs())
+                    .sort_values("_abs_risk", ascending=False, na_position="last")
                     .drop(columns="_abs_risk")
                     .reset_index(drop=True)
                 )
                 st.caption(
-                    "Each SKU broken out by customer group; within a SKU, "
-                    "largest revenue risk first (by magnitude)."
+                    "Ordered by largest revenue risk (by magnitude); blanks last."
                 )
-            else:
-                by_cust_table = (
-                    by_cust.sort_values(["SKU", "Customer Grouping"])
-                    .reset_index(drop=True)
-                )
-                st.caption("Each SKU broken out by customer group.")
-            render_filtered_table(by_cust_table, "filter_by_customer", P)
+            render_filtered_table(summary_table, "filter_by_sku", P)
             st.download_button(
-                "⬇️ Download the summary table by SKU and Customer",
-                data=summary_to_excel(by_cust_table),
-                file_name=(
-                    f"{view.replace('/', '-').replace(' ', '_')}"
-                    f"_demand_projections_{today_str}.xlsx"
-                    if view != ALL_CUSTOMERS_VIEW
-                    else f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx"
-                ),
+                "⬇️ Download the summary table by SKU",
+                data=view_to_excel(summary_table, weekly),
+                file_name=f"{view.replace('/', '-').replace(' ', '_')}"
+                          f"_by_sku_demand_projections_{today_str}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_by_customer",
+                key="dl_by_sku",
             )
 
     # The four data-quality sections (inactive-region / missing forecasts /

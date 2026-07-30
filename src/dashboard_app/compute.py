@@ -292,6 +292,62 @@ def _forecast_one_group(df_group, today_ts, model_path, group_label,
     return summary, weekly, agg
 
 
+def _narrow_group_frames(weekly, agg, group):
+    """The chart-ready ``(weekly, agg)`` pair for one group, tagged with it.
+
+    Models carry extra per-model columns (exponential_smoothing adds
+    ``promo_uplift``) which differ across models and would break the concat
+    downstream, so both frames are narrowed to the columns the charts actually
+    read. ``WeekDate`` is coerced because the models emit ``datetime.date``
+    objects, not Timestamps. ``.assign(**{...})`` rather than a keyword because
+    "Customer Grouping" is not an identifier.
+    """
+    wk = weekly[["SKU", "WeekDate", "projected_pos"]].copy()
+    wk["WeekDate"] = pd.to_datetime(wk["WeekDate"])
+    ag = agg[["SKU", "WeekDate", "POS", "Orders", "Projection"]].copy()
+    ag["WeekDate"] = pd.to_datetime(ag["WeekDate"])
+    return (wk.assign(**{"Customer Grouping": group}),
+            ag.assign(**{"Customer Grouping": group}))
+
+
+def _by_customer_frames(df, groups, forecast_group, progress_cb=None):
+    """Stitch a per-group forecast loop into ``(combined, weekly_by_group,
+    agg_by_group)``.
+
+    The shared engine behind ``compute_by_customer``, ``compute_by_customer_frames``
+    and ``compute_by_customer_best`` — they differ only in WHICH model fits each
+    group, which is what ``forecast_group(group, sub)`` decides (it returns that
+    group's ``(summary, weekly, agg)``, and may stamp extra columns on the
+    summary). Groups that produce no rows are skipped silently.
+
+    The two returned per-group frames keep their ``Customer Grouping`` column and
+    are deliberately NOT summed: callers that want one total per (SKU, WeekDate)
+    sum them themselves, and callers that draw one group at a time (the Customer
+    detail charts, the per-row detail cards) need them un-summed. Returns
+    ``(None, None, None)`` when nothing was forecast.
+    """
+    frames = []
+    weekly_by_group_frames = []
+    agg_by_group_frames = []
+    n_groups = len(groups)
+    for i, group in enumerate(groups):
+        sub = df[df["Customer Grouping"] == group]
+        summary, weekly, agg = forecast_group(group, sub)
+        if summary is not None and not summary.empty:
+            frames.append(summary)
+            wk, ag = _narrow_group_frames(weekly, agg, group)
+            weekly_by_group_frames.append(wk)
+            agg_by_group_frames.append(ag)
+        if progress_cb is not None:
+            progress_cb(i + 1, n_groups, group)
+
+    if not frames:
+        return None, None, None
+    return (pd.concat(frames, ignore_index=True),
+            pd.concat(weekly_by_group_frames, ignore_index=True),
+            pd.concat(agg_by_group_frames, ignore_index=True))
+
+
 def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
                         beta=None, phi=None, min_weeks=None, progress_cb=None,
                         data_sig=None):
@@ -311,25 +367,19 @@ def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
     at all — the result is held in session_state (see main()).
 
     Returns a DataFrame in the pipeline's SUMMARY_COLUMNS order, or None if no
-    group had anything to forecast.
+    group had anything to forecast. Deliberately the RAW stitched summary: the
+    descriptive averages the dashboard wants are attached by
+    ``compute_by_customer_frames``, so this stays the plain concatenation the
+    golden master pins.
     """
-    frames = []
-    groups = sorted(df["Customer Grouping"].dropna().unique().tolist())
-    n_groups = len(groups)
-    for i, group in enumerate(groups):
-        sub = df[df["Customer Grouping"] == group]
-        summary, _, _ = _forecast_one_group(
+    return _by_customer_frames(
+        df, sorted(df["Customer Grouping"].dropna().unique().tolist()),
+        lambda group, sub: _forecast_one_group(
             sub, today_ts, model_path, group,
             prices, alpha, beta, phi, min_weeks, data_sig,
-        )
-        if summary is not None and not summary.empty:
-            frames.append(summary)
-        if progress_cb is not None:
-            progress_cb(i + 1, n_groups, group)
-
-    if not frames:
-        return None
-    return pd.concat(frames, ignore_index=True)
+        ),
+        progress_cb,
+    )[0]
 
 
 def _agent_summaries_mtime():
@@ -409,11 +459,11 @@ EIGHT_WK_AVG_COL = "8-Week POS/Orders Average"
 def _descriptive_averages(agg_by_group, today_ts):
     """Per-(Customer Grouping, SKU) all-history and 8-week demand averages.
 
-    Cached: this is a ~11,000-iteration Python groupby loop (~7s on the live
-    snapshot) and three separate callers ask for it with the same inputs on one
-    pass through the Exceptions view — ``compute_exceptions``, ``compute_spikes``
-    and ``compute_by_customer_best`` all pass the same ``sku_week_by_group``
-    frame and the same ``today_ts``, so only the first pays.
+    Cached because several callers ask for it with the same inputs on one pass
+    through a view — ``compute_exceptions`` and ``compute_spikes`` pass the same
+    ``sku_week_by_group`` frame and the same ``today_ts``, so only the first
+    pays. (The per-group aggregate the forecast paths pass is a differently
+    shaped frame, so those are separate entries; at ~0.25s each that is fine.)
 
     Computed straight from the stitched per-group SKU-week aggregates so BOTH
     averages exist for every group regardless of which model won its backtest.
@@ -447,8 +497,9 @@ def _descriptive_averages(agg_by_group, today_ts):
         """Vectorised equivalent of the original per-(group, SKU) Python loop.
 
         The loop it replaces sliced the window frame once per (group, SKU) pair —
-        ~11,000 slices, ~7s on the live snapshot — and this runs on the critical
-        path of the Exceptions scan, the spikes scan and Optimized Projections.
+        ~11,000 slices, ~10s on the live snapshot — and this runs on the critical
+        path of the Exceptions scan, the spikes scan and both combined-forecast
+        views. Vectorised it is ~0.25s.
 
         Same three decisions, now as whole-column operations:
           * source = POS when the pair has ANY non-null POS in the window, else
@@ -523,6 +574,106 @@ def _descriptive_averages(agg_by_group, today_ts):
     return all_hist.merge(eight_wk, on=["Customer Grouping", "SKU"], how="outer")
 
 
+def attach_descriptive_averages(summary, agg_by_group, today_ts):
+    """Give every row of ``summary`` BOTH descriptive averages.
+
+    Each model reports only one: the 8-Week Moving Average model reports an
+    "8 Week POS/Orders Average" (a recent run-rate), the other four report
+    all-history. Both are computed centrally from the stitched per-group
+    aggregates so the two columns are always populated and comparable — which is
+    what lets a table show a recent run-rate next to a long-run average
+    regardless of which model produced the row.
+
+    Merges on ``["SKU", "Customer Grouping"]``, so ``summary["SKU"]`` must already
+    be string-typed (``_descriptive_averages`` casts its own side). Discontinued
+    ``*`` SKUs are dropped by ``_descriptive_averages``, so they come back with a
+    blank All-History and a 0.0 8-Week — harmless, since the models drop them too.
+
+    Stops deliberately after slotting the two columns in: callers that reorder
+    other columns (``compute_by_customer_best`` moves ``Model Used``) depend on
+    this ordering being final.
+    """
+    avgs = _descriptive_averages(agg_by_group, today_ts)
+    summary = summary.drop(columns=["8 Week POS/Orders Average"], errors="ignore")
+    summary = summary.merge(
+        avgs.rename(columns={
+            ALL_HIST_AVG_COL: "_central_all_hist",
+            EIGHT_WK_AVG_COL: "_central_8wk",
+        }),
+        on=["SKU", "Customer Grouping"], how="left",
+    )
+    # All-History: keep each model's own reported value; fill only the gaps (the
+    # 8-week-model rows, which never compute an all-history average) so existing
+    # non-8-week numbers are unchanged.
+    if ALL_HIST_AVG_COL in summary.columns:
+        summary[ALL_HIST_AVG_COL] = summary[ALL_HIST_AVG_COL].fillna(
+            summary["_central_all_hist"]
+        )
+    else:
+        summary[ALL_HIST_AVG_COL] = summary["_central_all_hist"]
+    # 8-Week: the central value everywhere (it equals the 8-Week Moving Average
+    # model's own figure on the rows it produced, so nothing shifts there). A SKU
+    # with history but no POS/Orders in the last 8 weeks has no run-rate to
+    # compute; its recent average is a genuine 0 (absent week = zero, matching the
+    # models' gap-fill), so fill rather than leave a blank.
+    summary[EIGHT_WK_AVG_COL] = summary["_central_8wk"].fillna(0.0)
+    summary = summary.drop(columns=["_central_all_hist", "_central_8wk"])
+
+    # Slot both averages right after "Weeks with data" (All-History then 8-Week),
+    # immediately ahead of "Updated Projection Average", for a stable layout.
+    if "Weeks with data" in summary.columns:
+        cols = [c for c in summary.columns
+                if c not in (ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL)]
+        pos = cols.index("Weeks with data") + 1
+        cols[pos:pos] = [ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL]
+        summary = summary[cols]
+    return summary
+
+
+def compute_by_customer_frames(df, today_ts, model_path, prices=None, alpha=None,
+                               beta=None, phi=None, min_weeks=None,
+                               progress_cb=None, data_sig=None):
+    """``compute_by_customer`` plus everything the Quick Projections view needs.
+
+    Returns ``(combined, weekly_by_group, agg_by_group)``: the same per-(SKU,
+    Customer Grouping) summary, with BOTH descriptive averages attached, alongside
+    the un-summed per-group weekly-forecast and SKU-week frames that the Customer
+    detail chart and the summary table's per-row detail cards draw from.
+
+    Not cached, for the same reason ``compute_by_customer`` isn't: it drives a
+    ``progress_cb``, and Streamlit element calls can't happen inside a cached
+    function. The expensive part — each group's fit — is cached in
+    ``_forecast_one_group`` (in process and on disk), so a repeat call pays only
+    the stitching.
+    """
+    combined, weekly_by_group, agg_by_group = _by_customer_frames(
+        df, sorted(df["Customer Grouping"].dropna().unique().tolist()),
+        lambda group, sub: _forecast_one_group(
+            sub, today_ts, model_path, group,
+            prices, alpha, beta, phi, min_weeks, data_sig,
+        ),
+        progress_cb,
+    )
+    if combined is None:
+        return None, None, None
+    return (attach_descriptive_averages(combined, agg_by_group, today_ts),
+            weekly_by_group, agg_by_group)
+
+
+def single_group_frames(summary, weekly, agg, group, today_ts):
+    """``compute_by_customer_frames``' 3-tuple for a view that IS one group.
+
+    ``compute_view``'s single-group branch has already made exactly the calls the
+    per-group loop would make — same slice, same ``aggregate_to_sku_week``, same
+    ``fit_regression`` with the same ``grouping_label`` — so re-entering the loop
+    would fit the group a second time purely because ``compute_view`` and
+    ``_forecast_one_group`` are different cache entries (and different disk-cache
+    kinds, "view" vs "group"). Reuse the frames instead.
+    """
+    wk, ag = _narrow_group_frames(weekly, agg, group)
+    return attach_descriptive_averages(summary, ag, today_ts), wk, ag
+
+
 def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
                              progress_cb=None, data_sig=None):
     """Per-(SKU, Customer Grouping) summary using each group's BEST model.
@@ -567,18 +718,9 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         return None, None, None, None, None, excluded
 
     # Second pass: forecast each resolved group with its own model (autofit when
-    # supported). Alongside each group's summary we keep its weekly forecast and
-    # SKU-week aggregate so the charts have series to plot.
-    frames = []
-    weekly_frames = []
-    agg_frames = []
-    # Same per-group frames, tagged with the group and NOT summed away — feed the
-    # per-customer "Customer detail" chart.
-    weekly_by_group_frames = []
-    agg_by_group_frames = []
-    n = len(resolved)
-    for i, (group, (label, path)) in enumerate(resolved.items()):
-        sub = df[df["Customer Grouping"] == group]
+    # supported), stamping the winning model's name on each row.
+    def _forecast_best(group, sub):
+        label, path = resolved[group]
         alpha = beta = phi = None
         P = load_pipeline(path)
         if _supports_autofit(P):
@@ -586,10 +728,10 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
             # branch filters by `Customer Grouping == view`, and re-filtering an
             # already-filtered slice by the same predicate is a no-op — so the
             # aggregate it fits is byte-identical while the full-frame filter and
-            # aggregate stop being repeated here (they were already done above,
-            # and again inside _forecast_one_group). It also narrows the cache key
-            # from "the whole snapshot" to "this group's rows", which is what the
-            # result actually depends on.
+            # aggregate stop being repeated here (they were already done by the
+            # loop, and again inside _forecast_one_group). It also narrows the
+            # cache key from "the whole snapshot" to "this group's rows", which is
+            # what the result actually depends on.
             fitted = run_autofit(sub, group, today_ts, path, min_weeks, data_sig)
             if fitted:
                 alpha, beta, phi = fitted.get("alpha"), fitted.get("beta"), fitted.get("phi")
@@ -598,69 +740,21 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
             data_sig,
         )
         if summary is not None and not summary.empty:
+            # Copy before stamping: _forecast_one_group's result is cached and
+            # shared, so mutating it in place would leak MODEL_USED_COL into every
+            # other caller's copy.
             summary = summary.copy()
             summary[MODEL_USED_COL] = model_display(label)
-            frames.append(summary)
-            # Keep only the columns the charts need; models carry extra columns
-            # (e.g. promo_uplift) that differ across models and would break concat.
-            wk = weekly[["SKU", "WeekDate", "projected_pos"]].copy()
-            wk["WeekDate"] = pd.to_datetime(wk["WeekDate"])
-            weekly_frames.append(wk)
-            ag = agg[["SKU", "WeekDate", "POS", "Orders", "Projection"]].copy()
-            ag["WeekDate"] = pd.to_datetime(ag["WeekDate"])
-            agg_frames.append(ag)
-            # Tagged copies for the per-customer chart (kept separate so the
-            # summed weekly_all/agg_all above are unaffected).
-            weekly_by_group_frames.append(wk.assign(**{"Customer Grouping": group}))
-            agg_by_group_frames.append(ag.assign(**{"Customer Grouping": group}))
-        if progress_cb is not None:
-            progress_cb(i + 1, n, group)
+        return summary, weekly, agg
 
-    if not frames:
+    combined, weekly_by_group, agg_by_group = _by_customer_frames(
+        df, list(resolved), _forecast_best, progress_cb
+    )
+    if combined is None:
         return None, None, None, None, None, excluded
-    combined = pd.concat(frames, ignore_index=True)
 
     # Give every group BOTH descriptive averages regardless of its winning model.
-    # Each model reports only one: the 8-Week Moving Average model reports an
-    # "8 Week POS/Orders Average" (a recent run-rate), the others report
-    # all-history. Compute both centrally from the stitched per-group aggregates
-    # so the two columns are always populated and comparable.
-    avgs = _descriptive_averages(
-        pd.concat(agg_by_group_frames, ignore_index=True), today_ts
-    )
-    combined = combined.drop(columns=["8 Week POS/Orders Average"], errors="ignore")
-    combined = combined.merge(
-        avgs.rename(columns={
-            ALL_HIST_AVG_COL: "_central_all_hist",
-            EIGHT_WK_AVG_COL: "_central_8wk",
-        }),
-        on=["SKU", "Customer Grouping"], how="left",
-    )
-    # All-History: keep each model's own reported value; fill only the gaps (the
-    # 8-week-model groups, which never compute an all-history average) so existing
-    # non-8-week numbers are unchanged.
-    if ALL_HIST_AVG_COL in combined.columns:
-        combined[ALL_HIST_AVG_COL] = combined[ALL_HIST_AVG_COL].fillna(
-            combined["_central_all_hist"]
-        )
-    else:
-        combined[ALL_HIST_AVG_COL] = combined["_central_all_hist"]
-    # 8-Week: the central value for every group (it equals the 8-Week Moving
-    # Average model's own figure on the groups it won, so nothing shifts there).
-    # A SKU with history but no POS/Orders in the last 8 weeks has no run-rate to
-    # compute; its recent average is a genuine 0 (absent week = zero, matching the
-    # models' gap-fill), so fill rather than leave a blank.
-    combined[EIGHT_WK_AVG_COL] = combined["_central_8wk"].fillna(0.0)
-    combined = combined.drop(columns=["_central_all_hist", "_central_8wk"])
-
-    # Slot both averages right after "Weeks with data" (All-History then 8-Week),
-    # immediately ahead of "Updated Projection Average", for a stable layout.
-    if "Weeks with data" in combined.columns:
-        cols = [c for c in combined.columns
-                if c not in (ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL)]
-        pos = cols.index("Weeks with data") + 1
-        cols[pos:pos] = [ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL]
-        combined = combined[cols]
+    combined = attach_descriptive_averages(combined, agg_by_group, today_ts)
 
     # Surface the model used right after the customer group for readability.
     if "Customer Grouping" in combined.columns:
@@ -670,18 +764,18 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         combined = combined[cols]
 
     # Stitch the per-group series into one total per (SKU, WeekDate). min_count=1
-    # keeps a genuinely-absent cell NaN rather than coercing it to 0.
+    # keeps a genuinely-absent cell NaN rather than coercing it to 0. Naming the
+    # value columns explicitly is what drops the "Customer Grouping" the per-group
+    # frames carry, so these two come out at (SKU, WeekDate) grain.
     weekly_all = (
-        pd.concat(weekly_frames, ignore_index=True)
+        weekly_by_group
         .groupby(["SKU", "WeekDate"], as_index=False)["projected_pos"].sum()
     )
     agg_all = (
-        pd.concat(agg_frames, ignore_index=True)
+        agg_by_group
         .groupby(["SKU", "WeekDate"], as_index=False)[["POS", "Orders", "Projection"]]
         .sum(min_count=1)
     )
-    weekly_by_group = pd.concat(weekly_by_group_frames, ignore_index=True)
-    agg_by_group = pd.concat(agg_by_group_frames, ignore_index=True)
     return combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded
 
 

@@ -197,6 +197,190 @@ def test_exceptions_view_renders():
     assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min revenue risk / wk"}
 
 
+def _headings(at):
+    """The view body's "### ..." section headings, as one searchable string."""
+    return " ".join(m.value for m in at.markdown if m.value.startswith("###"))
+
+
+@needs_data
+def test_quick_default_view_is_all_customers_in_the_new_order():
+    """The default Quick Projections landing view, and its section order.
+
+    Region defaults to the ALL_REGIONS sentinel and Customer group to the raw
+    ALL_CUSTOMERS_VIEW string (raw, not the prettified label — several callers,
+    including the agent-run button, read the selected value as a view ID). The
+    body then reads KPIs -> total demand -> Customer detail -> the by-SKU-and-
+    customer table, with the view-level per-SKU table in a collapsed expander.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    assert at.session_state["quick_region"] == dashboard.ALL_REGIONS
+    assert at.selectbox(key="quick_group").value == dashboard.ALL_CUSTOMERS_VIEW
+
+    headings = _headings(at)
+    assert "### Customer detail" in headings
+    assert "### Summary table by SKU and customer" in headings
+    # Customer detail comes before the table.
+    assert headings.index("### Customer detail") < \
+        headings.index("### Summary table by SKU and customer")
+    # The old dropdown-driven SKU-detail section is gone (it lives in the table's
+    # row detail cards now).
+    assert "### SKU detail" not in headings
+    assert any("Summary table by SKU (view total)" in (e.label or "")
+               for e in at.expander)
+
+
+@needs_data
+def test_quick_region_change_resets_the_customer_group():
+    """Switching Region must re-option the Customer-group selectbox cleanly.
+
+    Both are keyed, which keeps the options list out of the widget's element
+    identity — so the stored group survives the switch and Streamlit is the one
+    that has to notice it is no longer offered and fall back to the first option
+    (that region's rollup), writing the corrected value back in the same run. If a
+    Streamlit upgrade changes that behaviour, this fails loudly rather than the
+    page throwing "value not in options" for a planner.
+
+    Only the two selectboxes matter here — they render into region_slot before the
+    body runs, so a region whose rollup has no recent demand (and therefore stops
+    the body with a "nothing to forecast" error) is still a valid probe.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    regions = [r for r in at.selectbox(key="quick_region").options
+               if r != dashboard.ALL_REGIONS]
+    # A region with at least one individual group, so there is something to hold
+    # across the switch.
+    for region in regions:
+        at.selectbox(key="quick_region").set_value(region).run()
+        assert not at.exception
+        # .options are FORMATTED labels; .value is the raw view string.
+        assert at.selectbox(key="quick_group").options[0] == \
+            dashboard.quick_group_label(dashboard.region_all_view(region))
+        if len(at.selectbox(key="quick_group").options) > 1:
+            break
+    else:
+        pytest.skip("no region has an individual customer group")
+
+    # Hold a specific group (index >= 1, where the label IS the raw group name).
+    at.selectbox(key="quick_group").select_index(1).run()
+    assert not at.exception
+    held = at.selectbox(key="quick_group").value
+    assert dashboard.region_from_view(held) is None, "expected a bare group"
+
+    # Switch to a DIFFERENT region: the held group is no longer offered, so
+    # Streamlit must fall back to the new region's rollup.
+    other = next(r for r in regions if r != region)
+    at.selectbox(key="quick_region").set_value(other).run()
+    assert not at.exception
+    assert at.selectbox(key="quick_group").value == dashboard.region_all_view(other)
+
+
+@needs_data
+def test_quick_single_group_renders_the_by_customer_table():
+    """A single customer group still gets the main by-SKU-and-customer table.
+
+    It used to be gated to the combined / region-rollup views, so this branch had
+    no coverage at all. It now runs through single_group_frames (the fast path that
+    reuses compute_view's frames). Customer detail and the view-total expander are
+    deliberately absent: with one group both would just restate the totals above.
+
+    Groups are probed rather than assumed — a group with no demand in the model's
+    window legitimately stops the body with a "nothing to forecast" error, and
+    which groups those are depends on the snapshot.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    for region in [r for r in at.selectbox(key="quick_region").options
+                   if r != dashboard.ALL_REGIONS]:
+        at.selectbox(key="quick_region").set_value(region).run()
+        assert not at.exception
+        for i in range(1, len(at.selectbox(key="quick_group").options)):
+            at.selectbox(key="quick_group").select_index(i).run()
+            assert not at.exception
+            if not at.error:
+                break
+        else:
+            continue
+        break
+    else:
+        pytest.skip("no individual customer group has demand in this snapshot")
+
+    headings = _headings(at)
+    assert "### Summary table by SKU and customer" in headings
+    assert "### Customer detail" not in headings
+    assert not any("Summary table by SKU (view total)" in (e.label or "")
+                   for e in at.expander)
+
+
+def test_historical_window_label_covers_every_models_avg_column():
+    """The window prefix on the Historical Demand metrics, per model.
+
+    The figure's window follows the selected model, so the label has to be driven
+    off that model's own average-column name. Read the labels out of the real model
+    files rather than hardcoding them, so a model whose LOOKBACK_WEEKS changes (or a
+    new model file) shows up here instead of silently rendering a bare label.
+    """
+    from dashboard_app.config import MODEL_OPTIONS
+    from dashboard_app.summaries import historical_window_label
+    from agent.model_loader import load_pipeline
+
+    # regression reports the space-spelled column and defines no AVG_COL_LABEL.
+    assert historical_window_label("8 Week POS/Orders Average") == "8-Week"
+    # The hyphenated central columns (compute.py's constants).
+    assert historical_window_label("8-Week POS/Orders Average") == "8-Week"
+    assert historical_window_label("All-History POS/Orders Average") == "All-Time"
+
+    seen = set()
+    for label, path in MODEL_OPTIONS.items():
+        P = load_pipeline(path)
+        avg_col = getattr(P, "AVG_COL_LABEL", "8 Week POS/Orders Average")
+        window = historical_window_label(avg_col)
+        assert window in {"8-Week", "All-Time"} or window.endswith("-Week"), (
+            f"{label}: {avg_col!r} produced an unusable window label {window!r}"
+        )
+        # Never leak the raw column name or the internal "All-History" wording
+        # into a metric label.
+        assert "POS/Orders" not in window
+        assert window != "All-History"
+        seen.add(window)
+    assert seen >= {"8-Week", "All-Time"}, (
+        f"expected both windows across the model catalog, saw {seen}"
+    )
+
+
+@needs_data
+def test_quick_kpi_row_names_the_historical_demand_window():
+    """The KPI row must say WHICH window its Historical Demand covers.
+
+    With the default 8-Week Moving Average model this reads "8-Week Historical
+    Demand"; the other four models make it "All-Time". Without the prefix the two
+    are indistinguishable on screen even though they can differ substantially.
+    """
+    from dashboard_app.summaries import historical_window_label
+    from dashboard_app.pipeline import load_pipeline, pipeline_path
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+
+    P = load_pipeline(pipeline_path())
+    expected = historical_window_label(
+        getattr(P, "AVG_COL_LABEL", "8 Week POS/Orders Average")
+    )
+    labels = [m.label for m in at.metric]
+    assert f"{expected} Historical Demand (avg/wk)" in labels, (
+        f"expected a {expected}-labelled historical-demand metric, got {labels}"
+    )
+    # And no un-windowed one left behind.
+    assert "Historical Demand (avg/wk)" not in labels
+
+
 @needs_data
 def test_provider_selector_change_does_not_call_llm(monkeypatch):
     """Moving the reasoning-LLM selector (a plain rerun) must not fire the LLM.

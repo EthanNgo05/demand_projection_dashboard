@@ -205,6 +205,222 @@ def test_compute_by_customer_golden(raw, prices):
     assert_golden("compute_by_customer__regression", by_cust)
 
 
+# --------------------------------------------------------------------------
+# compute_by_customer_frames / single_group_frames / the averages helper
+# --------------------------------------------------------------------------
+REG_PATH = os.path.join(MODELS_DIR, "regression.py")
+
+
+def test_frames_change_only_the_average_columns(raw, prices):
+    """``compute_by_customer_frames`` adds the two averages and touches nothing else.
+
+    The Quick Projections table reads the _frames variant; this pins that the only
+    difference from the golden-mastered ``compute_by_customer`` output is the
+    average columns (the model's space-spelled one out, All-History + 8-Week in).
+    """
+    from dashboard_app import compute
+
+    df = cleaned("regression", raw)
+    plain = compute.compute_by_customer(df, TODAY, REG_PATH, prices)
+    framed, weekly_by_group, agg_by_group = compute.compute_by_customer_frames(
+        df, TODAY, REG_PATH, prices,
+    )
+
+    shared = [c for c in plain.columns if not c.endswith("POS/Orders Average")]
+    pd.testing.assert_frame_equal(framed[shared], plain[shared], check_exact=True)
+    assert set(framed.columns) - set(plain.columns) == {
+        compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
+    }
+    assert set(plain.columns) - set(framed.columns) == {"8 Week POS/Orders Average"}
+    # Both averages land right after "Weeks with data".
+    pos = list(framed.columns).index("Weeks with data")
+    assert list(framed.columns)[pos + 1:pos + 3] == [
+        compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
+    ]
+    # The per-group frames cover the same groups as the table, un-summed.
+    for frame in (weekly_by_group, agg_by_group):
+        assert set(frame["Customer Grouping"]) == set(framed["Customer Grouping"])
+
+
+def test_central_8wk_matches_the_regression_models_own_average(raw, prices):
+    """The claim the Quick Projections table now rests on.
+
+    Its 8-Week column switches from the 8-Week Moving Average model's own
+    "8 Week POS/Orders Average" to the centrally-computed "8-Week POS/Orders
+    Average". ``_descriptive_averages``' docstring asserts the two are equal
+    (same POS-then-Orders source, same total / weeks-since-first span); if they
+    ever diverge, every row of that column silently changes value.
+    """
+    from dashboard_app import compute
+
+    df = cleaned("regression", raw)
+    plain = compute.compute_by_customer(df, TODAY, REG_PATH, prices)
+    framed, _, _ = compute.compute_by_customer_frames(df, TODAY, REG_PATH, prices)
+
+    key = ["SKU", "Customer Grouping"]
+    merged = plain[key + ["8 Week POS/Orders Average"]].merge(
+        framed[key + [compute.EIGHT_WK_AVG_COL]], on=key, how="outer",
+        indicator=True,
+    )
+    assert (merged["_merge"] == "both").all(), "row sets diverged"
+    pd.testing.assert_series_equal(
+        merged[compute.EIGHT_WK_AVG_COL],
+        merged["8 Week POS/Orders Average"],
+        check_names=False, check_exact=True,
+    )
+
+
+def test_single_group_frames_matches_the_loop(raw, prices):
+    """The fast path that avoids fitting a single-group view twice.
+
+    ``compute_view``'s single-group branch and ``_forecast_one_group`` make the
+    same three calls, so reusing the former's frames must equal running the loop
+    over just that group's rows.
+    """
+    from dashboard_app import compute
+
+    df = cleaned("regression", raw)
+    group = "AMAZON-DC"
+    summary, weekly, agg = compute.compute_view(
+        df, group, TODAY, REG_PATH, prices,
+    )
+    reused, reused_wk, reused_ag = compute.single_group_frames(
+        summary, weekly, agg, group, TODAY,
+    )
+    looped, loop_wk, loop_ag = compute.compute_by_customer_frames(
+        df[df["Customer Grouping"] == group], TODAY, REG_PATH, prices,
+    )
+    pd.testing.assert_frame_equal(reused, looped, check_exact=True)
+    pd.testing.assert_frame_equal(reused_wk, loop_wk, check_exact=True)
+    pd.testing.assert_frame_equal(reused_ag, loop_ag, check_exact=True)
+
+
+def _summary_frame(rows, cols):
+    """Minimal summary frame: rows are dicts keyed by column name."""
+    return pd.DataFrame(rows, columns=cols)
+
+
+def test_attach_descriptive_averages_drops_the_space_spelled_column():
+    from dashboard_app import compute
+
+    agg = _agg_frame([("AMAZON-DC", "A-1", "2026-06-21", 8.0, np.nan)])
+    summary = _summary_frame(
+        [{"SKU": "A-1", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3,
+          "8 Week POS/Orders Average": 8.0, "Updated Projection Average": 5.0}],
+        ["SKU", "Customer Grouping", "Weeks with data",
+         "8 Week POS/Orders Average", "Updated Projection Average"],
+    )
+    out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
+    assert "8 Week POS/Orders Average" not in out.columns
+    # Both averages present and slotted immediately after "Weeks with data".
+    assert list(out.columns) == [
+        "SKU", "Customer Grouping", "Weeks with data",
+        compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
+        "Updated Projection Average",
+    ]
+
+
+def test_attach_descriptive_averages_only_fills_all_history_gaps():
+    """A model that reports its own All-History keeps it; only NaNs are filled."""
+    from dashboard_app import compute
+
+    agg = _agg_frame([
+        ("AMAZON-DC", "A-1", "2026-06-21", 8.0, np.nan),
+        ("AMAZON-DC", "A-2", "2026-06-21", 4.0, np.nan),
+    ])
+    summary = _summary_frame(
+        [{"SKU": "A-1", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3,
+          compute.ALL_HIST_AVG_COL: 123.4},
+         {"SKU": "A-2", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3,
+          compute.ALL_HIST_AVG_COL: np.nan}],
+        ["SKU", "Customer Grouping", "Weeks with data", compute.ALL_HIST_AVG_COL],
+    )
+    out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
+    assert out.loc[0, compute.ALL_HIST_AVG_COL] == 123.4     # untouched
+    assert out.loc[1, compute.ALL_HIST_AVG_COL] == 4.0       # filled centrally
+
+
+def test_attach_descriptive_averages_zero_fills_missing_recent_pairs():
+    """A pair the central averages never saw gets a genuine 0.0 recent run-rate."""
+    from dashboard_app import compute
+
+    # A-2 sells only outside the 8-week window, so it has an all-history average
+    # but no recent one.
+    agg = _agg_frame([
+        ("AMAZON-DC", "A-1", "2026-06-21", 8.0, np.nan),
+        ("AMAZON-DC", "A-2", "2025-01-05", 40.0, np.nan),
+    ])
+    summary = _summary_frame(
+        [{"SKU": "A-1", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3},
+         {"SKU": "A-2", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3},
+         {"SKU": "GHOST", "Customer Grouping": "AMAZON-DC", "Weeks with data": 0}],
+        ["SKU", "Customer Grouping", "Weeks with data"],
+    )
+    out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
+    by_sku = out.set_index("SKU")
+    assert by_sku.loc["A-2", compute.EIGHT_WK_AVG_COL] == 0.0
+    assert by_sku.loc["A-2", compute.ALL_HIST_AVG_COL] > 0
+    # A pair absent from the aggregate entirely: 0.0 recent, blank all-history.
+    assert by_sku.loc["GHOST", compute.EIGHT_WK_AVG_COL] == 0.0
+    assert pd.isna(by_sku.loc["GHOST", compute.ALL_HIST_AVG_COL])
+
+
+def test_attach_descriptive_averages_without_weeks_with_data():
+    """No "Weeks with data" anchor => no reorder, and no ValueError from index()."""
+    from dashboard_app import compute
+
+    agg = _agg_frame([("AMAZON-DC", "A-1", "2026-06-21", 8.0, np.nan)])
+    summary = _summary_frame(
+        [{"SKU": "A-1", "Customer Grouping": "AMAZON-DC"}],
+        ["SKU", "Customer Grouping"],
+    )
+    out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
+    assert list(out.columns) == [
+        "SKU", "Customer Grouping", compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
+    ]
+
+
+def test_compute_by_customer_best_golden(raw, prices, monkeypatch):
+    """The Optimized Projections table: each group fit with its own best model.
+
+    The winner resolution is monkeypatched because it reads
+    ``outputs/agent_summary_<group>.json``, which the fixture has none of — the
+    real call would return all-Nones and the golden would be vacuous.
+
+    Two models are alternated across the groups on purpose. The 8-Week Moving
+    Average model reports only a space-spelled "8 Week POS/Orders Average" while
+    Holt's reports only an all-history one, so a mixed table exercises BOTH
+    branches of the descriptive-average merge (drop-the-space-spelled-column and
+    fillna-the-gaps) as well as the concat of summaries with differing columns.
+    Alternation is by sorted-group index, not ``hash()``, which is salted per
+    process and would make the golden non-reproducible.
+    """
+    from dashboard_app import compute
+
+    df = cleaned("regression", raw)
+    models = [
+        ("8-Week Moving Average", os.path.join(MODELS_DIR, "regression.py")),
+        ("Holt's (double) exponential smoothing",
+         os.path.join(MODELS_DIR, "exponential_smoothing.py")),
+    ]
+    order = {g: i for i, g in
+             enumerate(sorted(df["Customer Grouping"].dropna().unique()))}
+    monkeypatch.setattr(
+        compute, "_best_model_for_group", lambda g: models[order[g] % 2]
+    )
+
+    combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded = (
+        compute.compute_by_customer_best(df, TODAY, prices)
+    )
+    assert not excluded, f"every group should resolve, got excluded={excluded}"
+    assert combined[compute.MODEL_USED_COL].nunique() == 2, "both models should win"
+    assert_golden("compute_by_customer_best__combined", combined)
+    assert_golden("compute_by_customer_best__weekly_all", weekly_all)
+    assert_golden("compute_by_customer_best__agg_all", agg_all)
+    assert_golden("compute_by_customer_best__weekly_by_group", weekly_by_group)
+    assert_golden("compute_by_customer_best__agg_by_group", agg_by_group)
+
+
 def test_descriptive_averages_golden(raw):
     """The all-history / 8-week demand averages used by the best-model views."""
     from dashboard_app import compute

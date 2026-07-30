@@ -133,8 +133,12 @@ def main():
 
     if not args.skip_slow:
         print("Multi-group loops")
-        with step("compute_by_customer (regression, all groups)"):
-            compute.compute_by_customer(
+        # The _frames variant is what Quick Projections actually calls: the same
+        # per-group loop plus the per-group chart frames and both descriptive
+        # averages. Timing plain compute_by_customer here would benchmark a path
+        # the app no longer takes.
+        with step("compute_by_customer_frames (regression, all groups)"):
+            compute.compute_by_customer_frames(
                 cleaned, today, os.path.join(SRC, "models", "regression.py"))
         with step("compute_by_customer_best (Optimized Projections)"):
             compute.compute_by_customer_best(cleaned, today)

@@ -30,6 +30,24 @@ def avg_window_phrase(avg_col):
     return avg_col.replace(" POS/Orders Average", "")
 
 
+def historical_window_label(avg_col):
+    """Short window prefix for a "Historical Demand" metric label.
+
+    "8-Week" or "All-Time", from the same column label ``avg_window_phrase``
+    reads. The window a historical-demand figure covers follows the SELECTED
+    MODEL (8 weeks for the 8-Week Moving Average, all history for the other
+    four), so without this in the label the two are indistinguishable on screen
+    -- a planner comparing an 8-week run-rate against an all-time average would
+    have no way to tell which they were looking at.
+
+    "All-Time" is the display wording for the all-history window; the per-SKU
+    table column keeps its own name, ``All-History POS/Orders Average``. Same
+    window, and the metrics' help text says so.
+    """
+    phrase = avg_window_phrase(avg_col)
+    return "All-Time" if phrase == "All-History" else phrase.replace(" Week", "-Week")
+
+
 def source_map(summary):
     """SKU -> 'POS' or 'Orders' (whichever the forecast used)."""
     if "Data Source" not in summary.columns:
