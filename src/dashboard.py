@@ -139,7 +139,7 @@ from dashboard_app.datasources import (  # noqa: F401
     price_glob, raw_glob, read_plytix_from_bytes, read_plytix_from_path,
 )
 from dashboard_app.compute import (  # noqa: F401
-    ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL,
+    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL,
     _agent_summaries_generated_at, _agent_summaries_mtime, _agent_summary_path,
     _best_model_for_group, _forecast_one_group, _load_agent_summary, _region_frame,
     attach_descriptive_averages, compute_by_customer, compute_by_customer_best,
@@ -198,7 +198,7 @@ AUTOFIT_CACHE_MAX = 64
 QUICK_CONDENSED_COLS = ["SKU", "Customer Grouping", EIGHT_WK_AVG_COL,
                         "Current Projection Average", RISK_COL]
 QUICK_CARD_COLS = ["Customer Grouping", "Data Source",
-                   ALL_HIST_AVG_COL, "Weeks with data"]
+                   ALL_TIME_AVG_COL, "Weeks with data"]
 
 
 @st.cache_data(show_spinner=False)
@@ -1666,7 +1666,7 @@ def main():
             render_sku_detail_card, agg_by_group, weekly_by_group,
             (lb, lcw, ffw), chart_anchors, prices,
             model_label=model_display(st.session_state.get("model_choice")),
-            top_groups=top_groups, avg_col=anchors_avg_col,
+            top_groups=top_groups,
         )
         render_selectable_table(
             by_cust_table, "filter_by_customer", P,
@@ -1698,15 +1698,28 @@ def main():
                 "One row per SKU for the whole view, forecast as a single combined "
                 "series — not the sum of the per-group forecasts above, so the two "
                 "tables will not tie out exactly. Its demand average is the one the "
-                "selected model reports; the table above shows both a recent 8-week "
-                "run-rate and an all-history average for every row."
+                "selected model reports — the mean of the series it actually fit, "
+                "with promo spikes and stockout dips cleansed out — hence the "
+                "“(model fit)” suffix. The table above instead shows the observed "
+                "demand average, model-independent, plus a recent 8-week run-rate."
             )
-            summary_table = summary
-            if RISK_COL in summary.columns and summary[RISK_COL].notna().any():
+            # Qualify the model's own average so it can't be read as the canonical
+            # observed one. compute_view's summary is left untouched on purpose (the
+            # agent parity tests hold it to exact equality with fit_regression), so
+            # this table genuinely carries the cleansed fitted figure — under the
+            # unqualified name it would be the third same-name-different-number
+            # collision this whole change exists to remove. Display-only: the rename
+            # lands on a local copy, after the cache and before render/export.
+            model_avg_col = resolve_avg_col(summary)
+            summary_table = summary.rename(
+                columns={model_avg_col: f"{model_avg_col} (model fit)"}
+            )
+            if RISK_COL in summary_table.columns \
+                    and summary_table[RISK_COL].notna().any():
                 # Largest revenue risk first, by magnitude (a big drop is as much a
                 # "risk" as a big gain); SKUs with no price (blank risk) sort last.
                 summary_table = (
-                    summary.assign(_abs_risk=summary[RISK_COL].abs())
+                    summary_table.assign(_abs_risk=summary_table[RISK_COL].abs())
                     .sort_values("_abs_risk", ascending=False, na_position="last")
                     .drop(columns="_abs_risk")
                     .reset_index(drop=True)

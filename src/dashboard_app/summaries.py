@@ -14,38 +14,41 @@ def resolve_avg_col(df):
     """Name of the descriptive-average column, whatever window it covers.
 
     The label varies by pipeline: regression always fits exactly 8 weeks
-    ("8 Week POS/Orders Average"), while exponential-smoothing and XGBoost
-    default to LOOKBACK_WEEKS=None ("All-History POS/Orders Average") or an
+    ("8-Week POS/Orders Average"), while exponential-smoothing and XGBoost
+    default to LOOKBACK_WEEKS=None ("All-Time POS/Orders Average") or an
     explicit N-week window if LOOKBACK_WEEKS is set. Matching by suffix keeps
     the dashboard correct regardless of which pipeline produced the summary.
     """
+    # Literal rather than compute.EIGHT_WK_AVG_COL: this module is deliberately
+    # streamlit-free, and compute.py imports streamlit.
     matches = [c for c in df.columns if c.endswith("POS/Orders Average")]
-    return matches[0] if matches else "8 Week POS/Orders Average"
+    return matches[0] if matches else "8-Week POS/Orders Average"
 
 
 def avg_window_phrase(avg_col):
     """Human-readable window description derived from the average column's
-    own label, e.g. "8 Week" or "All-History" -- so KPI captions never say
+    own label, e.g. "8-Week" or "All-Time" -- so KPI captions never say
     "8 wk" when the underlying average actually covers a different window."""
     return avg_col.replace(" POS/Orders Average", "")
 
 
 def historical_window_label(avg_col):
-    """Short window prefix for a "Historical Demand" metric label.
+    """Short window prefix for a weekly-demand metric label.
 
-    "8-Week" or "All-Time", from the same column label ``avg_window_phrase``
-    reads. The window a historical-demand figure covers follows the SELECTED
-    MODEL (8 weeks for the 8-Week Moving Average, all history for the other
-    four), so without this in the label the two are indistinguishable on screen
-    -- a planner comparing an 8-week run-rate against an all-time average would
-    have no way to tell which they were looking at.
+    "8-Week" or "All-Time", read straight off the average column's own name. The
+    window a demand average covers follows the SELECTED MODEL (8 weeks for the
+    8-Week Moving Average, all history for the other four), so without this in the
+    label the two are indistinguishable on screen -- a planner comparing an 8-week
+    run-rate against an all-time average would have no way to tell which they were
+    looking at.
 
-    "All-Time" is the display wording for the all-history window; the per-SKU
-    table column keeps its own name, ``All-History POS/Orders Average``. Same
-    window, and the metrics' help text says so.
+    Deliberately a pass-through, not a translation: the metric label and the table
+    column must use the SAME word for the same window. Two vocabularies for one
+    window ("All-History" in the column, "All-Time" in the metric) is exactly the
+    confusion this function used to create. The ``" Week"`` -> ``"-Week"`` fixup is
+    the one remaining concession, for frames persisted by an older build.
     """
-    phrase = avg_window_phrase(avg_col)
-    return "All-Time" if phrase == "All-History" else phrase.replace(" Week", "-Week")
+    return avg_window_phrase(avg_col).replace(" Week", "-Week")
 
 
 def source_map(summary):

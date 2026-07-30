@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_app.compute import (
-    ALL_HIST_AVG_COL,
+    ALL_TIME_AVG_COL,
     EIGHT_WK_AVG_COL,
     _agent_summaries_mtime,
     _agent_summaries_oldest_at,
@@ -34,13 +34,13 @@ _WATCHLIST_SEL_KEY = "watchlist__sel"
 # Detail-card field order for the watchlist (decoupled from the best-model table's
 # full column set). Renders as three rows:
 #   Customer Grouping · Region · Data Source
-#   All-History Avg · 8-Week Avg · Current Projection Average
+#   All-Time Avg · 8-Week Avg · Current Projection Average
 #   List Price · Weeks with data
 # The projection change (new value, difference, revenue risk) comes from the card's
 # "Calculate Optimal Projection" button, so it's intentionally left off the grid.
 WATCHLIST_CARD_COLS = [
     "Customer Grouping", "Region", "Data Source",
-    ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL, "Current Projection Average",
+    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, "Current Projection Average",
     PRICE_COL, "Weeks with data",
 ]
 

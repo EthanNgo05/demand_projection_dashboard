@@ -14,7 +14,7 @@ from dashboard_app.summaries import (
 )
 from dashboard_app.compute import (
     compute_by_customer_best, _agent_summaries_mtime, _agent_summaries_oldest_at,
-    summary_to_excel, ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL,
+    summary_to_excel, ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL,
 )
 from dashboard_app.refresh import batch_in_progress
 from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart
@@ -32,7 +32,7 @@ BEST_MIX_CONDENSED_COLS = ["SKU", "Customer Grouping", EIGHT_WK_AVG_COL,
 # visible somewhere). The chart + stacked metrics below it are drawn by
 # render_sku_detail_card.
 BEST_MIX_CARD_COLS = ["Customer Grouping", MODEL_USED_COL,
-                      ALL_HIST_AVG_COL, "Weeks with data"]
+                      ALL_TIME_AVG_COL, "Weeks with data"]
 
 
 def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
@@ -49,16 +49,16 @@ def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
     row layout.
 
     ``avg_col`` names the descriptive-average column whose window label describes
-    ``anchors``, for the historical-demand metric's help text only. It has to be
-    passed explicitly by any caller whose ``summary`` carries BOTH averages
-    (``attach_descriptive_averages`` puts All-History first, so the ``resolve_avg_col``
-    fallback would claim an all-history window even when ``anchors`` spans 8 weeks).
+    ``anchors``, for the total-weekly-demand metric's label and help text. It has to
+    be passed explicitly by any caller whose ``summary`` carries BOTH averages
+    (``attach_descriptive_averages`` puts All-Time first, so the ``resolve_avg_col``
+    fallback would claim an all-time window even when ``anchors`` spans 8 weeks).
     """
     lb, lcw, ffw = anchors
     # Avg. weekly demand = the mean of the TOTAL weekly demand actually plotted
     # on the chart's "Actual demand" line (POS/Orders summed across SKUs per
     # week, then averaged over the weeks in the window). Do NOT sum the per-SKU
-    # "N Week POS/Orders Average" column here: that per-SKU average divides each
+    # "N-Week POS/Orders Average" column here: that per-SKU average divides each
     # SKU by its own weeks-with-data, so summing it counts a SKU that sold in
     # only a few weeks as if it sold every week and overstates the total.
     n_skus = int(summary["SKU"].nunique())
@@ -98,20 +98,24 @@ def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
         "SKUs Forecasted", f"{n_skus:,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
     )
+    # "Total Weekly Demand", not "Historical Demand": this is a VIEW TOTAL and is
+    # deliberately not the sum of the per-SKU average column (see the note above on
+    # why summing that column would overstate the total). Naming it after the total
+    # keeps it from being read as the same metric a table row shows.
+    #
     # The window is in the LABEL, not just the help: it follows the selected model
     # (8 weeks vs all history), so two runs of this row can show very different
     # numbers under an otherwise identical caption.
     window = historical_window_label(avg_col)
     k2.metric(
-        f"{window} Historical Demand (avg/wk)", f"{total_avg:,.0f}",
-        help=f"Mean of total weekly actual demand (POS/Orders) over the "
-             f"{avg_window_phrase(avg_col).lower()} window — the average of the "
-             f"chart's actual-demand line. This is the window the selected model "
-             f"fits on."
-             + (" Same window as the per-SKU 'All-History POS/Orders Average' "
-                "column in the tables below." if window == "All-Time" else
-                " Same window as the per-SKU '8-Week POS/Orders Average' column "
-                "in the tables below."),
+        f"Total Weekly Demand ({window} avg)", f"{total_avg:,.0f}",
+        help=f"Mean of TOTAL weekly actual demand (POS/Orders) summed across every "
+             f"SKU, over the {avg_window_phrase(avg_col).lower()} window — the "
+             f"average of the chart's actual-demand line, and the window the "
+             f"selected model fits on. Not the sum of the per-SKU "
+             f"'{window} POS/Orders Average' column below: that column divides each "
+             f"SKU by its own span, so summing it would count a SKU that only sold "
+             f"for part of the window as if it sold throughout.",
     )
     k3.metric(
         "Current Forecast (avg/wk)", f"{total_initial:,.0f}",
@@ -167,8 +171,7 @@ def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
 
 
 def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors,
-                           pm, row, key_base, model_label=None, top_groups=None,
-                           avg_col=None):
+                           pm, row, key_base, model_label=None, top_groups=None):
     """Detail-card body for one (SKU, Customer Grouping) row of a summary table.
 
     Shared by Optimized Projections and Quick Projections so the two views read
@@ -192,12 +195,12 @@ def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors
       comes from ``compute_view``'s ``breakdown_df``, which the per-group fits
       never pass), and it is a whole-view figure, not this group's share — the
       caption says so.
-    * ``avg_col`` names the average column describing ``anchors``, so the
-      historical-demand metric can say WHICH window it covers. It must come from
-      the caller: every row reaching this card carries BOTH averages, so
-      resolving it from ``row`` would always answer All-History and would label
-      an 8-week span "All-Time" — the precise confusion the label exists to
-      prevent.
+
+    The card shows no weekly-demand average of its own. Both averages are already
+    on the row and rendered in the card's field row (``QUICK_CARD_COLS`` /
+    ``BEST_MIX_CARD_COLS``), so recomputing one here only created a second number
+    that disagreed with the column beside it — same window, but dividing by weeks
+    that had a row instead of the SKU's full span.
     """
     sku = str(row["SKU"])
     group = str(row["Customer Grouping"])
@@ -240,23 +243,6 @@ def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors
         # Every figure is this one (SKU, group) row's, so the metrics read
         # straight off it — no summing across a SKU's groups any more.
         st.metric("Data Source", source)
-        sku_hist = historical_window(
-            sku_agg[sku_agg["SKU"].astype(str) == sku],
-            pd.DataFrame([{"SKU": sku, "Data Source": source}]),
-            anchors,
-        )
-        sku_weekly_tot = sku_hist.groupby("WeekDate")["demand"].sum(min_count=1)
-        # Same window naming as the KPI row above (see avg_col in the docstring).
-        hist_label = (
-            f"{historical_window_label(avg_col)} Historical Demand (avg/wk)"
-            if avg_col else "Historical Demand (avg/wk)"
-        )
-        st.metric(
-            hist_label,
-            f"{float(sku_weekly_tot.mean()) if not sku_weekly_tot.empty else 0.0:,.1f}",
-            help="Mean of this SKU's weekly actual demand for this customer group "
-                 "over the same window the KPI row above uses.",
-        )
         sysv = row["Current Projection Average"]
         st.metric(
             "Current Forecast (avg/wk)",
@@ -413,12 +399,12 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     chart_lb = pd.to_datetime(agg_all["WeekDate"]).min()
     chart_anchors = (chart_lb, lcw, ffw)
 
-    # Window label for the historical-demand KPI's help text. It has to describe
-    # `anchors`, which come from the SIDEBAR model's week_anchors — NOT from
-    # `combined`, which carries both averages, so _render_kpis' resolve_avg_col
-    # fallback would pick All-History and mislabel an 8-week window.
+    # Window label for the total-weekly-demand KPI. It has to describe `anchors`,
+    # which come from the SIDEBAR model's week_anchors — NOT from `combined`, which
+    # carries both averages, so _render_kpis' resolve_avg_col fallback would pick
+    # All-Time and mislabel an 8-week window.
     anchors_avg_col = (
-        getattr(P, "AVG_COL_LABEL", "8 Week POS/Orders Average")
+        getattr(P, "AVG_COL_LABEL", EIGHT_WK_AVG_COL)
         if P is not None else None
     )
 
@@ -501,8 +487,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     # the card prefers. top_groups is unbound too — this view has no compute_view
     # summary, so no breakdown exists (see render_sku_detail_card).
     sku_card = functools.partial(render_sku_detail_card, agg_by_group,
-                                 weekly_by_group, anchors, chart_anchors, pm,
-                                 avg_col=anchors_avg_col)
+                                 weekly_by_group, anchors, chart_anchors, pm)
     render_selectable_table(
         table, "filter_best_mix", P,
         condensed_cols=BEST_MIX_CONDENSED_COLS, style=True,

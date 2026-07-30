@@ -451,13 +451,22 @@ def _best_model_for_group(group):
     return label, path
 
 
-ALL_HIST_AVG_COL = "All-History POS/Orders Average"
+# The two descriptive-average column names, and the ONLY spellings the UI shows.
+# The model files' AVG_COL_LABEL / DISPLAY_NAMES match these exactly so
+# ``attach_descriptive_averages`` replaces the model's column in place instead of
+# leaving two differently-named copies of one figure on the same table.
+ALL_TIME_AVG_COL = "All-Time POS/Orders Average"
 EIGHT_WK_AVG_COL = "8-Week POS/Orders Average"
 
 
 @st.cache_data(show_spinner=False)
 def _descriptive_averages(agg_by_group, today_ts):
-    """Per-(Customer Grouping, SKU) all-history and 8-week demand averages.
+    """Per-(Customer Grouping, SKU) all-time and 8-week demand averages.
+
+    These are the CANONICAL figures behind ``ALL_TIME_AVG_COL`` /
+    ``EIGHT_WK_AVG_COL`` everywhere in the UI — observed demand, model-independent,
+    so one SKU/customer row reads the same whichever model produced it (see
+    ``attach_descriptive_averages``).
 
     Cached because several callers ask for it with the same inputs on one pass
     through a view — ``compute_exceptions`` and ``compute_spikes`` pass the same
@@ -476,8 +485,12 @@ def _descriptive_averages(agg_by_group, today_ts):
       gaps count as real zeros). Over the 8-week window this reproduces
       ``regression.fit_regression``'s ``mean_val = y.sum() / weeks_since_first``.
 
+    Note these are RAW observations: unlike the models' own reported average, no
+    outlier cleansing is applied. Window, source fallback and span are otherwise
+    identical to the models', so cleansing is the only difference between the two.
+
     Discontinued SKUs (name ending in '*') are dropped, matching the models.
-    Returns a frame: Customer Grouping, SKU, ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL.
+    Returns a frame: Customer Grouping, SKU, ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL.
     """
     # In-progress week is excluded; the historical window ends last completed week.
     days_since_sunday = (today_ts.weekday() + 1) % 7          # Sun=0 ... Sat=6
@@ -569,63 +582,77 @@ def _descriptive_averages(agg_by_group, today_ts):
             out_col: [round(v, 1) for v in totals[keep] / spans],
         })
 
-    all_hist = _avg(hist_start, ALL_HIST_AVG_COL)
+    all_time = _avg(hist_start, ALL_TIME_AVG_COL)
     eight_wk = _avg(eight_wk_start, EIGHT_WK_AVG_COL)
-    return all_hist.merge(eight_wk, on=["Customer Grouping", "SKU"], how="outer")
+    return all_time.merge(eight_wk, on=["Customer Grouping", "SKU"], how="outer")
 
 
 def attach_descriptive_averages(summary, agg_by_group, today_ts):
-    """Give every row of ``summary`` BOTH descriptive averages.
+    """Give every row of ``summary`` BOTH descriptive averages, centrally computed.
 
-    Each model reports only one: the 8-Week Moving Average model reports an
-    "8 Week POS/Orders Average" (a recent run-rate), the other four report
-    all-history. Both are computed centrally from the stitched per-group
-    aggregates so the two columns are always populated and comparable — which is
-    what lets a table show a recent run-rate next to a long-run average
-    regardless of which model produced the row.
+    Each model reports only ONE average, and reports it as the mean of the series
+    it actually fit — which for four of the five is outlier-CLEANSED (promo spikes
+    flattened, stockout dips lifted). Read off a table that figure is indefensible:
+    it silently changes definition when the model changes, and it doesn't match the
+    demand a planner can see on the chart next to it.
+
+    So both columns come from ``_descriptive_averages`` — observed demand over the
+    same window and span the models use, no cleansing — and the central value WINS
+    over whatever the model reported. The model's own figure survives only where
+    ``_descriptive_averages`` has no row at all (see below). That is what makes one
+    number mean one thing across every table, card and Excel export in the UI, and
+    what lets a recent run-rate sit beside a long-run average and be comparable.
+
+    (Each model's standalone .xlsx output is untouched — it still reports the
+    cleansed mean it fit on, which is the right figure in that context. So is
+    ``compute_view``'s summary, which the agent parity tests hold to exact equality
+    with ``fit_regression``; the one place that surfaces is the collapsed
+    "Summary table by SKU (view total)", whose column dashboard.py suffixes
+    "(model fit)" so it can't be read as this one.)
 
     Merges on ``["SKU", "Customer Grouping"]``, so ``summary["SKU"]`` must already
     be string-typed (``_descriptive_averages`` casts its own side). Discontinued
-    ``*`` SKUs are dropped by ``_descriptive_averages``, so they come back with a
-    blank All-History and a 0.0 8-Week — harmless, since the models drop them too.
+    ``*`` SKUs are dropped by ``_descriptive_averages``, so they keep the model's
+    value if it reported one and otherwise come back with a blank All-Time and a
+    0.0 8-Week — harmless, since the models drop them too.
 
     Stops deliberately after slotting the two columns in: callers that reorder
     other columns (``compute_by_customer_best`` moves ``Model Used``) depend on
     this ordering being final.
     """
     avgs = _descriptive_averages(agg_by_group, today_ts)
+    # Legacy spelling from before the model files were aligned on EIGHT_WK_AVG_COL.
+    # Harmless now, kept so a frame persisted by an older build still loads clean.
     summary = summary.drop(columns=["8 Week POS/Orders Average"], errors="ignore")
     summary = summary.merge(
         avgs.rename(columns={
-            ALL_HIST_AVG_COL: "_central_all_hist",
+            ALL_TIME_AVG_COL: "_central_all_time",
             EIGHT_WK_AVG_COL: "_central_8wk",
         }),
         on=["SKU", "Customer Grouping"], how="left",
     )
-    # All-History: keep each model's own reported value; fill only the gaps (the
-    # 8-week-model rows, which never compute an all-history average) so existing
-    # non-8-week numbers are unchanged.
-    if ALL_HIST_AVG_COL in summary.columns:
-        summary[ALL_HIST_AVG_COL] = summary[ALL_HIST_AVG_COL].fillna(
-            summary["_central_all_hist"]
-        )
-    else:
-        summary[ALL_HIST_AVG_COL] = summary["_central_all_hist"]
-    # 8-Week: the central value everywhere (it equals the 8-Week Moving Average
-    # model's own figure on the rows it produced, so nothing shifts there). A SKU
-    # with history but no POS/Orders in the last 8 weeks has no run-rate to
-    # compute; its recent average is a genuine 0 (absent week = zero, matching the
-    # models' gap-fill), so fill rather than leave a blank.
+    # All-Time: the central observed value wins; the model's own (cleansed) figure
+    # only fills pairs _descriptive_averages produced no row for, so such a row
+    # shows *something* rather than a blank.
+    summary[ALL_TIME_AVG_COL] = (
+        summary["_central_all_time"].fillna(summary[ALL_TIME_AVG_COL])
+        if ALL_TIME_AVG_COL in summary.columns
+        else summary["_central_all_time"]
+    )
+    # 8-Week: the central value everywhere. A SKU with history but no POS/Orders in
+    # the last 8 weeks has no run-rate to compute; its recent average is a genuine 0
+    # (absent week = zero, matching the models' gap-fill), so fill rather than leave
+    # a blank.
     summary[EIGHT_WK_AVG_COL] = summary["_central_8wk"].fillna(0.0)
-    summary = summary.drop(columns=["_central_all_hist", "_central_8wk"])
+    summary = summary.drop(columns=["_central_all_time", "_central_8wk"])
 
-    # Slot both averages right after "Weeks with data" (All-History then 8-Week),
+    # Slot both averages right after "Weeks with data" (All-Time then 8-Week),
     # immediately ahead of "Updated Projection Average", for a stable layout.
     if "Weeks with data" in summary.columns:
         cols = [c for c in summary.columns
-                if c not in (ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL)]
+                if c not in (ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL)]
         pos = cols.index("Weeks with data") + 1
-        cols[pos:pos] = [ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL]
+        cols[pos:pos] = [ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL]
         summary = summary[cols]
     return summary
 

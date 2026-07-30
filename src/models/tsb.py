@@ -114,12 +114,18 @@ LOOKBACK_WEEKS = None
 HISTORY_YEARS = 3
 
 # Display label for the descriptive-average column. Reflects LOOKBACK_WEEKS so
-# the header never claims "8 Week" when it's actually averaging all history
+# the header never claims "8-Week" when it's actually averaging all history
 # (or some other window) -- see DISPLAY_NAMES / SUMMARY_COLUMNS below.
+#
+# Spelled to match dashboard_app.compute's ALL_TIME_AVG_COL / EIGHT_WK_AVG_COL
+# EXACTLY ("All-Time", hyphenated "N-Week"). The dashboard replaces this column
+# with its own centrally-computed observed average, and a second spelling would
+# leave two differently-named copies of the same figure on one table -- which is
+# precisely the confusion this label once caused.
 AVG_COL_LABEL = (
-    "All-History POS/Orders Average"
+    "All-Time POS/Orders Average"
     if LOOKBACK_WEEKS is None
-    else f"{LOOKBACK_WEEKS} Week POS/Orders Average"
+    else f"{LOOKBACK_WEEKS}-Week POS/Orders Average"
 )
 
 # --- Intermittent / lumpy demand -------------------------------------------- #
@@ -822,8 +828,14 @@ def fit_tsb(df, today, grouping_label, breakdown_df=None,
 
         # Descriptive average over the (cleaned) fitting window. The column's
         # display label (AVG_COL_LABEL) already reflects LOOKBACK_WEEKS, so it
-        # reads "All-History..." rather than a hardcoded "8 Week..." when the
+        # reads "All-Time..." rather than a hardcoded "8-Week..." when the
         # window isn't actually 8 weeks.
+        #
+        # This is the CLEANSED mean -- what the model actually fit on -- and it is
+        # what the standalone .xlsx output reports. The dashboard REPLACES this
+        # column with the observed (uncleansed) average from
+        # dashboard_app.compute._descriptive_averages, so the figure a planner
+        # reads means the same thing regardless of which model produced the row.
         mean_val = y.mean()
 
         raw_forecast = tsb_forecast(

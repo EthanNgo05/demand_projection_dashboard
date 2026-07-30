@@ -22,12 +22,16 @@ def style_summary(summary_df):
     ] if c in df.columns]
     fmt = {c: "{:,.0f}" for c in int_cols}
     # Format every descriptive-average column to one decimal. Single-group views
-    # carry one; the Optimal Projections combined view carries two (All-History
+    # carry one; the Optimal Projections combined view carries two (All-Time
     # and 8-Week POS/Orders Average). The Exceptions view stores its 8-week
     # average as a whole number (integer dtype) so it ties out with Projection
     # Difference / Revenue Risk — render those without a spurious decimal.
+    #
+    # Substring, not suffix: the view-total table qualifies its column
+    # "... POS/Orders Average (model fit)" (see dashboard._render_quick_view), and
+    # that one must format identically. No other column carries the phrase.
     for c in df.columns:
-        if c.endswith("POS/Orders Average") and pd.api.types.is_numeric_dtype(df[c]):
+        if "POS/Orders Average" in c and pd.api.types.is_numeric_dtype(df[c]):
             fmt[c] = "{:,.0f}" if pd.api.types.is_integer_dtype(df[c]) else "{:,.1f}"
     # The Exceptions view's signed percent deviation: two decimals when the value
     # has a fractional part, a whole number when it doesn't, always suffixed "%".

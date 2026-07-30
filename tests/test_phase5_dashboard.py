@@ -320,49 +320,79 @@ def test_quick_single_group_renders_the_by_customer_table():
 
 
 def test_historical_window_label_covers_every_models_avg_column():
-    """The window prefix on the Historical Demand metrics, per model.
+    """The window prefix on the weekly-demand metrics, per model.
 
     The figure's window follows the selected model, so the label has to be driven
     off that model's own average-column name. Read the labels out of the real model
     files rather than hardcoding them, so a model whose LOOKBACK_WEEKS changes (or a
     new model file) shows up here instead of silently rendering a bare label.
     """
+    from dashboard_app.compute import ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL
     from dashboard_app.config import MODEL_OPTIONS
     from dashboard_app.summaries import historical_window_label
     from agent.model_loader import load_pipeline
 
-    # regression reports the space-spelled column and defines no AVG_COL_LABEL.
+    # The canonical columns (compute.py's constants), which the model files match.
+    assert historical_window_label(EIGHT_WK_AVG_COL) == "8-Week"
+    assert historical_window_label(ALL_TIME_AVG_COL) == "All-Time"
+    # Legacy space-spelled column from a frame persisted by an older build.
     assert historical_window_label("8 Week POS/Orders Average") == "8-Week"
-    # The hyphenated central columns (compute.py's constants).
-    assert historical_window_label("8-Week POS/Orders Average") == "8-Week"
-    assert historical_window_label("All-History POS/Orders Average") == "All-Time"
 
     seen = set()
     for label, path in MODEL_OPTIONS.items():
         P = load_pipeline(path)
-        avg_col = getattr(P, "AVG_COL_LABEL", "8 Week POS/Orders Average")
+        avg_col = getattr(P, "AVG_COL_LABEL", EIGHT_WK_AVG_COL)
         window = historical_window_label(avg_col)
         assert window in {"8-Week", "All-Time"} or window.endswith("-Week"), (
             f"{label}: {avg_col!r} produced an unusable window label {window!r}"
         )
-        # Never leak the raw column name or the internal "All-History" wording
-        # into a metric label.
+        # Never leak the raw column name into a metric label.
         assert "POS/Orders" not in window
-        assert window != "All-History"
         seen.add(window)
     assert seen >= {"8-Week", "All-Time"}, (
         f"expected both windows across the model catalog, saw {seen}"
     )
 
 
-@needs_data
-def test_quick_kpi_row_names_the_historical_demand_window():
-    """The KPI row must say WHICH window its Historical Demand covers.
+def test_every_model_label_matches_a_canonical_average_column():
+    """A model's AVG_COL_LABEL must be one of the two canonical spellings.
 
-    With the default 8-Week Moving Average model this reads "8-Week Historical
-    Demand"; the other four models make it "All-Time". Without the prefix the two
-    are indistinguishable on screen even though they can differ substantially.
+    ``attach_descriptive_averages`` replaces the model's average column with the
+    centrally-computed one BY NAME. A model spelling it differently (the old
+    "All-History ..." / space-spelled "8 Week ...") leaves both on the same table:
+    two columns, two definitions, one window — the exact confusion planners hit.
     """
+    from dashboard_app.compute import ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL
+    from dashboard_app.config import MODEL_OPTIONS
+    from agent.model_loader import load_pipeline
+
+    canonical = {ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL}
+    for label, path in MODEL_OPTIONS.items():
+        P = load_pipeline(path)
+        avg_col = getattr(P, "AVG_COL_LABEL", None)
+        if avg_col is None:                    # regression: hardcoded DISPLAY_NAMES
+            avg_col = P.DISPLAY_NAMES["8_week_pos_avg"]
+        assert avg_col in canonical, (
+            f"{label}: average column {avg_col!r} is not one of {canonical} — "
+            "the dashboard would carry two copies of the same figure"
+        )
+
+
+@needs_data
+def test_quick_kpi_row_names_the_total_weekly_demand_window():
+    """The KPI row must say WHICH window its total weekly demand covers.
+
+    With the default 8-Week Moving Average model this reads "Total Weekly Demand
+    (8-Week avg)"; the other four models make it "(All-Time avg)". Without the
+    window the two are indistinguishable on screen even though they can differ
+    substantially.
+
+    It must also NOT be called "Historical Demand" any more: that name was shared
+    with a per-SKU metric on the detail card, which computed a different number
+    (weeks-with-demand denominator). This KPI is a view TOTAL and is deliberately
+    not the sum of the per-SKU average column, so its name says "Total".
+    """
+    from dashboard_app.compute import EIGHT_WK_AVG_COL
     from dashboard_app.summaries import historical_window_label
     from dashboard_app.pipeline import load_pipeline, pipeline_path
 
@@ -371,14 +401,17 @@ def test_quick_kpi_row_names_the_historical_demand_window():
 
     P = load_pipeline(pipeline_path())
     expected = historical_window_label(
-        getattr(P, "AVG_COL_LABEL", "8 Week POS/Orders Average")
+        getattr(P, "AVG_COL_LABEL", EIGHT_WK_AVG_COL)
     )
     labels = [m.label for m in at.metric]
-    assert f"{expected} Historical Demand (avg/wk)" in labels, (
-        f"expected a {expected}-labelled historical-demand metric, got {labels}"
+    assert f"Total Weekly Demand ({expected} avg)" in labels, (
+        f"expected a {expected}-labelled total-weekly-demand metric, got {labels}"
     )
-    # And no un-windowed one left behind.
-    assert "Historical Demand (avg/wk)" not in labels
+    # No un-windowed one, and none of the retired "Historical Demand" wording.
+    assert "Total Weekly Demand" not in labels
+    assert not any("Historical Demand" in (lbl or "") for lbl in labels), (
+        f"the retired 'Historical Demand' wording is back: {labels}"
+    )
 
 
 @needs_data

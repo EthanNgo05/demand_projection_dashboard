@@ -212,11 +212,12 @@ REG_PATH = os.path.join(MODELS_DIR, "regression.py")
 
 
 def test_frames_change_only_the_average_columns(raw, prices):
-    """``compute_by_customer_frames`` adds the two averages and touches nothing else.
+    """``compute_by_customer_frames`` adds the all-time average and touches nothing else.
 
     The Quick Projections table reads the _frames variant; this pins that the only
     difference from the golden-mastered ``compute_by_customer`` output is the
-    average columns (the model's space-spelled one out, All-History + 8-Week in).
+    average columns — All-Time added, 8-Week replaced in place by the identical
+    central value (see the test below).
     """
     from dashboard_app import compute
 
@@ -228,14 +229,16 @@ def test_frames_change_only_the_average_columns(raw, prices):
 
     shared = [c for c in plain.columns if not c.endswith("POS/Orders Average")]
     pd.testing.assert_frame_equal(framed[shared], plain[shared], check_exact=True)
-    assert set(framed.columns) - set(plain.columns) == {
-        compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
-    }
-    assert set(plain.columns) - set(framed.columns) == {"8 Week POS/Orders Average"}
+    # Only the all-time average is genuinely new. The 8-week column already exists
+    # under its canonical name — the model files spell it exactly as compute.py's
+    # constant, so attach_descriptive_averages overwrites it in place rather than
+    # leaving a second, differently-spelled copy of the same figure behind.
+    assert set(framed.columns) - set(plain.columns) == {compute.ALL_TIME_AVG_COL}
+    assert set(plain.columns) - set(framed.columns) == set()
     # Both averages land right after "Weeks with data".
     pos = list(framed.columns).index("Weeks with data")
     assert list(framed.columns)[pos + 1:pos + 3] == [
-        compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
+        compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL,
     ]
     # The per-group frames cover the same groups as the table, un-summed.
     for frame in (weekly_by_group, agg_by_group):
@@ -245,10 +248,10 @@ def test_frames_change_only_the_average_columns(raw, prices):
 def test_central_8wk_matches_the_regression_models_own_average(raw, prices):
     """The claim the Quick Projections table now rests on.
 
-    Its 8-Week column switches from the 8-Week Moving Average model's own
-    "8 Week POS/Orders Average" to the centrally-computed "8-Week POS/Orders
-    Average". ``_descriptive_averages``' docstring asserts the two are equal
-    (same POS-then-Orders source, same total / weeks-since-first span); if they
+    Its 8-Week column is the centrally-computed one, overwriting whatever the model
+    reported. ``_descriptive_averages``' docstring asserts the two are equal for the
+    8-Week Moving Average model (same POS-then-Orders source, same total /
+    weeks-since-first span, and that model applies no outlier cleansing); if they
     ever diverge, every row of that column silently changes value.
     """
     from dashboard_app import compute
@@ -258,14 +261,14 @@ def test_central_8wk_matches_the_regression_models_own_average(raw, prices):
     framed, _, _ = compute.compute_by_customer_frames(df, TODAY, REG_PATH, prices)
 
     key = ["SKU", "Customer Grouping"]
-    merged = plain[key + ["8 Week POS/Orders Average"]].merge(
+    merged = plain[key + [compute.EIGHT_WK_AVG_COL]].merge(
         framed[key + [compute.EIGHT_WK_AVG_COL]], on=key, how="outer",
-        indicator=True,
+        suffixes=("_model", "_central"), indicator=True,
     )
     assert (merged["_merge"] == "both").all(), "row sets diverged"
     pd.testing.assert_series_equal(
-        merged[compute.EIGHT_WK_AVG_COL],
-        merged["8 Week POS/Orders Average"],
+        merged[f"{compute.EIGHT_WK_AVG_COL}_central"],
+        merged[f"{compute.EIGHT_WK_AVG_COL}_model"],
         check_names=False, check_exact=True,
     )
 
@@ -301,6 +304,11 @@ def _summary_frame(rows, cols):
 
 
 def test_attach_descriptive_averages_drops_the_space_spelled_column():
+    """The legacy "8 Week ..." spelling, from a frame persisted by an older build.
+
+    The model files now spell it exactly as EIGHT_WK_AVG_COL, so this path only
+    matters for old cached frames — but it must not leave both spellings behind.
+    """
     from dashboard_app import compute
 
     agg = _agg_frame([("AMAZON-DC", "A-1", "2026-06-21", 8.0, np.nan)])
@@ -315,13 +323,20 @@ def test_attach_descriptive_averages_drops_the_space_spelled_column():
     # Both averages present and slotted immediately after "Weeks with data".
     assert list(out.columns) == [
         "SKU", "Customer Grouping", "Weeks with data",
-        compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
+        compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL,
         "Updated Projection Average",
     ]
 
 
-def test_attach_descriptive_averages_only_fills_all_history_gaps():
-    """A model that reports its own All-History keeps it; only NaNs are filled."""
+def test_attach_descriptive_averages_central_all_time_overrides_the_model():
+    """The central observed average WINS over whatever the model reported.
+
+    Four of the five models report the mean of the outlier-CLEANSED series they fit.
+    Displaying that made one column mean different things depending on the selected
+    model, and disagree with the demand plotted beside it. So the central value
+    overwrites it; the model's figure survives only where ``_descriptive_averages``
+    produced no row for the pair at all, so such a row shows something not a blank.
+    """
     from dashboard_app import compute
 
     agg = _agg_frame([
@@ -329,15 +344,22 @@ def test_attach_descriptive_averages_only_fills_all_history_gaps():
         ("AMAZON-DC", "A-2", "2026-06-21", 4.0, np.nan),
     ])
     summary = _summary_frame(
+        # A-1 carries a model value the central pass also covers -> overridden.
+        # A-2 carries none -> filled centrally. ORPHAN is absent from `agg`, so the
+        # central pass has no row for it and its model value survives.
         [{"SKU": "A-1", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3,
-          compute.ALL_HIST_AVG_COL: 123.4},
+          compute.ALL_TIME_AVG_COL: 123.4},
          {"SKU": "A-2", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3,
-          compute.ALL_HIST_AVG_COL: np.nan}],
-        ["SKU", "Customer Grouping", "Weeks with data", compute.ALL_HIST_AVG_COL],
+          compute.ALL_TIME_AVG_COL: np.nan},
+         {"SKU": "ORPHAN", "Customer Grouping": "AMAZON-DC", "Weeks with data": 3,
+          compute.ALL_TIME_AVG_COL: 77.7}],
+        ["SKU", "Customer Grouping", "Weeks with data", compute.ALL_TIME_AVG_COL],
     )
     out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
-    assert out.loc[0, compute.ALL_HIST_AVG_COL] == 123.4     # untouched
-    assert out.loc[1, compute.ALL_HIST_AVG_COL] == 4.0       # filled centrally
+    by_sku = out.set_index("SKU")
+    assert by_sku.loc["A-1", compute.ALL_TIME_AVG_COL] == 8.0    # central overrode 123.4
+    assert by_sku.loc["A-2", compute.ALL_TIME_AVG_COL] == 4.0    # filled centrally
+    assert by_sku.loc["ORPHAN", compute.ALL_TIME_AVG_COL] == 77.7   # no central row
 
 
 def test_attach_descriptive_averages_zero_fills_missing_recent_pairs():
@@ -359,10 +381,10 @@ def test_attach_descriptive_averages_zero_fills_missing_recent_pairs():
     out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
     by_sku = out.set_index("SKU")
     assert by_sku.loc["A-2", compute.EIGHT_WK_AVG_COL] == 0.0
-    assert by_sku.loc["A-2", compute.ALL_HIST_AVG_COL] > 0
+    assert by_sku.loc["A-2", compute.ALL_TIME_AVG_COL] > 0
     # A pair absent from the aggregate entirely: 0.0 recent, blank all-history.
     assert by_sku.loc["GHOST", compute.EIGHT_WK_AVG_COL] == 0.0
-    assert pd.isna(by_sku.loc["GHOST", compute.ALL_HIST_AVG_COL])
+    assert pd.isna(by_sku.loc["GHOST", compute.ALL_TIME_AVG_COL])
 
 
 def test_attach_descriptive_averages_without_weeks_with_data():
@@ -376,7 +398,7 @@ def test_attach_descriptive_averages_without_weeks_with_data():
     )
     out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
     assert list(out.columns) == [
-        "SKU", "Customer Grouping", compute.ALL_HIST_AVG_COL, compute.EIGHT_WK_AVG_COL,
+        "SKU", "Customer Grouping", compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL,
     ]
 
 
@@ -388,10 +410,12 @@ def test_compute_by_customer_best_golden(raw, prices, monkeypatch):
     real call would return all-Nones and the golden would be vacuous.
 
     Two models are alternated across the groups on purpose. The 8-Week Moving
-    Average model reports only a space-spelled "8 Week POS/Orders Average" while
-    Holt's reports only an all-history one, so a mixed table exercises BOTH
-    branches of the descriptive-average merge (drop-the-space-spelled-column and
-    fillna-the-gaps) as well as the concat of summaries with differing columns.
+    Average model reports only an 8-week average while Holt's reports only an
+    all-time one, so a mixed table exercises both sides of the descriptive-average
+    merge (override-the-model-value and fill-the-gap) as well as the concat of
+    summaries with differing columns. It is also the case that matters most for
+    this change: before it, one column on this very table held Holt's cleansed
+    figure on some rows and the central observed figure on others.
     Alternation is by sorted-group index, not ``hash()``, which is salted per
     process and would make the golden non-reproducible.
     """
@@ -452,7 +476,7 @@ def _descriptive_averages_reference(agg_by_group, today_ts):
     eight_wk_start = last_complete_week - pd.Timedelta(weeks=7)
     hist_start = today_ts - pd.DateOffset(years=3)
 
-    from dashboard_app.compute import ALL_HIST_AVG_COL, EIGHT_WK_AVG_COL
+    from dashboard_app.compute import ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL
 
     A = agg_by_group.copy()
     A["SKU"] = A["SKU"].astype(str)
@@ -476,7 +500,7 @@ def _descriptive_averages_reference(agg_by_group, today_ts):
                          out_col: round(vals.sum() / max(weeks_span, 1), 1)})
         return pd.DataFrame(rows, columns=["Customer Grouping", "SKU", out_col])
 
-    return _avg(hist_start, ALL_HIST_AVG_COL).merge(
+    return _avg(hist_start, ALL_TIME_AVG_COL).merge(
         _avg(eight_wk_start, EIGHT_WK_AVG_COL),
         on=["Customer Grouping", "SKU"], how="outer",
     )

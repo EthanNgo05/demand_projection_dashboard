@@ -53,7 +53,7 @@ def frames():
         "summary": pd.DataFrame({
             "SKU": ["A-1", "B-2"],
             "Description": ["Widget", "Gadget"],
-            "8 Week POS/Orders Average": [12.5, 0.0],
+            "8-Week POS/Orders Average": [12.5, 0.0],
             "Updated Projection Average": [13.0, np.nan],
             "Weeks with data": [26, 3],
             "Top Volume Customer Groups": ["AMAZON-DC (80%)", None],
