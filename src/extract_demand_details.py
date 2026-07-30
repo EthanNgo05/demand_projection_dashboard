@@ -102,6 +102,19 @@ REQUIRED_SQL_COLUMNS = (
 COL_SKU = SQL_TO_POWERBI_FORMAT["DisplaySKU"]
 COL_CUST = SQL_TO_POWERBI_FORMAT["Custnmbr"]
 
+# Output columns that carry text/dates rather than measures. Everything else in
+# SQL_TO_POWERBI_FORMAT is a numeric measure, derived rather than hand-listed so a
+# column added to the map is classified automatically.
+TEXT_COLUMNS = (
+    SQL_TO_POWERBI_FORMAT["DisplaySKU"],
+    SQL_TO_POWERBI_FORMAT["LongName"],
+    SQL_TO_POWERBI_FORMAT["Custnmbr"],
+    SQL_TO_POWERBI_FORMAT["WeekDate"],
+)
+NUMERIC_COLUMNS = tuple(
+    c for c in SQL_TO_POWERBI_FORMAT.values() if c not in TEXT_COLUMNS
+)
+
 # Written into the top banner cell so the file self-documents its filters,
 # mirroring the "Applied filters:" note the real PowerBI export carries.
 FILTER_BANNER = (
@@ -285,12 +298,51 @@ def run_query(sql: str, conn: pyodbc.Connection) -> pd.DataFrame:
     return pd.DataFrame.from_records([tuple(r) for r in rows], columns=columns)
 
 
+def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Force every measure column to float64, in place on a copy.
+
+    pyodbc hands back ``decimal.Decimal`` for SQL ``decimal``/``numeric`` columns,
+    and ``pd.DataFrame.from_records`` stores those as **object** dtype. That broke
+    the Parquet sidecar on every single run — pyarrow refuses to convert
+    ``Decimal`` to double, so ``write_parquet_sidecar`` logged
+    "Could not convert Decimal('24.00000000') ... for column Sum of Quantity"
+    and gave up, leaving the app to re-parse the 34 MB workbook instead (66s vs
+    0.15s). The ``.xlsx`` write never noticed because openpyxl serialises Decimal
+    as a plain number.
+
+    Normalising here rather than in ``write_parquet_sidecar`` fixes it at the
+    source, which also matters on the ``--incremental`` path: the previous
+    snapshot's half arrives as float64 and the fresh SQL half as object, so
+    ``merge_snapshots``' ``pd.concat`` produced an object column too.
+
+    ``errors="coerce"`` keeps a surprise non-numeric value from failing the whole
+    pull, but a value silently becoming NaN would be data loss, so any growth in
+    the null count is logged.
+    """
+    out = df.copy()
+    for col in NUMERIC_COLUMNS:
+        if col not in out.columns:
+            continue
+        before = int(out[col].isna().sum())
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+        lost = int(out[col].isna().sum()) - before
+        if lost > 0:
+            log.warning(
+                "Column %r: %d non-numeric value(s) could not be converted and "
+                "became NaN. Check the SQL's type for this column.", col, lost,
+            )
+    return out
+
+
 def select_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     """Validate required columns, then keep+rename to the PowerBI schema.
 
     Raises if a required column is missing (never ship a silently-malformed
     workbook). Logs any expected-but-absent optional columns and any unmapped
     columns that get dropped, so column changes in the SQL are visible.
+
+    Measure columns are normalised to float64 on the way out — see
+    ``coerce_numeric_columns`` for why that is load-bearing.
     """
     missing = [c for c in REQUIRED_SQL_COLUMNS if c not in df.columns]
     if missing:
@@ -312,7 +364,7 @@ def select_and_rename(df: pd.DataFrame) -> pd.DataFrame:
         log.info("Dropping %d unmapped SQL column(s): %s", len(dropped), dropped)
 
     keep = [c for c in SQL_TO_POWERBI_FORMAT if c in df.columns]
-    return df[keep].rename(columns=SQL_TO_POWERBI_FORMAT)
+    return coerce_numeric_columns(df[keep].rename(columns=SQL_TO_POWERBI_FORMAT))
 
 
 def load_demand_details(
@@ -394,8 +446,37 @@ def find_previous_snapshot(folder: str) -> str | None:
     return max(dated)[1]
 
 
+def _read_snapshot_frame(xlsx_path: str) -> pd.DataFrame:
+    """Read a snapshot, preferring its Parquet sidecar when it is current.
+
+    Mirrors the rule ``agent.data_io.read_raw_frame`` uses: the sidecar wins when
+    it exists and is at least as new as the workbook (``>=``, so an equal mtime
+    still counts), otherwise the workbook is parsed. Any sidecar problem — absent,
+    stale, corrupt, no Parquet engine — falls through to the ``.xlsx``, which
+    stays the source of truth.
+
+    Worth ~66s per ``--incremental`` run on the current 34 MB snapshot (0.15s vs
+    66s), which was most of the reason a "fast" incremental pull took ~4 minutes.
+    """
+    sidecar = parquet_sidecar_path(xlsx_path)
+    try:
+        if os.path.exists(sidecar) and (
+            not os.path.exists(xlsx_path)
+            or os.path.getmtime(sidecar) >= os.path.getmtime(xlsx_path)
+        ):
+            df = pd.read_parquet(sidecar)
+            log.info("Previous snapshot read from Parquet sidecar %s",
+                     os.path.basename(sidecar))
+            return df
+    except Exception as exc:  # corrupt sidecar / missing engine -> use the xlsx
+        log.warning("Could not read Parquet sidecar %s (%s); using the workbook.",
+                    sidecar, exc)
+    log.info("Previous snapshot read from workbook %s", os.path.basename(xlsx_path))
+    return pd.read_excel(xlsx_path, header=2)
+
+
 def load_previous_snapshot(path: str) -> pd.DataFrame | None:
-    """Read a snapshot workbook for merging, or None if it's unusable.
+    """Read a snapshot for merging, or None if it's unusable.
 
     Any failure — unreadable file, missing required columns, unparseable
     WeekDate — returns None (logged) so the caller falls back to a full pull
@@ -403,7 +484,7 @@ def load_previous_snapshot(path: str) -> pd.DataFrame | None:
     """
     required = [SQL_TO_POWERBI_FORMAT[c] for c in REQUIRED_SQL_COLUMNS]
     try:
-        df = pd.read_excel(path, header=2)
+        df = _read_snapshot_frame(path)
         missing = [c for c in required if c not in df.columns]
         if missing:
             log.warning(
@@ -503,6 +584,32 @@ def parquet_sidecar_path(xlsx_path: str) -> str:
     return root + ".parquet"
 
 
+def _blank_text_to_na(df: pd.DataFrame) -> pd.DataFrame:
+    """Empty strings -> NaN in the text columns, matching an xlsx round-trip.
+
+    ``read_raw_frame`` treats the sidecar and the workbook as interchangeable, so
+    the sidecar has to hold what ``pd.read_excel(path, header=2)`` would return.
+    Excel writes a zero-length string as an **empty cell**, which reads back as
+    NaN — so without this a blank Description would be ``''`` via the sidecar and
+    ``NaN`` via the workbook, and `_clean`'s ``astype(str)`` would turn the latter
+    into the string "nan".
+
+    Deliberately applied ONLY when building the sidecar, never to the frame that
+    feeds ``write_powerbi_xlsx``: ``_apply_output_filters`` drops rows on
+    ``df[COL_CUST].notna()``, so masking an empty-string Custnmbr upstream would
+    start dropping rows that ship today. That would be a data change, not a
+    bug fix. Keeping it here leaves the workbook and the row set untouched.
+    """
+    out = df.copy()
+    for col in TEXT_COLUMNS:
+        if col == SQL_TO_POWERBI_FORMAT["WeekDate"] or col not in out.columns:
+            continue
+        blank = out[col].astype("string").str.len() == 0
+        if blank.any():
+            out[col] = out[col].mask(blank.fillna(False))
+    return out
+
+
 def write_parquet_sidecar(df: pd.DataFrame, xlsx_path: str) -> str | None:
     """Write ``df`` as a ``.parquet`` sidecar next to ``xlsx_path``, atomically.
 
@@ -510,6 +617,24 @@ def write_parquet_sidecar(df: pd.DataFrame, xlsx_path: str) -> str | None:
     and swallowed — the ``.xlsx`` is the source of truth and the app falls back
     to it. Same temp-file + atomic-replace dance as ``write_powerbi_xlsx`` so a
     reader never sees a half-written sidecar. Returns the path written, or None.
+
+    ``read_raw_frame`` serves the sidecar and the workbook interchangeably, so the
+    two have to agree. The frame is normalised to what an xlsx round-trip yields
+    first (see ``_blank_text_to_na``; numeric dtypes are handled upstream by
+    ``coerce_numeric_columns``). Two differences remain, both value-preserving and
+    both pinned by tests/test_parquet_sidecar.py:
+
+    * **Precision.** Excel stores only ~15 significant digits, so a value needing
+      more keeps full float64 precision here but is truncated in the workbook.
+      The sidecar is therefore marginally MORE accurate. Reaching this needs a
+      measure above 1e8 carrying 8 decimal places, and it cannot surface — every
+      consumer rounds to one decimal place.
+    * **Integer inference.** ``pd.read_excel`` returns int64 for a measure column
+      that happens to hold only whole numbers with no nulls, and float64
+      otherwise, so a workbook's dtypes shift between snapshots. The sidecar is
+      always float64. Values are identical either way, and the columns `_clean`
+      actually consumes (POS / Orders / Projection) always carry nulls in real
+      data, so they are float64 from both sources regardless.
     """
     out_path = parquet_sidecar_path(xlsx_path)
     out_dir = os.path.dirname(os.path.abspath(out_path))
@@ -517,7 +642,7 @@ def write_parquet_sidecar(df: pd.DataFrame, xlsx_path: str) -> str | None:
     fd, tmp = tempfile.mkstemp(suffix=".parquet", dir=out_dir)
     os.close(fd)
     try:
-        df.to_parquet(tmp, index=False)
+        _blank_text_to_na(df).to_parquet(tmp, index=False)
         _replace_with_retry(tmp, out_path)
         return out_path
     except Exception as exc:  # engine missing / write error — xlsx still stands
