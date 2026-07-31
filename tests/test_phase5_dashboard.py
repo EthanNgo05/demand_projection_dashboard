@@ -332,6 +332,7 @@ def test_quick_detail_card_renders_its_kpis_as_tiles():
     row contributes, opening a card must add the card's own fields on top.
     """
     import dashboard
+    from dashboard_app.config import PRICE_COL as PRICE_COL_LABEL
 
     at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
     assert not at.exception
@@ -357,6 +358,17 @@ def test_quick_detail_card_renders_its_kpis_as_tiles():
     assert after.count("Data Source") == 1, (
         f"Data Source rendered {after.count('Data Source')} times: {after}"
     )
+    # The rendered tiles really are in KPI_ORDER — including the DERIVED ones. Sorting
+    # only the column-backed tiles left "Projected Revenue" stranded at the end of the
+    # grid, away from the List Price and Revenue Risk it is read against.
+    from dashboard_app.config import kpi_sort
+
+    assert added == kpi_sort(added), (
+        f"card tiles are not in canonical order:\n  got      {added}\n"
+        f"  expected {kpi_sort(added)}"
+    )
+    if "Projected Revenue" in added and PRICE_COL_LABEL in added:
+        assert added.index("Projected Revenue") > added.index(PRICE_COL_LABEL)
     # The retired chart-side labels must not come back alongside the column names.
     for retired in ("Current Forecast (avg/wk)", "Updated Forecast (avg/wk)",
                     "Projection Difference (avg/wk)"):

@@ -469,7 +469,7 @@ def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, per_row=4):
     """
     deltas = deltas or {}
     tiles = []
-    for c in kpi_sort(cols):
+    for c in cols:
         fn = deltas.get(c)
         tiles.append((
             c, _tile_value(c, row[c]), fn(row) if fn else None, KPI_HELP.get(c),
@@ -479,6 +479,12 @@ def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, per_row=4):
         tiles.extend(extra(row))
     if not tiles:
         return
+    # Order AFTER folding in the extras, not before: a derived tile is a KPI like any
+    # other and belongs in its canonical slot. Sorting only the column-backed tiles
+    # left Projected Revenue stranded at the end of the grid, away from List Price and
+    # Revenue Risk — the two figures it is read against.
+    order = {label: i for i, label in enumerate(kpi_sort([t[0] for t in tiles]))}
+    tiles.sort(key=lambda t: order[t[0]])
 
     for start in range(0, len(tiles), per_row):
         chunk = tiles[start:start + per_row]

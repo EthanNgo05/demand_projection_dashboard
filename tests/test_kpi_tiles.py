@@ -85,6 +85,23 @@ def test_kpi_sort_keeps_unknown_fields_last_and_stable():
     assert out[2:] == ["zzz-custom", "aaa-custom"]
 
 
+def test_derived_tile_labels_have_a_canonical_slot():
+    """"Projected Revenue" must sort in with the money tiles, not to the end.
+
+    It is derived (price × forecast) rather than read off the row, and the first cut
+    of ``_render_kpi_tiles`` sorted only the column-backed tiles before appending the
+    derived ones — which stranded it at the very end of the grid, away from List Price
+    and Revenue Risk, the two figures it is read against. This pins the label's place
+    in the order; that the RENDERER actually applies it is asserted against real
+    rendered metrics by test_phase5_dashboard's detail-card test.
+    """
+    cols = ["Customer Grouping", PRICE_COL, RISK_COL, ONHAND_COL, WOS_COL]
+    assert kpi_sort(cols + ["Projected Revenue"]) == [
+        "Customer Grouping", PRICE_COL, RISK_COL, "Projected Revenue",
+        ONHAND_COL, WOS_COL,
+    ]
+
+
 def test_identity_fields_are_text_not_stat_tiles():
     """Long identity values must not render as big tabular numbers.
 
