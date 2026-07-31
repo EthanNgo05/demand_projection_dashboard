@@ -4,7 +4,10 @@ import re
 import pandas as pd
 import streamlit as st
 
-from dashboard_app.config import MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar
+from dashboard_app.config import (
+    MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar,
+    KPI_HELP, KPI_TEXT_FIELDS, ONHAND_COL, TREND_COL, WOS_COL, kpi_sort,
+)
 from dashboard_app.watchlist import (
     STAR_PREFIX, active_pairs, mark_starred_sku, starred_mask,
 )
@@ -22,12 +25,16 @@ def style_summary(summary_df):
     ] if c in df.columns]
     fmt = {c: "{:,.0f}" for c in int_cols}
     # Format every descriptive-average column to one decimal. Single-group views
-    # carry one; the Optimal Projections combined view carries two (All-History
+    # carry one; the Optimal Projections combined view carries two (All-Time
     # and 8-Week POS/Orders Average). The Exceptions view stores its 8-week
     # average as a whole number (integer dtype) so it ties out with Projection
     # Difference / Revenue Risk — render those without a spurious decimal.
+    #
+    # Substring, not suffix: the view-total table qualifies its column
+    # "... POS/Orders Average (model fit)" (see dashboard._render_quick_view), and
+    # that one must format identically. No other column carries the phrase.
     for c in df.columns:
-        if c.endswith("POS/Orders Average") and pd.api.types.is_numeric_dtype(df[c]):
+        if "POS/Orders Average" in c and pd.api.types.is_numeric_dtype(df[c]):
             fmt[c] = "{:,.0f}" if pd.api.types.is_integer_dtype(df[c]) else "{:,.1f}"
     # The Exceptions view's signed percent deviation: two decimals when the value
     # has a fractional part, a whole number when it doesn't, always suffixed "%".
@@ -402,6 +409,13 @@ def _fmt_detail_value(col, val):
         return fmt_dollar(val, decimals=0)
     if col == "% Deviation":
         return f"{int(val):,}%" if val == int(val) else f"{val:,.2f}%"
+    if col == TREND_COL:
+        # Signed, so "is this growing or dying" reads without hunting for a colour.
+        return f"{val:+,.1f}%"
+    if col == ONHAND_COL:
+        return f"{val:,.0f}"
+    if col in (WOS_COL, "Container Impact"):
+        return f"{val:,.1f}"
     int_cols = {
         "Weeks with data", "Current Projection Average",
         "Updated Projection Average", "Projection Difference",
@@ -413,40 +427,137 @@ def _fmt_detail_value(col, val):
     return str(val)
 
 
-def _dismiss_card(dismissed_key, label):
-    """Callback: mark a card's row-label dismissed so its detail card closes in
-    place (runs before the rerun, so the card is gone on the next render)."""
-    st.session_state.setdefault(dismissed_key, set()).add(label)
+def _tile_value(col, val):
+    """``_fmt_detail_value`` plus the one KPI whose blank carries meaning.
+
+    A blank trend is not "no data" — it means the earlier 8-week window had no
+    sales, so there is no baseline to measure against. "New" says that; "—" would
+    read as missing. Every other column keeps the shared "—" for NaN.
+    """
+    if col == TREND_COL and pd.isna(val):
+        return "New"
+    return _fmt_detail_value(col, val)
+
+
+def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, per_row=4):
+    """Render a detail card's KPIs as the same shaded tiles the KPI row uses.
+
+    Every card in the app funnels through here, which is the point: KPIs used to be
+    flat ``**Label**\\n\\nvalue`` markdown in this card, shaded ``st.metric`` tiles
+    beside the projections chart, and a hand-rolled coloured ``<span>`` in the
+    Exceptions card — three treatments for one kind of thing. Emitting ``st.metric``
+    means the tiles inherit the existing ``[data-testid="stMetric"]`` styling in
+    dashboard.py's stylesheet, so they match *by construction* rather than by a
+    second copy of the CSS that can drift.
+
+    ``cols`` is the field set; ``config.kpi_sort`` decides the order, so a field
+    lands in the same position no matter which view opened the card.
+
+    Two optional hooks, both bound per view via ``functools.partial``:
+
+    * ``extra``: ``callable(row) -> [(label, value, delta, help, kind), ...]`` for KPIs
+      that are derived rather than columns (e.g. Projected Revenue = price ×
+      forecast), appended after the column-backed tiles.
+    * ``deltas``: ``{column: callable(row) -> str | None}`` to hang a secondary
+      figure under an EXISTING tile — the small green/red line ``st.metric`` renders
+      below the value. Used for the percentage under Projection Difference, which has
+      to modify a tile rather than add one.
+
+    Each tile row is wrapped in a keyed container so the stylesheet can equalise
+    heights within the row — otherwise a value that wraps to three lines (a long
+    model name) leaves its neighbours short and the grid reads ragged.
+    """
+    deltas = deltas or {}
+    tiles = []
+    for c in cols:
+        fn = deltas.get(c)
+        tiles.append((
+            c, _tile_value(c, row[c]), fn(row) if fn else None, KPI_HELP.get(c),
+            "text" if c in KPI_TEXT_FIELDS else "stat",
+        ))
+    if extra is not None:
+        tiles.extend(extra(row))
+    if not tiles:
+        return
+    # Order AFTER folding in the extras, not before: a derived tile is a KPI like any
+    # other and belongs in its canonical slot. Sorting only the column-backed tiles
+    # left Projected Revenue stranded at the end of the grid, away from List Price and
+    # Revenue Risk — the two figures it is read against.
+    order = {label: i for i, label in enumerate(kpi_sort([t[0] for t in tiles]))}
+    tiles.sort(key=lambda t: order[t[0]])
+
+    for start in range(0, len(tiles), per_row):
+        chunk = tiles[start:start + per_row]
+        # Pad the final row so a lone trailing tile stays column-width instead of
+        # stretching across the card.
+        with st.container(key=f"kpitiles-{card_key}-{start}"):
+            slots = st.columns(per_row)
+            for slot, (label, value, delta, help_txt, kind) in zip(slots, chunk):
+                if kind == "text":
+                    # Keyed wrapper -> CSS can size identity values as captions
+                    # rather than headlines ("Holt-Winters (triple) exponential
+                    # smoothing" is not a number and must not look like one).
+                    slug = re.sub(r"[^0-9A-Za-z]+", "-", str(label)).strip("-")
+                    with slot.container(key=f"kpitile-text-{card_key}-{start}-{slug}"):
+                        st.metric(label, value, help=help_txt)
+                else:
+                    slot.metric(label, value, delta=delta, help=help_txt)
+
+
+def _dismiss_card(sel_key, pos):
+    """Callback: deselect this card's table row so the card closes AND its
+    table checkbox clears together (runs before the rerun, so both are gone on
+    the next render). Streamlit 1.58+ lets us set st.dataframe row selection
+    through Session State (see the DataframeState docstring in
+    streamlit/elements/arrow.py)."""
+    state = st.session_state.get(sel_key)
+    current = []
+    if state and "selection" in state:
+        current = list(state["selection"].get("rows", []))
+    st.session_state[sel_key] = {"selection": {"rows": [r for r in current if r != pos]}}
 
 
 def _render_row_detail(row, shown, detail_chart=None, key_base=None,
-                       dismissed_key=None, close_label=None, card_cols=None,
-                       row_action=None):
+                       sel_key=None, close_label=None, close_pos=None, card_cols=None,
+                       row_action=None, title_col="SKU", extra_kpis=None,
+                       kpi_deltas=None):
     """Render a row's full detail in a bordered card beneath the table.
 
-    ``card_cols`` (if given) is the explicit, ordered list of fields to show in the
-    card, decoupled from the frame's full column set (which the condensed table,
-    sorting, and the Excel download still need). Without it the card falls back to
-    listing EVERY non-hidden field, so other callers keep their behaviour. ``shown``
-    is kept for signature stability but no longer hides columns. When ``detail_chart``
-    is given it is called with ``(row, key_base)`` to draw a chart below the fields.
-    A ✕ button (top-right) dismisses the card via ``dismissed_key``/``close_label``
-    so the user can close it without scrolling the table back up to deselect.
+    Layout is the same for every view: the card's KPIs as one shaded tile grid
+    (``_render_kpi_tiles``), then the chart full-width beneath. The projections card
+    used to split into chart-left / metrics-right, which meant its KPIs lived in two
+    places at once — the grid here AND that column — with ``Data Source`` in both.
+
+    ``card_cols`` (if given) is the set of fields to show in the card, decoupled from
+    the frame's full column set (which the condensed table, sorting, and the Excel
+    download still need); ``config.kpi_sort`` orders them, so the list is a set, not
+    a sequence. Without it the card falls back to listing EVERY non-hidden field, so
+    other callers keep their behaviour. ``shown`` is kept for signature stability but
+    no longer hides columns. ``extra_kpis`` is passed straight to
+    ``_render_kpi_tiles`` for KPIs derived rather than read off the row. When
+    ``detail_chart`` is given it is called with ``(row, key_base)`` to draw a chart
+    below the tiles.
+    A ✕ button (top-right) closes the card by deselecting its table row via
+    ``sel_key``/``close_pos`` (so the row's checkbox clears too, matching an
+    in-table deselect), letting the user close it without scrolling back up.
     ``row_action`` (if given) is a ``{label, help, danger, callback}`` dict rendered
     as a button at the bottom of the card; clicking it calls ``callback(row)`` (the
     callback owns any rerun — e.g. by opening a confirmation dialog)."""
-    # SKU and Description live in the card title, so they're dropped from the grid;
-    # the remaining columns start with Customer Grouping, which fills the first slot.
+    # The title-bearing column (``title_col``, default SKU) and Description live in
+    # the card title, so they're dropped from the grid; the remaining columns start
+    # with the first stat. At a rolled-up grain ``title_col`` is the group key
+    # (e.g. Customer Grouping / Region) so it isn't repeated as a grid cell.
+    _title_drop = {"SKU", "Description", title_col}
     if card_cols is not None:
         detail_cols = [
             c for c in card_cols
-            if c in row.index and c not in ("SKU", "Description")
+            if c in row.index and c not in _title_drop
             and not str(c).startswith("_")
         ]
     else:
         detail_cols = [
             c for c in row.index
-            if c not in ("SKU", "Description") and not str(c).startswith("_")
+            if c not in _title_drop and not str(c).startswith("_")
         ]
     # "Note" reads as a sentence, not a stat — peel it out of the 3-per-row grid and
     # render it full-width at the bottom (only when it carries text), so the grid's
@@ -464,21 +575,17 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
     # Keyed so the scoped CSS in render_selectable_table can tint + space each card.
     card_key = re.sub(r"[^0-9A-Za-z_-]+", "-", f"detailcard-{key_base}-{close_label}")
     with st.container(border=True, key=card_key):
-        title_col, x_col = st.columns([12, 1])
-        sku_txt = f"{star}{row.get('SKU', '')}"
-        title = f"**{sku_txt}** — {desc}" if desc else f"**{sku_txt}**"
-        title_col.markdown(title)
-        if dismissed_key is not None and close_label is not None:
+        title_c, x_col = st.columns([12, 1])
+        title_txt = f"{star}{row.get(title_col, '')}"
+        title = f"**{title_txt}** — {desc}" if desc else f"**{title_txt}**"
+        title_c.markdown(title)
+        if sel_key is not None and close_pos is not None:
             x_col.button(
                 "✕", key=f"{key_base}__close__{close_label}", help="Close this card",
-                on_click=_dismiss_card, args=(dismissed_key, close_label),
+                on_click=_dismiss_card, args=(sel_key, close_pos),
             )
-        per_row = 3
-        for start in range(0, len(detail_cols), per_row):
-            chunk = detail_cols[start:start + per_row]
-            cols = st.columns(per_row)
-            for i, c in enumerate(chunk):
-                cols[i].markdown(f"**{c}**\n\n{_fmt_detail_value(c, row[c])}")
+        _render_kpi_tiles(row, detail_cols, card_key, extra=extra_kpis,
+                          deltas=kpi_deltas)
         if show_note:
             st.markdown(f"**Note**\n\n{_fmt_detail_value('Note', note_val)}")
         if detail_chart is not None:
@@ -504,7 +611,8 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
 @st.fragment
 def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
                             column_config=None, detail_chart=None, detail_cols=None,
-                            row_action=None):
+                            row_action=None, title_col="SKU", extra_kpis=None,
+                            kpi_deltas=None):
     """Like render_filtered_table, but shows only ``condensed_cols`` per row and
     reveals the full row in a detail card below when a row is clicked.
 
@@ -518,7 +626,9 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
     (display only — filtering and the detail lookup use the un-prefixed frame).
     ``row_action`` is forwarded to each detail card (see ``_render_row_detail``) so
-    callers can add a per-row button (e.g. the watchlist's "Remove" affordance).
+    callers can add a per-row button (e.g. the watchlist's "Remove" affordance), and
+    ``extra_kpis`` / ``kpi_deltas`` likewise for KPI tiles a view derives rather than
+    reads off the row.
     """
     filtered = filter_table(df, key, P)
     display_cols = [c for c in condensed_cols if c in filtered.columns]
@@ -533,17 +643,11 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     rows = event.selection.rows if event and event.selection else []
     rows = sorted(r for r in rows if r < len(filtered))
 
-    # Cards can be closed in place (✕) without deselecting the table row. Track the
-    # dismissed rows by their stable pandas index label (survives filtering, unlike
-    # the positional index). Prune to only still-selected rows so re-clicking a row
-    # reopens its card and a deselected row drops out of the dismissed set.
-    dismissed_key = f"{key}__dismissed"
-    selected_labels = {filtered.index[r] for r in rows}
-    dismissed = st.session_state.get(dismissed_key, set()) & selected_labels
-    st.session_state[dismissed_key] = dismissed
-
-    visible = [r for r in rows if filtered.index[r] not in dismissed]
-    if visible:
+    # The dataframe selection is the single source of truth: each selected row gets
+    # a card, and a card's ✕ deselects its row (see _dismiss_card) so closing a card
+    # and unchecking its row are the same action.
+    sel_key = f"{key}__sel"
+    if rows:
         # Tint + space each detail card so stacked cards read as separate panels
         # rather than one long card. Scoped to the cards' keyed wrappers; the
         # translucent gray works on either theme.
@@ -558,10 +662,12 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
             "</style>",
             unsafe_allow_html=True,
         )
-        for r in visible:
+        for r in rows:
             _render_row_detail(filtered.iloc[r], shown=display_cols,
                                detail_chart=detail_chart, key_base=key,
-                               dismissed_key=dismissed_key, close_label=filtered.index[r],
-                               card_cols=detail_cols, row_action=row_action)
+                               sel_key=sel_key, close_label=filtered.index[r],
+                               close_pos=r, card_cols=detail_cols,
+                               row_action=row_action, title_col=title_col,
+                               extra_kpis=extra_kpis, kpi_deltas=kpi_deltas)
     else:
         st.caption("Select one or more rows to see their full details.")

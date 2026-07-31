@@ -130,7 +130,7 @@ def _summary_df(n_rows):
             {
                 "SKU": f"SKU-{i + 1:03d}",
                 "Description": f"Widget {i + 1}",
-                "8 Week POS/Orders Average": recent,
+                "8-Week POS/Orders Average": recent,
                 "Updated Projection Average": projected,
                 "Weeks with data": 26,
             }

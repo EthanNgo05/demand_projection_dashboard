@@ -46,6 +46,12 @@ class AgentState(TypedDict, total=False):
     price_path: Optional[str]
     cleaned_df: Optional[pd.DataFrame]
     prices: Optional[pd.Series]
+    # Rows dropped by the pre-forecast exclusions (active-in + discontinued).
+    # Carried purely so agent.batch can rebuild the exact same persistent
+    # forecast-cache key the dashboard uses — the dashboard folds its own
+    # n_excluded_rows into that key, so without this the batch's warm entries
+    # would never be found. Not read by any forecasting node.
+    n_excluded_rows: Optional[int]
     results: dict[str, ModelResult]  # keyed by MODEL_OPTIONS label
     best_model: Optional[str]
     mase_confidence_threshold: Optional[float]  # per-run override; select falls back to config

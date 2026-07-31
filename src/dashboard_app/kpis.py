@@ -1,24 +1,51 @@
 """KPI row and the Optimal Projections (best-model-per-group) combined view."""
+import functools
+import re
+
 import pandas as pd
 import streamlit as st
 
 from dashboard_app.config import (
     PRICE_COL, RISK_COL, fmt_dollar, MODEL_USED_COL, BEST_MODEL_COMBINED_VIEW,
-    ALL_CUSTOMERS_VIEW,
+    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL, ONHAND_COL, WOS_COL, KPI_HELP,
 )
 from dashboard_app.summaries import (
-    resolve_avg_col, avg_window_phrase, historical_window, _format_generated_at,
+    resolve_avg_col, avg_window_phrase, historical_window,
+    historical_window_label, _format_generated_at, price_map_from_summary,
 )
 from dashboard_app.compute import (
     compute_by_customer_best, _agent_summaries_mtime, _agent_summaries_oldest_at,
-    summary_to_excel,
+    attach_supply_columns, summary_to_excel,
 )
 from dashboard_app.refresh import batch_in_progress
 from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart
-from dashboard_app.tables import render_filtered_table
+from dashboard_app.tables import render_selectable_table
+
+# The summary table's condensed row: the five columns a planner scans. Every
+# other field is one click away in the detail card, and the Excel download still
+# ships the full frame.
+BEST_MIX_CONDENSED_COLS = ["SKU", "Customer Grouping", EIGHT_WK_AVG_COL,
+                           "Current Projection Average", RISK_COL]
+# The KPI tiles on each detail card. A SET, not a sequence — config.kpi_sort orders
+# them, so a field sits in the same place here as on every other view's card.
+# Identifies which group's card this is (one SKU can have several open at once, one
+# per customer group), then everything the condensed row has no space for.
+#
+# Forecast/money fields used to render as st.metric in a column beside the chart
+# inside render_sku_detail_card; they are tiles here now, so the card has ONE KPI
+# zone instead of two. Projected Revenue is derived rather than a column and comes
+# from projection_kpi_extras.
+BEST_MIX_CARD_COLS = [
+    "Customer Grouping", MODEL_USED_COL, "Data Source",
+    "Weeks with data", ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL,
+    "Current Projection Average", "Updated Projection Average",
+    "Projection Difference",
+    PRICE_COL, RISK_COL,
+    ONHAND_COL, WOS_COL,
+]
 
 
-def _render_kpis(summary, agg, anchors, stacked=False):
+def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
     """Render the 7-metric KPI row shared by every view.
 
     Uses only ``summary`` + the SKU-week ``agg`` + the week ``anchors``. SKU
@@ -30,16 +57,22 @@ def _render_kpis(summary, agg, anchors, stacked=False):
     across a 7-column row, so they fit a narrow side column like the SKU/Customer
     detail charts. The trailing informational captions are shown only in the wide
     row layout.
+
+    ``avg_col`` names the descriptive-average column whose window label describes
+    ``anchors``, for the total-weekly-demand metric's label and help text. It has to
+    be passed explicitly by any caller whose ``summary`` carries BOTH averages
+    (``attach_descriptive_averages`` puts All-Time first, so the ``resolve_avg_col``
+    fallback would claim an all-time window even when ``anchors`` spans 8 weeks).
     """
     lb, lcw, ffw = anchors
     # Avg. weekly demand = the mean of the TOTAL weekly demand actually plotted
     # on the chart's "Actual demand" line (POS/Orders summed across SKUs per
     # week, then averaged over the weeks in the window). Do NOT sum the per-SKU
-    # "N Week POS/Orders Average" column here: that per-SKU average divides each
+    # "N-Week POS/Orders Average" column here: that per-SKU average divides each
     # SKU by its own weeks-with-data, so summing it counts a SKU that sold in
     # only a few weeks as if it sold every week and overstates the total.
     n_skus = int(summary["SKU"].nunique())
-    avg_col = resolve_avg_col(summary)
+    avg_col = avg_col or resolve_avg_col(summary)
     hist_demand = historical_window(agg, summary, (lb, lcw, ffw))
     weekly_totals = hist_demand.groupby("WeekDate")["demand"].sum(min_count=1)
     total_avg = float(weekly_totals.mean()) if not weekly_totals.empty else 0.0
@@ -75,11 +108,24 @@ def _render_kpis(summary, agg, anchors, stacked=False):
         "SKUs Forecasted", f"{n_skus:,}",
         help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
     )
+    # "Total Weekly Demand", not "Historical Demand": this is a VIEW TOTAL and is
+    # deliberately not the sum of the per-SKU average column (see the note above on
+    # why summing that column would overstate the total). Naming it after the total
+    # keeps it from being read as the same metric a table row shows.
+    #
+    # The window is in the LABEL, not just the help: it follows the selected model
+    # (8 weeks vs all history), so two runs of this row can show very different
+    # numbers under an otherwise identical caption.
+    window = historical_window_label(avg_col)
     k2.metric(
-        "Historical Demand (avg/wk)", f"{total_avg:,.0f}",
-        help=f"Mean of total weekly actual demand (POS/Orders) over the "
-             f"{avg_window_phrase(avg_col).lower()} window — the average of the "
-             f"chart's actual-demand line.",
+        f"Total Weekly Demand ({window} avg)", f"{total_avg:,.0f}",
+        help=f"Mean of TOTAL weekly actual demand (POS/Orders) summed across every "
+             f"SKU, over the {avg_window_phrase(avg_col).lower()} window — the "
+             f"average of the chart's actual-demand line, and the window the "
+             f"selected model fits on. Not the sum of the per-SKU "
+             f"'{window} POS/Orders Average' column below: that column divides each "
+             f"SKU by its own span, so summing it would count a SKU that only sold "
+             f"for part of the window as if it sold throughout.",
     )
     k3.metric(
         "Current Forecast (avg/wk)", f"{total_initial:,.0f}",
@@ -134,8 +180,135 @@ def _render_kpis(summary, agg, anchors, stacked=False):
             )
 
 
+def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors,
+                           pm, row, key_base, model_label=None, top_groups=None):
+    """Detail-card body for one (SKU, Customer Grouping) row of a summary table.
+
+    Shared by Optimized Projections and Quick Projections so the two views read
+    identically: a date-range picker + per-SKU chart, FULL WIDTH, scoped to the
+    single group on the clicked row.
+
+    This used to be a chart-left / metrics-right split, which put the card's KPIs in
+    two places at once — the tile grid ``_render_row_detail`` draws above, plus seven
+    ``st.metric`` calls here — with ``Data Source`` appearing in both. All seven now
+    live in that one grid (they read straight off ``row``; see ``QUICK_CARD_COLS`` /
+    ``BEST_MIX_CARD_COLS``), except ``Projected Revenue``, which is derived rather
+    than a column and comes through ``projected_revenue_kpi`` below. The chart gets
+    the whole card width as a result.
+
+    ``(row, key_base)`` sit where ``render_selectable_table``'s ``detail_chart``
+    contract passes them — positionally, and last of the required args. Callers
+    bind the leading five with functools.partial and the two trailing options **by
+    keyword**, so a positional ``row`` can never land in ``model_label``.
+
+    Two per-view differences are parameters:
+
+    * ``model_label`` names the model behind the row for views whose table has no
+      ``MODEL_USED_COL`` (Quick Projections fits one chosen model for the whole
+      view). Optimized leaves it None and the column on the row wins.
+    * ``top_groups`` maps ``str(SKU)`` -> the SKU's top-volume customer-group
+      breakdown. Only the combined and region-rollup Quick views have one (it
+      comes from ``compute_view``'s ``breakdown_df``, which the per-group fits
+      never pass), and it is a whole-view figure, not this group's share — the
+      caption says so.
+
+    The card computes no weekly-demand average of its own. Both averages are already
+    on the row and rendered as tiles, so recomputing one here only created a second
+    number that disagreed with the column beside it — same window, but dividing by
+    weeks that had a row instead of the SKU's full span.
+    """
+    sku = str(row["SKU"])
+    group = str(row["Customer Grouping"])
+    _, lcw, _ = anchors
+    # Per-card widget keys: several cards (same SKU, different groups) can be
+    # open at once, each with its own independent range picker and chart.
+    key = re.sub(r"[^0-9A-Za-z_]+", "_", f"{key_base}__sku__{sku}__{group}")
+
+    # The group's frames, NOT pre-filtered to this SKU: sku_chart filters by SKU
+    # internally, and chart_range_control's history floor then matches what the
+    # old section showed when a single customer group was picked.
+    sku_agg = agg_by_group[agg_by_group["Customer Grouping"].astype(str) == group]
+    sku_weekly = weekly_by_group[
+        weekly_by_group["Customer Grouping"].astype(str) == group
+    ]
+    if sku_agg.empty or sku_weekly.empty:
+        st.caption("No weekly data for this SKU / customer group.")
+        return
+
+    desc = row["Description"] if isinstance(row.get("Description"), str) else ""
+    # One row → exactly one source (the old section's "(mixed)" case can't arise).
+    source = row["Data Source"] if isinstance(row.get("Data Source"), str) else "POS"
+
+    sku_range = chart_range_control(sku_agg, sku_weekly, lcw, key=key)
+    st.plotly_chart(
+        sku_chart(sku, desc, source, sku_agg, sku_weekly, chart_anchors,
+                  date_range=sku_range, prices=pm),
+        width="stretch", key=f"{key}_plot",
+    )
+    # The row's own model wins when the table carries one (Optimized); else the
+    # caller's single-model label, and if neither, just name the group.
+    model = row[MODEL_USED_COL] if MODEL_USED_COL in row.index else model_label
+    st.caption(
+        f"Customer group **{group}** — forecast with {model}."
+        if model else f"Customer group **{group}**."
+    )
+    if top_groups:
+        breakdown = top_groups.get(sku)
+        if breakdown:
+            st.markdown("**Top Volume Groups**")
+            st.caption(breakdown)
+            st.caption(
+                ":gray[Across all customer groups in this view, not this "
+                "group's share.]"
+            )
+
+
+def projection_kpi_extras(row):
+    """Derived KPI tiles for a projections-table row (the ``extra_kpis`` contract).
+
+    Two things the row's own columns can't express:
+
+    * **Projected Revenue** — list price × this row's updated weekly forecast. Every
+      other money figure is a column; this one is a product of two, so it has to be
+      computed at render time. It matches the page-top KPI of the same name, which is
+      this summed over the view.
+    * **% Deviation on Projection Difference** — the unit gap is meaningless without
+      its base (−4 is nothing on 2,000 and fatal on 20), so the gap's tile gets the
+      percentage in ``st.metric``'s delta slot, coloured by direction. The page-top
+      KPI row already does exactly this; the per-row card did not.
+
+    Returns ``[]`` when list prices aren't loaded — the same graceful degradation the
+    Revenue Risk column has, rather than a tile reading "—" for every row.
+    """
+    tiles = []
+    price = row[PRICE_COL] if PRICE_COL in row.index else None
+    price = None if price is None or pd.isna(price) else price
+    updated = row.get("Updated Projection Average")
+    if price is not None and pd.notna(updated):
+        tiles.append((
+            "Projected Revenue", fmt_dollar(price * updated), None,
+            KPI_HELP.get("Projected Revenue"), "stat",
+        ))
+    return tiles
+
+
+def projection_difference_delta(row):
+    """``Projection Difference`` as a percent of the current projection, or None.
+
+    None (rather than "0.0%") when the current projection is 0 or missing: there is
+    no base to be a percentage of, and showing 0% would imply agreement where there
+    is actually no plan to agree with.
+    """
+    pdiff = row.get("Projection Difference")
+    current = row.get("Current Projection Average")
+    if pd.isna(pdiff) or pd.isna(current) or not current:
+        return None
+    return f"{pdiff / current * 100:+.1f}%"
+
+
 def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows,
-                                anchors, P=None):
+                                anchors, P=None, data_sig=None,
+                                onhand_by_sku=None):
     """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
 
     Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
@@ -171,6 +344,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
                 )
             result = compute_by_customer_best(
                 df, today_ts, prices, min_weeks=None, progress_cb=_bump,
+                data_sig=data_sig,
             )
             prog.progress(1.0, text="Done")
         finally:
@@ -187,6 +361,10 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded = (
         result if result is not None else (None, None, None, None, None, [])
     )
+    # On Hand / Weeks of Supply for the detail cards. Attached here, outside the
+    # session-cached result, because On Hand comes from a separately loaded map
+    # rather than from the fit (see attach_supply_columns).
+    combined = attach_supply_columns(combined, onhand_by_sku)
 
     # Freshness caption. While a batch is rewriting summaries, the table mixes
     # freshly-recomputed and prior-run recommendations, so say so plainly rather
@@ -238,6 +416,9 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
 
     _, lcw, ffw = anchors
     view_label = "Optimized Projections"
+    # SKU->list-price map for the charts' "vs plan" revenue-difference hover
+    # (empty when list prices weren't loaded → plain hovers).
+    pm = price_map_from_summary(combined)
 
     # Chart-only anchors: the passed-in `anchors` come from the sidebar model's
     # week_anchors, whose lookback start (lb) is as short as 8 weeks (8-Week
@@ -248,11 +429,20 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     chart_lb = pd.to_datetime(agg_all["WeekDate"]).min()
     chart_anchors = (chart_lb, lcw, ffw)
 
+    # Window label for the total-weekly-demand KPI. It has to describe `anchors`,
+    # which come from the SIDEBAR model's week_anchors — NOT from `combined`, which
+    # carries both averages, so _render_kpis' resolve_avg_col fallback would pick
+    # All-Time and mislabel an 8-week window.
+    anchors_avg_col = (
+        getattr(P, "AVG_COL_LABEL", EIGHT_WK_AVG_COL)
+        if P is not None else None
+    )
+
     # ----- KPIs -------------------------------------------------------------
     # Same seven metrics as every other view. The combined frame carries one row
     # per (SKU, Customer Grouping); _render_kpis counts distinct SKUs and the
     # forecast/risk totals sum naturally across a SKU's groups.
-    _render_kpis(combined, agg_all, anchors)
+    _render_kpis(combined, agg_all, anchors, avg_col=anchors_avg_col)
 
     # ----- Aggregate chart --------------------------------------------------
     # Total actual demand + total forecast, summed across every group. Actuals
@@ -263,7 +453,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         agg_range = chart_range_control(agg_all, weekly_all, lcw, key="range_agg_best")
     st.plotly_chart(
         aggregate_chart(agg_all, combined, weekly_all, chart_anchors, view_label,
-                        date_range=agg_range),
+                        date_range=agg_range, prices=pm),
         width="stretch",
     )
     st.caption(
@@ -290,7 +480,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
             aggregate_chart(
                 agg_c, summary_c, wk_c,
                 (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw),
-                customer, date_range=cust_range,
+                customer, date_range=cust_range, prices=pm,
             ),
             width="stretch",
         )
@@ -299,108 +489,8 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         # and stacked to fit the side column (like the SKU detail chart). Use the
         # section's original `anchors` (not the widened chart range) so the
         # historical-demand window lines up with the combined KPI row.
-        _render_kpis(summary_c, agg_c, anchors, stacked=True)
-
-    # ----- Per-SKU detail ---------------------------------------------------
-    st.markdown("### SKU detail")
-    c_sku, c_cust = st.columns(2)
-    with c_sku:
-        skus = sorted(combined["SKU"].astype(str).unique())
-        sku = st.selectbox("SKU", skus, help="Type to search", key="best_sku")
-    sku_rows_all = combined[combined["SKU"].astype(str) == sku]
-    # Customer-group filter: default keeps the combined total across every group
-    # carrying this SKU (the original behaviour); pick a group to narrow the chart
-    # and metrics to just that group. Options depend on the selected SKU.
-    sku_groups = sorted(sku_rows_all["Customer Grouping"].astype(str).unique())
-    with c_cust:
-        cust_pick = st.selectbox(
-            "Customer group", [ALL_CUSTOMERS_VIEW] + sku_groups,
-            key="best_sku_cust",
-            help="Keep the combined total, or narrow to one customer group.",
-        )
-    if cust_pick == ALL_CUSTOMERS_VIEW:
-        rows = sku_rows_all
-        sku_agg, sku_weekly = agg_all, weekly_all
-    else:
-        rows = sku_rows_all[sku_rows_all["Customer Grouping"].astype(str) == cust_pick]
-        sku_agg = agg_by_group[agg_by_group["Customer Grouping"].astype(str) == cust_pick]
-        sku_weekly = weekly_by_group[
-            weekly_by_group["Customer Grouping"].astype(str) == cust_pick
-        ]
-
-    row0 = rows.iloc[0]
-    desc = row0["Description"] if isinstance(row0["Description"], str) else ""
-    # Resolve one source for the SKU's chart (same last-wins rule as source_map).
-    src_vals = rows["Data Source"].dropna().unique().tolist() \
-        if "Data Source" in rows.columns else []
-    source = src_vals[-1] if src_vals else "POS"
-    mixed_source = len(src_vals) > 1
-
-    cL, cR = st.columns([3, 1])
-    with cL:
-        sku_range = chart_range_control(sku_agg, sku_weekly, lcw, key="range_sku_best")
-        st.plotly_chart(
-            sku_chart(sku, desc, source, sku_agg, sku_weekly, chart_anchors,
-                      date_range=sku_range),
-            width="stretch",
-        )
-        # One line per group, annotated with the best model used for that group
-        # (rows carries one row per Customer Grouping, each with MODEL_USED_COL).
-        group_models = sorted(
-            zip(rows["Customer Grouping"].astype(str),
-                rows[MODEL_USED_COL].astype(str)),
-            key=lambda gm: gm[0],
-        )
-        group_lines = "\n".join(f"- {g} — {m}" for g, m in group_models)
-        if cust_pick == ALL_CUSTOMERS_VIEW:
-            st.caption(
-                f"Totals across every group carrying this SKU "
-                f"({len(group_models)} group{'s' if len(group_models) != 1 else ''}), "
-                f"with the model used for each:\n{group_lines}"
-            )
-        else:
-            st.caption(f"Customer group **{cust_pick}** only:\n{group_lines}")
-    with cR:
-        # Metrics aggregate the SKU's per-group rows: forecast/risk totals sum;
-        # the historical avg/wk is derived from the stitched actuals (do NOT sum
-        # the per-SKU average column across groups — it would over-count). When a
-        # single group is picked, `rows` is one row so every sum collapses to it.
-        st.metric("Data Source", f"{source} (mixed)" if mixed_source else source)
-        sku_hist = historical_window(
-            sku_agg[sku_agg["SKU"].astype(str) == sku], rows, anchors
-        )
-        sku_weekly_tot = sku_hist.groupby("WeekDate")["demand"].sum(min_count=1)
-        st.metric(
-            "Historical Demand (avg/wk)",
-            f"{float(sku_weekly_tot.mean()) if not sku_weekly_tot.empty else 0.0:,.1f}",
-        )
-        sysv = rows["Current Projection Average"].sum(min_count=1)
-        st.metric(
-            "Current Forecast (avg/wk)",
-            "—" if pd.isna(sysv) else f"{sysv:,.0f}",
-        )
-        updated = rows["Updated Projection Average"].sum()
-        st.metric("Updated Forecast (avg/wk)", f"{updated:,.0f}")
-        pdiff = rows["Projection Difference"].sum(min_count=1)
-        st.metric(
-            "Projection Difference (avg/wk)",
-            f"{pdiff:+,.0f}" if pd.notna(pdiff) else "—",
-        )
-        if RISK_COL in combined.columns:
-            price = rows[PRICE_COL].dropna().iloc[0] \
-                if PRICE_COL in rows.columns and rows[PRICE_COL].notna().any() \
-                else None
-            rv = rows[RISK_COL].sum(min_count=1)
-            st.metric("List Price", fmt_dollar(price, decimals=2))
-            st.metric(
-                "Revenue Risk (avg/wk)", fmt_dollar(rv, signed=True),
-                help="Σ (projection difference × list price) across this SKU's groups.",
-            )
-            prv = price * updated if price is not None else None
-            st.metric(
-                "Projected Revenue (avg/wk)", fmt_dollar(prv),
-                help="List price × total updated weekly-avg forecast for this SKU.",
-            )
+        _render_kpis(summary_c, agg_c, anchors, stacked=True,
+                     avg_col=anchors_avg_col)
 
     st.markdown("### Summary table by SKU and customer")
 
@@ -412,15 +502,29 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
             .drop(columns="_abs").reset_index(drop=True)
         )
         st.caption("Each SKU broken out by customer group; within a SKU, "
-                   "largest revenue risk first (by magnitude).")
+                   "largest revenue risk first (by magnitude). Click a row to "
+                   "open its chart and metrics.")
     else:
         table = combined.sort_values(["SKU", "Customer Grouping"]).reset_index(drop=True)
-        st.caption("Each SKU broken out by customer group.")
+        st.caption("Each SKU broken out by customer group. Click a row to open "
+                   "its chart and metrics.")
 
-    # Every group now carries both a genuine All-History and an 8-Week
-    # POS/Orders Average (computed in compute_by_customer_best), so the table
-    # renders directly with the usual numeric formatting.
-    render_filtered_table(table, "filter_best_mix", P, style=True)
+    # Condensed rows (five scannable columns); clicking one reveals that exact
+    # (SKU, customer group) combination's detail card below — the chart, date
+    # range and metrics the standalone "SKU detail" section used to hold. The
+    # filter chips and the Excel download still run on the full frame.
+    # model_label is left unbound: every row carries its own MODEL_USED_COL, which
+    # the card prefers. top_groups is unbound too — this view has no compute_view
+    # summary, so no breakdown exists (see render_sku_detail_card).
+    sku_card = functools.partial(render_sku_detail_card, agg_by_group,
+                                 weekly_by_group, anchors, chart_anchors, pm)
+    render_selectable_table(
+        table, "filter_best_mix", P,
+        condensed_cols=BEST_MIX_CONDENSED_COLS, style=True,
+        detail_chart=sku_card, detail_cols=BEST_MIX_CARD_COLS,
+        extra_kpis=projection_kpi_extras,
+        kpi_deltas={"Projection Difference": projection_difference_delta},
+    )
     st.download_button(
         "⬇️ Download the combined best-model table",
         data=summary_to_excel(table),

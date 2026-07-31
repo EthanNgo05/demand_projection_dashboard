@@ -365,6 +365,57 @@ def prices_from_plytix(plytix_df):
     return prices.set_index("SKU")["List Price USD"]
 
 
+def container_load_from_plytix(plytix_df):
+    """SKU -> Container Load Series (units a full container holds) from an
+    already-read Plytix frame.
+
+    Mirrors ``prices_from_plytix``. The trailing '*' discontinued marker is
+    stripped from the SKU (like ``compute_active_products``) so keys line up with
+    the demand-frame SKUs. SKUs with a blank/zero load are dropped so they map to
+    NaN downstream (an unknown load is left blank, never treated as a container of
+    zero). Returns None when the frame lacks the required columns."""
+    if plytix_df is None or not {"SKU", "Container Load"}.issubset(plytix_df.columns):
+        return None
+    cl = plytix_df[["SKU", "Container Load"]].dropna(subset=["SKU"]).copy()
+    cl["SKU"] = cl["SKU"].astype(str).str.strip().str.rstrip("*")
+    cl["Container Load"] = pd.to_numeric(cl["Container Load"], errors="coerce")
+    cl = cl[cl["Container Load"] > 0].drop_duplicates("SKU", keep="last")
+    return cl.set_index("SKU")["Container Load"]
+
+
+def onhand_by_sku(raw_df):
+    """SKU -> current total On Hand Series from the RAW (pre-_clean) demand frame.
+
+    On Hand is a weekly (SKU, Customer, WeekDate) inventory snapshot that ``_clean``
+    drops, so this reads the raw frame the same way ``active_allocation_pairs``
+    does. Forward/projection weeks carry NULL On Hand, so a SKU/customer's *current*
+    on-hand is its latest non-null week; the SKU total sums that across customers.
+    Keys are normalized (whitespace-stripped, trailing '*' dropped) to match the
+    demand-frame SKUs. Returns None when the frame lacks the columns (older
+    snapshot) — callers treat None as "no On Hand data" (WOS left blank)."""
+    if raw_df is None or raw_df.empty:
+        return None
+    sku_col = "'Demand'[DisplaySKU]"
+    needed = {sku_col, "Custnmbr", "WeekDate", "On Hand"}
+    if not needed.issubset(raw_df.columns):
+        return None
+    d = raw_df[[sku_col, "Custnmbr", "WeekDate", "On Hand"]].copy()
+    d["SKU"] = d[sku_col].astype(str).str.strip().str.rstrip("*")
+    d["Customer"] = d["Custnmbr"].astype(str).str.strip()
+    d["WeekDate"] = pd.to_datetime(d["WeekDate"], errors="coerce")
+    d["On Hand"] = pd.to_numeric(d["On Hand"], errors="coerce")
+    d = d.dropna(subset=["On Hand", "WeekDate"])
+    if d.empty:
+        return None
+    # Latest week per (SKU, Customer) = that customer's current on-hand; sum the
+    # per-customer currents to a SKU-level total.
+    latest = (
+        d.sort_values("WeekDate")
+        .drop_duplicates(["SKU", "Customer"], keep="last")
+    )
+    return latest.groupby("SKU")["On Hand"].sum()
+
+
 def _this_week_start():
     """Sunday-anchored start of the current week as a Timestamp.
 
@@ -621,6 +672,24 @@ def compute_missing_pos_orders(df, plytix_df, P, anchors=None):
     combos = combos[[
         loc in _active_in_list(sku_active_in, sku)
         for sku, loc in zip(combos["SKU"], combos["Region Code"])
+    ]]
+    if combos.empty:
+        return pd.DataFrame(columns=MISSING_POS_COLS)
+
+    # --- Keep only combos that are actually being forecast ---------------------
+    # A gone-silent channel only matters if the forecast is still carrying it. Drop
+    # combos with no forward projection or a projection of 0 (e.g. BT1028 @ AAFES):
+    # nothing is being carried forward, so there is no active gap to surface. Forward
+    # weeks are WeekDate >= current_week_start (the first forecast week); NaN
+    # projections count as 0, so "no projection" and "0 projection" both net to 0.
+    fwd = m[m["WeekDate"] >= current_week_start]
+    fwd_proj = (
+        fwd.groupby(["SKU", "Customer"])["Projection"].apply(lambda s: s.fillna(0).sum())
+    )
+    projected = set(fwd_proj[fwd_proj > 0].index)
+    combos = combos[[
+        (sku, cust) in projected
+        for sku, cust in zip(combos["SKU"], combos["Customer"])
     ]]
     if combos.empty:
         return pd.DataFrame(columns=MISSING_POS_COLS)

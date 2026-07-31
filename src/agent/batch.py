@@ -48,6 +48,7 @@ _CLEANED_PATH = None
 _TODAY = None
 _CLEANED_CACHE = None
 _PRICES = None
+_DATA_SIG = None
 
 
 def enumerate_views(cleaned_df, P):
@@ -63,12 +64,13 @@ def enumerate_views(cleaned_df, P):
     return [ALL_CUSTOMERS_VIEW] + [region_all_view(r) for r in regions] + groups
 
 
-def _worker_init(cleaned_path, prices, today_ts):
+def _worker_init(cleaned_path, prices, today_ts, data_sig=None):
     """Pool initializer: stash the shared inputs for this worker process."""
-    global _CLEANED_PATH, _TODAY, _PRICES
+    global _CLEANED_PATH, _TODAY, _PRICES, _DATA_SIG
     _CLEANED_PATH = cleaned_path
     _TODAY = today_ts
     _PRICES = prices
+    _DATA_SIG = data_sig
 
 
 def _cleaned():
@@ -77,6 +79,70 @@ def _cleaned():
     if _CLEANED_CACHE is None:
         _CLEANED_CACHE = pd.read_parquet(_CLEANED_PATH)
     return _CLEANED_CACHE
+
+
+def _warm_forecast_cache(view, results):
+    """Persist this view's already-computed frames for the dashboard to reuse.
+
+    ``run_all_models`` fits EVERY model for the view and keeps each one's
+    ``summary_df``/``weekly_df``/``agg`` in ``state["results"]`` — numbers the
+    batch previously discarded, publishing only which model won. Those frames are
+    exactly what ``dashboard_app.compute.compute_view`` /
+    ``_forecast_one_group`` produce for the same view and model (the Phase-2 and
+    Phase-6 parity suites assert that with exact-match equality), so writing them
+    into the shared on-disk cache turns the dashboard's first open of the day into
+    a Parquet read instead of a recompute — the ~55s Optimized Projections build
+    most of all.
+
+    Both cache "kinds" are warmed for a plain customer group, because the two
+    front-door paths key differently: Quick Projections asks for ``kind="view"``,
+    while the Optimized/Watchlist per-group loop asks for ``kind="group"``. The
+    inputs are identical for a group view (``view_frame`` for a group is the same
+    ``df["Customer Grouping"] == group`` slice ``_forecast_one_group`` receives),
+    so one computation legitimately satisfies both keys.
+
+    Smoothing parameters are left at None, matching the models' own module
+    constants. That is what ``compute_view`` uses for models with no autofit
+    (XGBoost / TSB / Holt-Winters); the Holt pipeline's autofitted alpha/beta/phi
+    produce a DIFFERENT key, so the dashboard correctly misses and refits rather
+    than reading a default-parameter forecast. Never guessed, never approximated.
+
+    Entirely best-effort: any failure is swallowed, since the summary JSON this
+    batch exists to write has already been published by the time we get here.
+    """
+    if not results:
+        return
+    try:
+        from agent.config import ALL_CUSTOMERS_VIEW, MODEL_OPTIONS, region_from_view
+        from dashboard_app import forecast_cache
+
+        if not _DATA_SIG or not forecast_cache.enabled():
+            return
+        today_str = pd.Timestamp(_TODAY).date().isoformat()
+        # A group view feeds both the per-view and per-group cache keys; the ALL
+        # and region rollups only ever exist as a "view".
+        is_rollup = view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None
+        kinds = ("view",) if is_rollup else ("view", "group")
+
+        for label, bundle in results.items():
+            path = MODEL_OPTIONS.get(label)
+            summary = (bundle or {}).get("summary_df")
+            weekly = (bundle or {}).get("weekly_df")
+            agg = (bundle or {}).get("agg")
+            if path is None or summary is None or weekly is None or agg is None:
+                continue
+            frames = {"summary": summary, "weekly": weekly, "agg": agg}
+            for kind in kinds:
+                key = forecast_cache.forecast_key(
+                    _DATA_SIG, view, path, today_str, kind=kind,
+                )
+                forecast_cache.put(
+                    key, frames,
+                    {"view": view, "model": os.path.basename(path),
+                     "kind": kind, "source": "agent.batch"},
+                )
+    except Exception:  # noqa: BLE001 - warming must never fail a view
+        pass
 
 
 def _run_view(view):
@@ -96,6 +162,7 @@ def _run_view(view):
             "prices": _PRICES,
         }
         final = build_graph().invoke(state)
+        _warm_forecast_cache(view, final.get("results"))
         errs = final.get("errors") or []
         return view, True, ("; ".join(errs) if errs else None)
     except Exception as e:  # one view must never sink the batch
@@ -138,6 +205,25 @@ def main(argv=None) -> int:
         print("Batch aborted:", "; ".join(errs), file=sys.stderr)
         return 1
     prices = seed.get("prices")
+
+    # --- Forecast-cache signature (must match the dashboard's exactly) ------
+    # Built here in the parent, from the same inputs dashboard.py uses, and
+    # handed to every worker so each can persist its view's frames under a key
+    # the dashboard will actually look up. If this drifts from dashboard.py's
+    # data_sig block the warm-up silently stops being found (a miss, never a
+    # wrong number), so the two are covered by test_forecast_cache.py.
+    data_sig = None
+    try:
+        from dashboard_app import forecast_cache
+
+        data_sig = forecast_cache.snapshot_signature(
+            seed.get("raw_path"),
+            n_excluded_rows=seed.get("n_excluded_rows"),
+            n_rows=len(cleaned),
+            prices=forecast_cache.content_signature(prices),
+        )
+    except Exception as exc:  # noqa: BLE001 - warming is optional
+        print(f"Forecast-cache warming disabled ({type(exc).__name__}: {exc})")
 
     P = default_pipeline()
     views = enumerate_views(cleaned, P)
@@ -187,7 +273,7 @@ def main(argv=None) -> int:
         with ProcessPoolExecutor(
             max_workers=max(1, args.workers),
             initializer=_worker_init,
-            initargs=(cleaned_path, prices, today_ts),
+            initargs=(cleaned_path, prices, today_ts, data_sig),
         ) as ex:
             # submit + as_completed, NOT ex.map: map yields results in SUBMISSION
             # order, so the counter would stall on the first-listed view (the slow
@@ -213,6 +299,21 @@ def main(argv=None) -> int:
             os.rmdir(tmpdir)
         except OSError:
             pass
+
+    # Keep outputs/.cache bounded: this run just wrote up to 5 models x 2 kinds
+    # per view, so without a prune the warm-up would grow without limit as
+    # snapshots roll over night after night. Least-recently-USED entries go first
+    # (get() touches the marker), so views people actually open survive.
+    if data_sig:
+        try:
+            from dashboard_app import forecast_cache
+
+            removed = forecast_cache.prune()
+            n_entries, n_bytes = forecast_cache.stats()
+            print(f"Forecast cache: {n_entries} entries, {n_bytes / 1e6:.0f} MB"
+                  + (f" ({removed} pruned)" if removed else ""))
+        except Exception as exc:  # noqa: BLE001 - housekeeping is optional
+            print(f"Forecast-cache prune skipped ({type(exc).__name__}: {exc})")
 
     elapsed = time.time() - started
     print(f"\nDone: {ok} ok, {fail} failed in {elapsed:.0f}s.")

@@ -158,9 +158,13 @@ def region_for_group(group):
 ALL_CUSTOMERS_LABEL = "ALL CUSTOMERS"
 
 # Internal (snake_case) column names -> display names used in the output sheets.
+# The average's display name is hyphenated to match dashboard_app.compute's
+# EIGHT_WK_AVG_COL EXACTLY, so the dashboard replaces this column in place with
+# its centrally-computed equivalent instead of carrying two differently-spelled
+# copies of the same figure. See AVG_COL_LABEL in the other four model files.
 DISPLAY_NAMES = {
     "weeks_with_data": "Weeks with data",
-    "8_week_pos_avg": "8 Week POS/Orders Average",
+    "8_week_pos_avg": "8-Week POS/Orders Average",
     "initial_projection_avg": "Current Projection Average",
     "updated_projection_avg": "Updated Projection Average",
     "projection_difference": "Projection Difference",
@@ -175,7 +179,7 @@ SUMMARY_COLUMNS = [
     "Customer Grouping",
     "Data Source",
     "Weeks with data",
-    "8 Week POS/Orders Average",
+    "8-Week POS/Orders Average",
     "Updated Projection Average",
     "Current Projection Average",
     "Projection Difference",

@@ -209,9 +209,9 @@ def _parse_model_fit(text):
 
 
 def _recent_avg_column(summary_df: pd.DataFrame):
-    """The recent-average column name varies by model: '8 Week POS/Orders
-    Average' (regression), 'All-History POS/Orders Average' or
-    '{N} Week POS/Orders Average' (ES/XGBoost). Match by suffix."""
+    """The recent-average column name varies by model: '8-Week POS/Orders
+    Average' (regression), 'All-Time POS/Orders Average' or
+    '{N}-Week POS/Orders Average' (ES/XGBoost). Match by suffix."""
     for col in summary_df.columns:
         if str(col).endswith("POS/Orders Average"):
             return col

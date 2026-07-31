@@ -102,4 +102,7 @@ def ingest(state: AgentState) -> dict:
         "price_path": price_path,
         "cleaned_df": cleaned,
         "prices": prices,
+        # Only so agent.batch can reproduce the dashboard's forecast-cache key
+        # (see AgentState.n_excluded_rows); no forecasting node reads it.
+        "n_excluded_rows": excl.n_excluded_rows,
     }

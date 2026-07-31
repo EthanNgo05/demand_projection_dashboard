@@ -26,7 +26,10 @@ import streamlit as st
 from dashboard_app.compute import (
     EIGHT_WK_AVG_COL, _descriptive_averages, optimal_projection_for, summary_to_excel,
 )
-from dashboard_app.config import ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, fmt_dollar
+from dashboard_app.config import (
+    ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, bounded_put, fmt_dollar,
+    ONHAND_COL, TREND_COL, WOS_COL,
+)
 from dashboard_app.dataquality import (
     render_discontinued_section,
     render_inactive_section,
@@ -34,10 +37,13 @@ from dashboard_app.dataquality import (
     render_missing_section,
 )
 from dashboard_app.datasources import (
+    compute_active_products,
     compute_missing_pos_orders,
     compute_missing_projections,
+    container_load_from_plytix,
     discover_key_skus_file,
     load_key_skus,
+    _region_code,
 )
 from dashboard_app.refresh import (
     key_skus_refresh_in_progress,
@@ -77,7 +83,8 @@ WEEKS_COL = "Weeks with data"   # weeks with any POS/Orders activity for this SK
 
 _DISPLAY_COLS = [
     "SKU", "Description", "Customer Grouping", "Region", "Data Source", STATUS_COL,
-    RECENT_COL, PROJ_COL, WEEKS_COL, GAP_COL, PCT_COL, PRICE_COL, IMPACT_COL, FLAG_COL,
+    RECENT_COL, TREND_COL, PROJ_COL, WEEKS_COL, GAP_COL, PCT_COL, PRICE_COL,
+    IMPACT_COL, ONHAND_COL, WOS_COL, FLAG_COL,
 ]
 
 # The Key SKUs watchlist table: the same columns as the All-Exceptions table
@@ -85,19 +92,25 @@ _DISPLAY_COLS = [
 # minus the Flag column.
 KEY_DISPLAY_COLS = [
     "SKU", "Description", "Customer Grouping", "Region", STATUS_COL, "Data Source",
-    RECENT_COL, PROJ_COL, WEEKS_COL, PRICE_COL, IMPACT_COL, PCT_COL, FLAG_COL,
+    RECENT_COL, TREND_COL, PROJ_COL, WEEKS_COL, PRICE_COL, IMPACT_COL, PCT_COL,
+    GAP_COL, ONHAND_COL, WOS_COL, FLAG_COL,
 ]
 
-# The detail-card field order (both Exceptions tabs), decoupled from the frame's
-# full column set above. "Note" is peeled to a full-width bottom row by the card
-# renderer, so the grid renders as three rows:
-#   Customer Grouping · Region · Data Source
-#   Status · 8-Week Avg · Current Projection Average
-#   List Price · Weeks with data
+# The detail-card KPI tiles (both Exceptions tabs), decoupled from the frame's full
+# column set above. A SET, not a sequence: config.kpi_sort orders it, so these land
+# in the same positions as on every other view's card. "Note" is peeled to a
+# full-width bottom row by the card renderer.
+#
+# GAP_COL / PCT_COL are the two numbers this view RANKS on and they were somehow
+# never on the card — a planner could see the flagged row's gap in the table but not
+# in the card they opened to understand it.
 EXCEPTION_CARD_COLS = [
-    "Customer Grouping", "Region", "Data Source",
-    STATUS_COL, RECENT_COL, PROJ_COL,
-    PRICE_COL, WEEKS_COL, FLAG_COL,
+    "Customer Grouping", "Region", "Data Source", STATUS_COL,
+    WEEKS_COL, RECENT_COL, TREND_COL,
+    PROJ_COL, GAP_COL, PCT_COL,
+    PRICE_COL, IMPACT_COL,
+    ONHAND_COL, WOS_COL,
+    FLAG_COL,
 ]
 
 # Per-column widths for the exception tables. Without these, st.dataframe
@@ -117,6 +130,83 @@ _COLUMN_CONFIG = {
 CONDENSED_EXCEPTION_COLS = ["SKU", "Customer Grouping", RECENT_COL, PROJ_COL, IMPACT_COL]
 _CONDENSED_COLUMN_CONFIG = {
     "Customer Grouping": st.column_config.Column("Customer"),
+}
+
+# ---------------------------------------------------------------------------
+# "Recent spikes in POS/Orders with no projections" table
+# ---------------------------------------------------------------------------
+# SKU x customer combos we project 0 for that have started selling (a recent
+# spike in POS or Orders). Surfaced so planners catch demand we aren't planning
+# for before it turns into a stockout. Distinct from the Under/Over sections:
+# those rank by deviation; this one adds the onset week + cumulative $ at risk.
+SPIKE_FIRST_WEEK_COL = "First Week Spike"
+SPIKE_WEEKS_SINCE_COL = "Weeks Since Spike"
+# SKU-level (constant across a SKU's customer rows): Container Impact = the SKU's
+# total cumulative spike units ÷ its Container Load (containers of unplanned
+# demand). WOS_COL / ONHAND_COL are imported from config.py — the Exceptions table
+# and the projections cards show them too now, so one definition serves all three
+# rather than each view naming its own.
+CONTAINER_IMPACT_COL = "Container Impact"
+
+SPIKE_DISPLAY_COLS = [
+    "SKU", "Description", "Region", "Region Code", "Active in", "Customer Grouping",
+    "Data Source", SPIKE_FIRST_WEEK_COL, SPIKE_WEEKS_SINCE_COL,
+    RECENT_COL, CONTAINER_IMPACT_COL, ONHAND_COL, WOS_COL,
+]
+
+# The condensed click-to-expand row: triage essentials incl. Container Impact. WOS
+# Impact and List Price move to the detail card on click.
+SPIKE_CONDENSED_COLS = [
+    "SKU", "Customer Grouping", SPIKE_FIRST_WEEK_COL, SPIKE_WEEKS_SINCE_COL,
+    RECENT_COL, CONTAINER_IMPACT_COL,
+]
+# Detail-card KPI tiles, ordered by config.kpi_sort like every other card. SKU +
+# Description form the card title (handled by the card renderer).
+#
+# TREND_COL is deliberately absent: a spike SKU sold nothing in the prior 8-week
+# window by definition, so its trend has no baseline and every row here would read
+# "New" — a column carrying no information.
+SPIKE_CARD_COLS = [
+    "Customer Grouping", "Region", "Data Source",
+    "Active in", SPIKE_FIRST_WEEK_COL, SPIKE_WEEKS_SINCE_COL,
+    RECENT_COL, CONTAINER_IMPACT_COL, ONHAND_COL, WOS_COL,
+    PRICE_COL,
+]
+# RECENT_COL is formatted by style_summary (like the other tables); Container
+# Impact / WOS get one decimal here. First Week Spike is stored as a plain date
+# (.dt.date) so it renders as an ISO string under the Styler.
+_SPIKE_COLUMN_CONFIG = {
+    "Customer Grouping": st.column_config.Column("Customer"),
+    CONTAINER_IMPACT_COL: st.column_config.NumberColumn(format="%.1f"),
+    WOS_COL: st.column_config.NumberColumn(format="%.1f"),
+}
+
+
+# ---------------------------------------------------------------------------
+# "Group by" roll-up: re-aggregate the exception/spike tables to a single
+# dimension (Customer / SKU / Region). The default keeps the (SKU × Customer)
+# grain the tables were built at; the other three collapse rows and sum the
+# additive metrics, recomputing the derived ones (see aggregate_exceptions).
+# ---------------------------------------------------------------------------
+GROUP_DETAIL = "SKU × Customer"   # default — one row per SKU/customer (as built)
+GROUP_SKU = "SKU"                 # roll up across customers
+GROUP_CUSTOMER = "Customer"       # roll up across SKUs
+GROUP_REGION = "Region"           # roll up across SKUs and customers
+GROUP_BY_OPTIONS = [GROUP_DETAIL, GROUP_SKU, GROUP_CUSTOMER, GROUP_REGION]
+
+# The frame column each non-default grain groups by.
+_GROUP_KEY = {
+    GROUP_SKU: "SKU",
+    GROUP_CUSTOMER: "Customer Grouping",
+    GROUP_REGION: "Region",
+}
+# The column whose value titles the detail card at each grain (see tables.py's
+# render_selectable_table ``title_col``).
+_TITLE_COL = {
+    GROUP_DETAIL: "SKU",
+    GROUP_SKU: "SKU",
+    GROUP_CUSTOMER: "Customer Grouping",
+    GROUP_REGION: "Region",
 }
 
 
@@ -187,7 +277,8 @@ def sku_week_by_group(df, P):
     return agg_by_group[~agg_by_group["SKU"].astype(str).str.endswith("*")]
 
 
-def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
+def _render_exception_chart(agg, anchors, df, prices, today_ts, data_sig,
+                            row, key_base):
     """Detail-card chart + "Calculate Optimal Projection" for one (SKU, group).
 
     Draws this SKU's actual sell-through vs the system projection with its own
@@ -223,7 +314,7 @@ def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
                       "available; otherwise backtests live (can be slow)."):
         with st.spinner("Finding the best model and forecasting…"):
             st.session_state[opt_key] = optimal_projection_for(
-                df, group, sku, today_ts, prices
+                df, group, sku, today_ts, prices, data_sig=data_sig,
             )
     opt = st.session_state.get(opt_key)
     weekly = None
@@ -233,20 +324,29 @@ def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
             current = row.get(PROJ_COL)
             has_current = current is not None and not pd.isna(current)
             diff = opt["optimized_avg"] - current if has_current else None
-            delta = None if diff is None else f"{diff:+,.0f} vs current"
-            st.metric("Optimized Projection (avg/wk)",
-                      f"{opt['optimized_avg']:,.0f}", delta=delta, delta_color="off")
-            # Revenue impact of moving the projection to the optimized value, valued
-            # at list price. Green when the change adds revenue, red when it removes it.
             price = pd.to_numeric(row.get(PRICE_COL), errors="coerce")
+            # These two are computed on the button click, so they can't live in the
+            # card's static tile grid above — but they must LOOK like it does. Both
+            # are st.metric, side by side, so they pick up the same shaded-tile
+            # styling. The revenue figure used to be a hand-rolled coloured <span>,
+            # which was the only KPI in the app styled by hand instead of by the
+            # stylesheet; st.metric's delta already carries the green/red.
+            m1, m2 = st.columns(2)
+            m1.metric(
+                "Optimized Projection (avg/wk)", f"{opt['optimized_avg']:,.0f}",
+                delta=None if diff is None else f"{diff:+,.0f} vs current",
+                delta_color="off",
+                help="Weekly average of the 15-week forecast from the model that "
+                     "wins this SKU/customer's 5-model backtest.",
+            )
             if diff is not None and not pd.isna(price):
-                risk = diff * price
-                colour = "#16a34a" if risk >= 0 else "#dc2626"
-                st.markdown(
-                    f"**Revenue Risk (avg/wk):** "
-                    f"<span style='color:{colour};font-weight:600'>"
-                    f"{fmt_dollar(risk, decimals=0)}</span>",
-                    unsafe_allow_html=True,
+                # Revenue impact of moving the projection to the optimized value,
+                # valued at list price. Signed so the direction reads without colour.
+                m2.metric(
+                    "Revenue Risk (avg/wk)",
+                    fmt_dollar(diff * price, decimals=0, signed=True),
+                    help="(Optimized − current projection) × list price — the weekly "
+                         "revenue the plan is over- or under-stating.",
                 )
             st.caption(f"Winning model: {opt['label']}")
         elif opt["status"] == "no_model":
@@ -266,11 +366,11 @@ def _render_exception_chart(agg, anchors, df, prices, today_ts, row, key_base):
     date_range = chart_range_control(ag, horizon, lcw, key=key)
     fig = actuals_vs_plan_chart(sku, row.get("Description"), source, ag,
                                 (chart_lb, lcw, ffw), date_range=date_range,
-                                weekly=weekly)
+                                weekly=weekly, prices=prices)
     st.plotly_chart(fig, width="stretch", key=f"{key}_plot")
 
 
-def compute_exceptions(df, today_ts, prices, P):
+def compute_exceptions(df, today_ts, prices, P, onhand_by_sku=None):
     """Build the (unfiltered, unsorted-for-display) exceptions frame.
 
     Pure/deterministic — no Streamlit — so it is unit-testable. ``df`` is the
@@ -280,6 +380,11 @@ def compute_exceptions(df, today_ts, prices, P):
     ``week_anchors`` / ``region_for_group`` are used). Returns a DataFrame with
     ``_DISPLAY_COLS`` plus a hidden ``_sort`` key, one row per flagged
     (SKU, Customer Grouping); direction lives in ``DIRECTION_COL``.
+
+    ``onhand_by_sku`` (SKU→current total On Hand, optional) adds the two SKU-level
+    supply columns the detail card shows — ``ONHAND_COL`` and ``WOS_COL`` — using the
+    SAME definition ``compute_spikes`` uses, so Weeks of Supply means one thing
+    wherever it appears. Both are blank when the map isn't supplied.
     """
     empty = pd.DataFrame(columns=_DISPLAY_COLS + [DIRECTION_COL])
     if df is None or df.empty:
@@ -291,9 +396,10 @@ def compute_exceptions(df, today_ts, prices, P):
     if agg_by_group.empty:
         return empty
 
-    # recent run-rate (shared helper) and forward system-projection average.
+    # Recent run-rate + the trend against the 8 weeks before it (shared helper), and
+    # the forward system-projection average.
     recent = _descriptive_averages(agg_by_group, today_ts)[
-        ["Customer Grouping", "SKU", RECENT_COL]
+        ["Customer Grouping", "SKU", RECENT_COL, TREND_COL]
     ]
     _, _, first_forecast_week = P.week_anchors(today_ts)
     forecast_weeks = pd.date_range(start=first_forecast_week, periods=15, freq="W-SUN")
@@ -369,6 +475,20 @@ def compute_exceptions(df, today_ts, prices, P):
     )
     frame["Description"] = frame["SKU"].map(desc)
 
+    # SKU-level supply: On Hand and Weeks of Supply, identical in definition to
+    # compute_spikes' — the SKU's total On Hand ÷ its total CURRENT weekly projection
+    # summed across ALL customers. Constant across a SKU's customer rows, which the
+    # tile help says. Blank (not zero) without an On Hand map: unknown, not empty.
+    oh_map = onhand_by_sku if onhand_by_sku is not None else {}
+    sku_onhand = frame["SKU"].astype(str).map(lambda s: _scalar_price(oh_map, s))
+    sku_total_proj = frame.groupby("SKU")["_proj"].sum()
+    total_proj = frame["SKU"].map(sku_total_proj)
+    frame[ONHAND_COL] = sku_onhand
+    frame[WOS_COL] = np.where(
+        sku_onhand.notna() & (total_proj > 0), sku_onhand / total_proj.where(total_proj > 0),
+        np.nan,
+    )
+
     # Display-shaped, pre-rounded numerics (kept numeric so the table sorts right).
     out = pd.DataFrame({
         "SKU": frame["SKU"].astype(str),
@@ -377,11 +497,14 @@ def compute_exceptions(df, today_ts, prices, P):
         "Region": frame["Region"],
         "Data Source": frame["Data Source"],
         RECENT_COL: frame[RECENT_COL].round().astype("Int64"),
+        TREND_COL: pd.to_numeric(frame[TREND_COL], errors="coerce"),
         PROJ_COL: frame["_proj"].round().astype("Int64"),
         WEEKS_COL: pd.to_numeric(frame[WEEKS_COL], errors="coerce").fillna(0).astype("Int64"),
         GAP_COL: frame["_gap"].round().astype("Int64"),
         PCT_COL: (frame["_pct"] * 100).round(2),
         IMPACT_COL: frame["_impact"].round(),
+        ONHAND_COL: pd.to_numeric(frame[ONHAND_COL], errors="coerce"),
+        WOS_COL: pd.to_numeric(frame[WOS_COL], errors="coerce").round(1),
         FLAG_COL: frame[FLAG_COL],
         PRICE_COL: pd.to_numeric(frame[PRICE_COL], errors="coerce"),
         STATUS_COL: frame[DIRECTION_COL].map(STATUS_SHORT).fillna(frame[DIRECTION_COL]),
@@ -390,6 +513,482 @@ def compute_exceptions(df, today_ts, prices, P):
         "_sort": frame["_impact"].abs().fillna(frame["_gap"].abs()),
     })
     return out.reset_index(drop=True)
+
+
+def _scalar_price(price_map, sku):
+    """List price for one SKU as a float (NaN when unknown/unpriced). ``price_map``
+    is the SKU→price Series/dict (or None)."""
+    if price_map is None:
+        return np.nan
+    raw = price_map.get(str(sku)) if hasattr(price_map, "get") else None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return np.nan
+    return np.nan if pd.isna(val) else val
+
+
+def compute_spikes(agg_by_group, today_ts, prices, P, sku_active_in=None,
+                   container_load=None, onhand_by_sku=None, min_container_impact=0.0):
+    """Recent-spike table: (SKU, Customer Grouping) combos we project 0 for that
+    have started selling in the last 8 weeks — demand we aren't planning for yet.
+
+    Pure/deterministic — no Streamlit — so it is unit-testable. ``agg_by_group`` is
+    the per-(Customer Grouping, SKU) weekly frame from ``sku_week_by_group`` (SKU,
+    WeekDate, POS, Orders, Projection, Description, Customer Grouping). A row is
+    included when the forward system projection (the same 15 weeks the models use)
+    is 0 or missing AND the SKU has any POS/Orders in the recent 8-week window — the
+    "spike" onset is that first selling week. POS-then-Orders per SKU (POS if the SKU
+    has any POS in the window, else Orders), matching the rest of the view.
+
+    ``container_load`` (SKU→units/container) and ``onhand_by_sku`` (SKU→current total
+    On Hand) drive two **SKU-level** columns constant across a SKU's customer rows:
+    Container Impact = the SKU's total cumulative spike units ÷ its Container Load;
+    WOS Impact = the SKU's total On Hand ÷ its total weekly projection (summed across
+    all customers). Both are blank when their inputs are missing (or projection
+    totals 0, to avoid ÷0). ``min_container_impact`` filters the table to SKUs whose
+    Container Impact meets that many containers (SKUs without a Container Load are
+    never hidden — their impact is unknown, not below-threshold).
+
+    Returns a DataFrame with ``SPIKE_DISPLAY_COLS`` plus hidden ``PROJ_COL``
+    (always 0), ``PRICE_COL``, and ``_sort`` (worst-first), one row per flagged
+    (SKU, Customer Grouping).
+    """
+    empty = pd.DataFrame(columns=SPIKE_DISPLAY_COLS + [PROJ_COL, PRICE_COL, "_sort"])
+    if agg_by_group is None or agg_by_group.empty:
+        return empty
+
+    agg = agg_by_group.copy()
+    agg["WeekDate"] = pd.to_datetime(agg["WeekDate"])
+
+    # Recent 8-week window (Sunday-anchored), same math as _recent_data_source.
+    days_since_sunday = (today_ts.weekday() + 1) % 7
+    current_week_start = today_ts - pd.Timedelta(days=days_since_sunday)
+    last_complete_week = current_week_start - pd.Timedelta(weeks=1)
+    eight_wk_start = last_complete_week - pd.Timedelta(weeks=7)
+
+    # Candidate universe: SKUs with no forward projection (0 or missing).
+    _, _, first_forecast_week = P.week_anchors(today_ts)
+    forecast_weeks = pd.date_range(start=first_forecast_week, periods=15, freq="W-SUN")
+    proj = _forward_projection_avg(agg, first_forecast_week, forecast_weeks[-1])
+    proj_lookup = dict(
+        zip(zip(proj["Customer Grouping"], proj["SKU"]), proj[PROJ_COL])
+    )
+
+    # Recent run-rate (shared helper, so the number ties out with the other tables).
+    recent = _descriptive_averages(agg, today_ts)[
+        ["Customer Grouping", "SKU", RECENT_COL]
+    ]
+    recent_lookup = dict(
+        zip(zip(recent["Customer Grouping"], recent["SKU"]), recent[RECENT_COL])
+    )
+
+    # First non-null Description per SKU, for the detail-card title.
+    desc_map = (
+        agg.dropna(subset=["Description"]).drop_duplicates("SKU")
+        .assign(SKU=lambda d: d["SKU"].astype(str))
+        .set_index("SKU")["Description"]
+    )
+
+    active_map = sku_active_in or {}
+    win = agg[(agg["WeekDate"] >= eight_wk_start)
+              & (agg["WeekDate"] <= last_complete_week)]
+
+    rows = []
+    for (group, sku), g in win.groupby(["Customer Grouping", "SKU"]):
+        # Skip anything that already carries a real forward projection.
+        pv = proj_lookup.get((group, sku))
+        if pv is not None and not pd.isna(pv) and round(float(pv)) != 0:
+            continue
+
+        # POS-then-Orders: POS if the SKU has any POS in the window, else Orders.
+        source = "POS" if g["POS"].notna().any() else "Orders"
+        wk = (g.dropna(subset=[source]).groupby("WeekDate")[source].sum())
+        wk = wk[wk > 0]
+        if wk.empty:
+            continue
+
+        # Spike onset = first selling week; cumulative units sold from there to now.
+        first_spike = pd.Timestamp(wk.index.min())
+        weeks_since = int(round((current_week_start - first_spike).days / 7))
+        spike_units = float(wk.sum())
+
+        rows.append({
+            "SKU": str(sku),
+            "Description": desc_map.get(str(sku)),
+            "Region": str(P.region_for_group(group)),
+            "Region Code": _region_code(P, group),
+            "Active in": active_map.get(str(sku)),
+            "Customer Grouping": group,
+            "Data Source": source,
+            SPIKE_FIRST_WEEK_COL: first_spike,
+            SPIKE_WEEKS_SINCE_COL: weeks_since,
+            RECENT_COL: recent_lookup.get((group, sku), 0.0),
+            PROJ_COL: 0,
+            PRICE_COL: _scalar_price(prices, sku),
+            "_spike_units": spike_units,
+        })
+
+    if not rows:
+        return empty
+    out = pd.DataFrame(rows)
+
+    # --- SKU-level Container Impact + WOS (constant across a SKU's rows) --------
+    # Container Impact = the SKU's total cumulative spike units (summed over its
+    # flagged rows) ÷ its Container Load. WOS = the SKU's total On Hand ÷ its total
+    # weekly projection across ALL customers (proj is per-group; sum by SKU).
+    sku_spike_units = out.groupby("SKU")["_spike_units"].sum()
+    sku_total_proj = proj.groupby("SKU")[PROJ_COL].sum() if not proj.empty \
+        else pd.Series(dtype="float64")
+    cl_map = container_load if container_load is not None else {}
+    oh_map = onhand_by_sku if onhand_by_sku is not None else {}
+
+    def _container_impact(sku):
+        load = _scalar_price(cl_map, sku)          # generic SKU→float lookup
+        units = float(sku_spike_units.get(sku, 0.0))
+        return units / load if not pd.isna(load) and load > 0 else np.nan
+
+    def _wos(sku):
+        onhand = _scalar_price(oh_map, sku)
+        total_proj = float(sku_total_proj.get(sku, 0.0))
+        return onhand / total_proj if not pd.isna(onhand) and total_proj > 0 else np.nan
+
+    out[CONTAINER_IMPACT_COL] = out["SKU"].map(_container_impact)
+    out[WOS_COL] = out["SKU"].map(_wos)
+    # On Hand itself, alongside the WOS it feeds: the ratio alone doesn't say whether
+    # 12 weeks of cover is 60 units or 6,000, which is what decides whether it matters.
+    out[ONHAND_COL] = out["SKU"].map(lambda s: _scalar_price(oh_map, s))
+
+    # Filter by minimum container impact. A blank impact (SKU has no Container Load)
+    # is "unknown", not "below threshold", so it's kept — mirrors _apply_thresholds.
+    if min_container_impact and min_container_impact > 0:
+        ci = out[CONTAINER_IMPACT_COL]
+        out = out[ci.isna() | (ci >= min_container_impact)]
+        if out.empty:
+            return empty
+
+    out = out.drop(columns=["_spike_units"])
+    # Plain date (not datetime) so it renders as a clean ISO string under the
+    # Styler and exports cleanly to Excel — matches the data-quality date columns.
+    out[SPIKE_FIRST_WEEK_COL] = pd.to_datetime(out[SPIKE_FIRST_WEEK_COL]).dt.date
+    out[SPIKE_WEEKS_SINCE_COL] = pd.to_numeric(
+        out[SPIKE_WEEKS_SINCE_COL], errors="coerce").astype("Int64")
+    out[RECENT_COL] = pd.to_numeric(out[RECENT_COL], errors="coerce").round(1)
+    out[PRICE_COL] = pd.to_numeric(out[PRICE_COL], errors="coerce")
+    # Worst-first: by container impact where known, else by recent run-rate.
+    out["_sort"] = out[CONTAINER_IMPACT_COL].fillna(out[RECENT_COL]).abs()
+    out[CONTAINER_IMPACT_COL] = out[CONTAINER_IMPACT_COL].round(1)
+    out[WOS_COL] = out[WOS_COL].round(1)
+    return out.sort_values("_sort", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# "Group by" roll-up helpers (pure — no Streamlit, so unit-testable).
+# ---------------------------------------------------------------------------
+def _plural(n, noun):
+    """"1 SKU" / "2 SKUs", "1 customer" / "3 customers" — a member-count label."""
+    n = int(n)
+    return f"{n:,} {noun}" if n == 1 else f"{n:,} {noun}s"
+
+
+def _sum_distinct_skus(frame, key, idx, col):
+    """Sum a SKU-LEVEL column over each group's distinct SKUs, or all-NaN if absent.
+
+    Container Impact / On Hand are constant across a SKU's customer rows, so a plain
+    groupby-sum would count a SKU once per customer. De-duplicating on (group, SKU)
+    first counts it once per group, which is what "containers of unplanned demand" and
+    "units on the shelf" actually mean when rolled up.
+
+    Returns an all-NaN column when ``col`` isn't on the frame, rather than raising:
+    the supply columns are optional (no On Hand map loaded → no column), and a
+    roll-up must not become the thing that fails because of it.
+    """
+    if col not in frame.columns:
+        return pd.Series(np.nan, index=idx, dtype="float64")
+    subset = ["SKU"] if key == "SKU" else [key, "SKU"]
+    return (frame.drop_duplicates(subset=subset)
+            .groupby(key, sort=False)[col].sum(min_count=1).reindex(idx))
+
+
+def _first_at_sku_grain(frame, grouped, group_by, idx, col):
+    """A per-SKU RATIO carried through a roll-up, or all-NaN where it can't be.
+
+    Weeks of Supply and the recent trend don't sum: averaging or adding supply cover
+    (or two percent changes) across SKUs produces a number that means nothing. At the
+    SKU grain the value is genuinely identical on every row of the group, so ``first``
+    is exact; at the customer/region grains it is left blank rather than invented.
+
+    All-NaN when ``col`` is absent, for the same reason as ``_sum_distinct_skus``.
+    """
+    if col not in frame.columns or group_by != GROUP_SKU:
+        return pd.Series(np.nan, index=idx, dtype="float64")
+    return grouped[col].first()
+
+
+def _join_regions(s):
+    """Comma-separated sorted unique regions in a group (for the SKU grain, where a
+    SKU can span several regions)."""
+    return ", ".join(sorted({str(r) for r in s.dropna()}))
+
+
+def _dim_labels(group_by, key_index, n_sku, n_cust, region_first, region_join):
+    """Display values for the SKU / Customer Grouping / Region columns at a
+    non-default grain. The key column holds the real group value; the collapsed
+    dimensions show a member-count, and a SKU spanning regions lists them all."""
+    keys = key_index.astype(str)
+    if group_by == GROUP_SKU:
+        sku = keys
+        cust = n_cust.map(lambda x: _plural(x, "customer")).to_numpy()
+        region = region_join.astype(str).to_numpy()     # every region the SKU is in
+    elif group_by == GROUP_CUSTOMER:
+        sku = n_sku.map(lambda x: _plural(x, "SKU")).to_numpy()
+        cust = keys
+        region = region_first.astype(str).to_numpy()   # one region per customer
+    else:  # GROUP_REGION
+        sku = n_sku.map(lambda x: _plural(x, "SKU")).to_numpy()
+        cust = n_cust.map(lambda x: _plural(x, "customer")).to_numpy()
+        region = keys
+    return sku, cust, region
+
+
+def aggregate_exceptions(frame, group_by):
+    """Roll the (SKU × Customer) exceptions frame up to one row per Customer /
+    SKU / Region. Returns ``frame`` unchanged for ``GROUP_DETAIL`` (or empty).
+
+    Additive metrics (8-week average, projection, revenue risk) are summed and the
+    derived columns (% deviation, direction, Note, sort key) are recomputed from the
+    summed totals using the same rules as ``compute_exceptions`` — so a group's net
+    gap correctly nets its under- and over-projected SKUs. List Price is kept only at
+    the SKU grain (a blended price across SKUs is meaningless)."""
+    if group_by == GROUP_DETAIL or frame is None or frame.empty:
+        return frame
+    key = _GROUP_KEY[group_by]
+    g = frame.groupby(key, dropna=False, sort=False)
+
+    recent = g[RECENT_COL].sum(min_count=1).astype("float64")
+    proj = g[PROJ_COL].sum(min_count=1).astype("float64")
+    impact = g[IMPACT_COL].sum(min_count=1)
+    weeks = g[WEEKS_COL].max()
+    n_sku = g["SKU"].nunique()
+    n_cust = g["Customer Grouping"].nunique()
+    region_first = g["Region"].first()
+    region_join = g["Region"].agg(_join_regions)
+    has_pos = g["Data Source"].agg(lambda s: (s == "POS").any())
+    has_ord = g["Data Source"].agg(lambda s: (s != "POS").any())
+    idx = recent.index
+
+    recent_f = recent.fillna(0.0).to_numpy()
+    proj_f = proj.fillna(0.0).to_numpy()
+    gap = np.rint(recent_f - proj_f)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pct = np.where(proj_f != 0, gap / proj_f, np.nan)
+    # A group selling nothing against a real plan is a full over-projection (-100%).
+    pct = np.where((recent_f == 0) & (proj_f > 0), -1.0, pct)
+    flag = np.where(proj_f == 0, "No forecasts given",
+                    np.where((recent_f == 0) & (proj_f > 0), "No recent sales", ""))
+    direction = np.select([gap > 0, gap < 0], [UNDER, OVER], default=ON_PLAN)
+    data_source = np.where(has_pos.to_numpy() & has_ord.to_numpy(), "Mixed",
+                           np.where(has_pos.to_numpy(), "POS", "Orders"))
+
+    sku_col, cust_col, region_col = _dim_labels(
+        group_by, idx, n_sku, n_cust, region_first, region_join)
+
+    # Trend is a ratio of two windows, so it only survives where the rolled-up rows
+    # still describe one series: summing "+40%" and "−10%" is meaningless. At the SKU
+    # grain a SKU's trend is genuinely the same across its customer rows, so .first()
+    # is exact; at the customer/region grains it is left blank rather than invented.
+    trend = _first_at_sku_grain(frame, g, group_by, idx, TREND_COL)
+    # On Hand is per-SKU units and sums over the group's DISTINCT SKUs; WOS is a
+    # ratio and, like the trend, survives only at the SKU grain.
+    onhand = _sum_distinct_skus(frame, key, idx, ONHAND_COL)
+    wos = _first_at_sku_grain(frame, g, group_by, idx, WOS_COL)
+
+    if group_by == GROUP_SKU:
+        desc = (frame.dropna(subset=["Description"]).groupby(key, sort=False)["Description"]
+                .first().reindex(idx))
+        price = g[PRICE_COL].first()
+    else:
+        counts = [_plural(c, "customer") for c in n_cust.to_numpy()] \
+            if group_by == GROUP_REGION else None
+        skus = [_plural(s, "SKU") for s in n_sku.to_numpy()]
+        desc = pd.Series(
+            [f"{c}, {s}" for c, s in zip(counts, skus)] if counts else skus, index=idx)
+        price = pd.Series(np.nan, index=idx, dtype="float64")
+
+    out = pd.DataFrame({
+        "SKU": pd.Series(sku_col, index=idx).astype("string"),
+        "Description": pd.Series(desc, index=idx),
+        "Customer Grouping": pd.Series(cust_col, index=idx),
+        "Region": pd.Series(region_col, index=idx),
+        "Data Source": pd.Series(data_source, index=idx),
+        RECENT_COL: np.rint(recent_f).astype("int64"),
+        TREND_COL: pd.to_numeric(trend, errors="coerce"),
+        PROJ_COL: np.rint(proj_f).astype("int64"),
+        WEEKS_COL: pd.to_numeric(weeks, errors="coerce").fillna(0).astype("int64"),
+        GAP_COL: gap.astype("int64"),
+        PCT_COL: (pd.Series(pct, index=idx) * 100).round(2),
+        IMPACT_COL: impact.round(),
+        FLAG_COL: pd.Series(flag, index=idx),
+        PRICE_COL: pd.to_numeric(price, errors="coerce"),
+        ONHAND_COL: pd.to_numeric(onhand, errors="coerce"),
+        WOS_COL: pd.to_numeric(wos, errors="coerce").round(1),
+        STATUS_COL: pd.Series(direction, index=idx).map(STATUS_SHORT).fillna(
+            pd.Series(direction, index=idx)),
+        DIRECTION_COL: pd.Series(direction, index=idx),
+        "_sort": impact.abs().fillna(pd.Series(np.abs(gap), index=idx)),
+    })
+    for c in (RECENT_COL, PROJ_COL, WEEKS_COL, GAP_COL):
+        out[c] = out[c].astype("Int64")
+    return out.reset_index(drop=True)
+
+
+def aggregate_spikes(frame, group_by):
+    """Roll the (SKU × Customer) spikes frame up to one row per Customer / SKU /
+    Region. Returns ``frame`` unchanged for ``GROUP_DETAIL`` (or empty).
+
+    8-week run-rate sums; First Week Spike is the earliest onset and Weeks Since
+    Spike the largest. Container Impact (SKU-level) is summed over the *distinct*
+    SKUs in each group — containers of unplanned demand are additive. WOS Impact is
+    a per-SKU supply ratio that does not sum, so it survives only the SKU grain."""
+    if group_by == GROUP_DETAIL or frame is None or frame.empty:
+        return frame
+    key = _GROUP_KEY[group_by]
+    g = frame.groupby(key, dropna=False, sort=False)
+
+    recent = g[RECENT_COL].sum(min_count=1)
+    first_wk = pd.to_datetime(g[SPIKE_FIRST_WEEK_COL].min())
+    weeks_since = g[SPIKE_WEEKS_SINCE_COL].max()
+    n_sku = g["SKU"].nunique()
+    n_cust = g["Customer Grouping"].nunique()
+    region_first = g["Region"].first()
+    region_code_first = g["Region Code"].first()
+    region_join = g["Region"].agg(_join_regions)
+    active_first = g["Active in"].first()
+    has_pos = g["Data Source"].agg(lambda s: (s == "POS").any())
+    has_ord = g["Data Source"].agg(lambda s: (s != "POS").any())
+    idx = recent.index
+
+    # Container Impact is constant per SKU; de-dup on (group, SKU) before summing so
+    # a SKU spanning multiple customers/regions is counted once per group.
+    container = _sum_distinct_skus(frame, key, idx, CONTAINER_IMPACT_COL)
+    # On Hand is per-SKU units, so it sums over the group's DISTINCT SKUs (same
+    # de-dup as Container Impact). WOS is a ratio and does not sum, so it survives
+    # only at the SKU grain — summing supply cover across SKUs would be meaningless.
+    onhand = _sum_distinct_skus(frame, key, idx, ONHAND_COL)
+    wos = _first_at_sku_grain(frame, g, group_by, idx, WOS_COL)
+
+    data_source = np.where(has_pos.to_numpy() & has_ord.to_numpy(), "Mixed",
+                           np.where(has_pos.to_numpy(), "POS", "Orders"))
+    sku_col, cust_col, region_col = _dim_labels(
+        group_by, idx, n_sku, n_cust, region_first, region_join)
+
+    if group_by == GROUP_SKU:
+        desc = (frame.dropna(subset=["Description"]).groupby(key, sort=False)["Description"]
+                .first().reindex(idx))
+        price = g[PRICE_COL].first()
+        region_code = region_code_first
+        active = active_first
+    else:
+        skus = [_plural(s, "SKU") for s in n_sku.to_numpy()]
+        counts = [_plural(c, "customer") for c in n_cust.to_numpy()] \
+            if group_by == GROUP_REGION else None
+        desc = pd.Series(
+            [f"{c}, {s}" for c, s in zip(counts, skus)] if counts else skus, index=idx)
+        price = pd.Series(np.nan, index=idx, dtype="float64")
+        region_code = region_code_first   # region is single per customer; the region key otherwise
+        active = pd.Series(pd.NA, index=idx)
+
+    out = pd.DataFrame({
+        "SKU": pd.Series(sku_col, index=idx).astype("string"),
+        "Description": pd.Series(desc, index=idx),
+        "Region": pd.Series(region_col, index=idx),
+        "Region Code": pd.Series(region_code, index=idx),
+        "Active in": pd.Series(active, index=idx),
+        "Customer Grouping": pd.Series(cust_col, index=idx),
+        "Data Source": pd.Series(data_source, index=idx),
+        SPIKE_FIRST_WEEK_COL: first_wk.dt.date,
+        SPIKE_WEEKS_SINCE_COL: pd.to_numeric(weeks_since, errors="coerce").astype("Int64"),
+        RECENT_COL: pd.to_numeric(recent, errors="coerce").round(1),
+        PROJ_COL: 0,
+        PRICE_COL: pd.to_numeric(price, errors="coerce"),
+        CONTAINER_IMPACT_COL: container.round(1),
+        ONHAND_COL: pd.to_numeric(onhand, errors="coerce"),
+        WOS_COL: pd.to_numeric(wos, errors="coerce").round(1),
+    })
+    out["_sort"] = out[CONTAINER_IMPACT_COL].fillna(out[RECENT_COL]).abs()
+    return out.sort_values("_sort", ascending=False).reset_index(drop=True)
+
+
+def _exc_cols_for(group_by):
+    """(condensed_cols, column_config, title_col) for the exceptions tables at a
+    grain — the leftmost condensed column is always the group key."""
+    if group_by == GROUP_SKU:
+        cols = ["SKU", "Region", RECENT_COL, PROJ_COL, IMPACT_COL]
+        return cols, {}, _TITLE_COL[group_by]
+    if group_by == GROUP_CUSTOMER:
+        cols = ["Customer Grouping", "Region", RECENT_COL, PROJ_COL, IMPACT_COL]
+        return cols, {"Customer Grouping": st.column_config.Column("Customer")}, _TITLE_COL[group_by]
+    if group_by == GROUP_REGION:
+        cols = ["Region", RECENT_COL, PROJ_COL, IMPACT_COL]
+        return cols, {}, _TITLE_COL[group_by]
+    return CONDENSED_EXCEPTION_COLS, _CONDENSED_COLUMN_CONFIG, _TITLE_COL[GROUP_DETAIL]
+
+
+def _spike_cols_for(group_by):
+    """(condensed_cols, column_config, title_col) for the spikes table at a grain."""
+    tail = [SPIKE_FIRST_WEEK_COL, SPIKE_WEEKS_SINCE_COL, RECENT_COL, CONTAINER_IMPACT_COL]
+    if group_by == GROUP_DETAIL:
+        return SPIKE_CONDENSED_COLS, _SPIKE_COLUMN_CONFIG, _TITLE_COL[GROUP_DETAIL]
+    cfg = {
+        CONTAINER_IMPACT_COL: st.column_config.NumberColumn(format="%.1f"),
+        WOS_COL: st.column_config.NumberColumn(format="%.1f"),
+    }
+    if group_by == GROUP_SKU:
+        cols = ["SKU", "Region"] + tail
+    elif group_by == GROUP_CUSTOMER:
+        cols = ["Customer Grouping", "Region"] + tail
+        cfg["Customer Grouping"] = st.column_config.Column("Customer")
+    else:  # GROUP_REGION
+        cols = ["Region"] + tail
+    return cols, cfg, _TITLE_COL[group_by]
+
+
+def _render_aggregate_chart(agg, anchors, P, group_by, row, key_base):
+    """Detail-card chart for a rolled-up row: sum the weekly POS/Orders/Projection
+    across the group's members and plot the same actuals-vs-plan chart. No per-SKU
+    "Calculate Optimal Projection" (that is inherently a single SKU/group).
+
+    Signature matches the ``detail_chart(row, key_base)`` contract — bind the
+    leading args via functools.partial (agg, anchors, P, group_by)."""
+    if agg is None or agg.empty:
+        return
+    if group_by == GROUP_REGION:
+        target = row.get("Region")
+        groups = [gr for gr in agg["Customer Grouping"].dropna().unique()
+                  if str(P.region_for_group(gr)) == str(target)]
+        ag = agg[agg["Customer Grouping"].isin(groups)]
+    elif group_by == GROUP_CUSTOMER:
+        target = row.get("Customer Grouping")
+        ag = agg[agg["Customer Grouping"].astype(str) == str(target)]
+    else:  # GROUP_SKU
+        target = row.get("SKU")
+        ag = agg[agg["SKU"].astype(str) == str(target)]
+    if ag.empty:
+        st.caption("No weekly history to chart for this group.")
+        return
+
+    summed = (ag.groupby("WeekDate", as_index=False)[["POS", "Orders", "Projection"]]
+              .sum(min_count=1))
+    title = str(target)
+    summed["SKU"] = title      # actuals_vs_plan_chart filters agg by this SKU value
+    source = "POS" if ag["POS"].notna().any() else "Orders"
+    _, lcw, ffw = anchors
+    chart_lb = pd.to_datetime(summed["WeekDate"]).min()
+    key = re.sub(r"[^0-9A-Za-z_]+", "_", f"{key_base}__aggchart__{group_by}__{title}")
+    date_range = chart_range_control(summed, summed, lcw, key=key)
+    fig = actuals_vs_plan_chart(title, row.get("Description"), source, summed,
+                                (chart_lb, lcw, ffw), date_range=date_range)
+    st.plotly_chart(fig, width="stretch", key=f"{key}_plot")
 
 
 def _apply_thresholds(frame, min_pct, min_dollar):
@@ -418,12 +1017,17 @@ def _download_button(table, slug, label, today_str):
 
 
 def _section(frame, direction, key, P, today_str, slug, label, cols=None,
-             empty_msg=None, chart_cb=None):
+             empty_msg=None, chart_cb=None, condensed_cols=None, column_config=None,
+             title_col="SKU"):
     """Render one direction's ranked, filterable table (worst first). ``cols``
-    selects the column set (All-Exceptions vs Key SKUs); ``empty_msg`` overrides
+    selects the full column set (All-Exceptions vs Key SKUs); ``empty_msg`` overrides
     the placeholder caption when the section has no rows; ``slug``/``label`` name
-    the download file and button; ``chart_cb`` draws the per-row detail chart."""
+    the download file and button; ``chart_cb`` draws the per-row detail chart.
+    ``condensed_cols``/``column_config``/``title_col`` adapt the on-screen row to the
+    current "Group by" grain (default: the SKU × Customer layout)."""
     cols = cols if cols is not None else _DISPLAY_COLS
+    condensed_cols = condensed_cols if condensed_cols is not None else CONDENSED_EXCEPTION_COLS
+    column_config = column_config if column_config is not None else _CONDENSED_COLUMN_CONFIG
     sub = frame[frame[DIRECTION_COL] == direction].sort_values(
         "_sort", ascending=False
     )
@@ -431,17 +1035,147 @@ def _section(frame, direction, key, P, today_str, slug, label, cols=None,
     if sub.empty:
         st.caption(empty_msg or "No SKUs flagged in this section at the current thresholds.")
         return
-    st.caption(f"{len(sub):,} SKUs flagged")
-    render_selectable_table(sub[cols], key, P, condensed_cols=CONDENSED_EXCEPTION_COLS,
-                            style=True, column_config=_CONDENSED_COLUMN_CONFIG,
-                            detail_chart=chart_cb, detail_cols=EXCEPTION_CARD_COLS)
+    st.caption(f"{len(sub):,} rows flagged")
+    render_selectable_table(sub[cols], key, P, condensed_cols=condensed_cols,
+                            style=True, column_config=column_config,
+                            detail_chart=chart_cb, detail_cols=EXCEPTION_CARD_COLS,
+                            title_col=title_col)
     _download_button(sub[cols], slug, label, today_str)
 
 
-def _render_all_exceptions_tab(frame, P, today_str, chart_cb=None):
-    """The All-Exceptions tab: severity thresholds + Under/Over sections over the
-    diverging rows (on-plan rows are excluded here)."""
-    diverging = frame[frame[DIRECTION_COL] != ON_PLAN]
+# Distinct container-impact thresholds held at once (the two tabs have their own
+# widget, and a planner nudging the stepper walks through values). Each entry is
+# one spikes frame — a few thousand rows — so a small cap keeps memory flat.
+SPIKE_CACHE_MAX = 6
+
+
+def _spikes_cached(agg, today_ts, prices, P, sku_active_in, container_load,
+                   onhand_by_sku, min_container_impact):
+    """``compute_spikes`` memoised per (structural signature, threshold).
+
+    Streamlit executes the body of EVERY ``st.tabs`` branch on every rerun, and
+    both Exceptions tabs render the spikes table — so an ungated call meant two
+    full scans (~8s each on the live snapshot) for every widget interaction, even
+    a threshold nudge that changes nothing about the scan.
+
+    The tabs differ only in the key-SKU filter and the group-by rollup, and both
+    are applied to the RESULT of the scan (see ``_render_spikes_section``), so one
+    shared frame is exactly equivalent to computing it per tab.
+
+    Keyed on ``exceptions_structural`` — the same signature guarding the
+    exceptions frame, which already covers today / prices / data / warehouse /
+    allocation and now on-hand — plus the threshold, which is the only other live
+    input ``compute_spikes`` reads. Cached per threshold rather than as a single
+    slot so two tabs sitting at different thresholds don't thrash the cache.
+    """
+    store = st.session_state.setdefault("exceptions_spikes", {})
+    sig = st.session_state.get("exceptions_structural")
+    if st.session_state.get("exceptions_spikes_sig") != sig:
+        store.clear()                       # new data -> every threshold is stale
+        st.session_state["exceptions_spikes_sig"] = sig
+
+    key = float(min_container_impact)
+    if key not in store:
+        frame = compute_spikes(
+            agg, today_ts, prices, P, sku_active_in,
+            container_load=container_load, onhand_by_sku=onhand_by_sku,
+            min_container_impact=min_container_impact,
+        )
+        bounded_put(store, key, frame, SPIKE_CACHE_MAX)
+    # Hand out a copy, so the two tabs keep the independent frames they had when
+    # each called compute_spikes itself. aggregate_spikes returns its input
+    # unchanged at the default grain, so without this both tabs would share one
+    # object and any future in-place edit in one would leak into the other.
+    return store[key].copy()
+
+
+def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
+                           key_skus=None, key_suffix="", chart_cb=None,
+                           container_load=None, onhand_by_sku=None,
+                           group_by=GROUP_DETAIL, anchors=None):
+    """The "Recent spikes in POS/Orders with no projections" table for one tab.
+
+    Flags SKUs we project 0 for that have started selling in the last 8 weeks, with
+    the onset week and the SKU-level Container Impact / WOS. A "Minimum container
+    impact" threshold (keyed by ``key_suffix`` so the two tabs' widgets stay
+    independent) focuses the table on the largest unplanned demand. ``key_skus`` (or
+    None) restricts the table to the watchlist. ``container_load``/``onhand_by_sku``
+    drive the SKU-level Container Impact / WOS columns."""
+    st.markdown("#### Recent spikes in POS/Orders with no projections")
+    st.caption(
+        "SKUs we currently project **0** for that have **started selling** in the "
+        "last 8 weeks — demand we aren't planning for yet. The **first selling week** "
+        "is the spike onset; raise the minimum container impact to focus on the "
+        "largest unplanned demand."
+    )
+    st.markdown(
+        "- **Container Impact** = units sold since the spike ÷ the SKU's Container "
+        "Load (how many containers' worth of unplanned demand).\n"
+        "- **WOS Impact** (Weeks of Supply) = the SKU's **total** On Hand ÷ its "
+        "**total** weekly projection across all customers.\n"
+        "  - Both are **SKU-level**, so every row for the same SKU shows the same "
+        "value; blank when Container Load / On Hand is unavailable. (Revenue Risk of "
+        "moving to the model's forecast shows in the detail card via "
+        "**Calculate Optimal Projection**.)"
+    )
+    c1, _ = st.columns([1, 3])
+    min_container_impact = c1.number_input(
+        "Minimum container impact", min_value=0.0, max_value=100_000.0, value=0.2,
+        step=0.5, key=f"spike_ci{key_suffix}",
+        help="Hide SKUs whose total unplanned demand is below this many containers "
+             "(units sold since the spike ÷ Container Load). SKUs without a Container "
+             "Load are always shown.",
+    )
+
+    frame = _spikes_cached(agg, today_ts, prices, P, sku_active_in,
+                           container_load, onhand_by_sku, min_container_impact)
+    if key_skus is not None:
+        frame = frame[frame["SKU"].isin(key_skus)]
+    if frame.empty:
+        st.caption("No SKUs projected 0 with a recent spike at the current minimum "
+                   "container impact.")
+        return
+
+    # Roll up to the chosen grain (identity for the default) and pick the matching
+    # condensed columns + chart callback.
+    frame = aggregate_spikes(frame, group_by)
+    condensed, col_cfg, title_col = _spike_cols_for(group_by)
+    section_chart = chart_cb if group_by == GROUP_DETAIL else \
+        partial(_render_aggregate_chart, agg, anchors, P, group_by)
+    st.caption(f"{len(frame):,} rows flagged")
+
+    # Carry the hidden PROJ_COL/PRICE_COL so the detail-card chart callback can value
+    # the optimized projection; they're excluded from the shown/condensed sets.
+    show_cols = SPIKE_DISPLAY_COLS + [PROJ_COL, PRICE_COL]
+    render_selectable_table(
+        frame[show_cols], f"exc_spikes{key_suffix}", P,
+        condensed_cols=condensed, style=True,
+        column_config=col_cfg,
+        detail_chart=section_chart, detail_cols=SPIKE_CARD_COLS,
+        title_col=title_col,
+    )
+    _download_button(frame[SPIKE_DISPLAY_COLS], f"spikes_no_projection{key_suffix}",
+                     "Recent Spikes table", today_str)
+
+
+def _render_all_exceptions_tab(frame, P, today_str, chart_cb=None,
+                               agg=None, prices=None, sku_active_in=None, today_ts=None,
+                               container_load=None, onhand_by_sku=None, anchors=None):
+    """The All-Exceptions tab: a Group-by selector, severity thresholds, and
+    Under/Over sections over the diverging rows (on-plan rows are excluded here)."""
+    group_by = st.segmented_control(
+        "Group by", GROUP_BY_OPTIONS, default=GROUP_DETAIL, key="grp_all",
+        help="Roll every table up to one row per Customer, SKU, or Region "
+             "(summing the metrics), or keep the SKU × Customer detail.",
+    ) or GROUP_DETAIL
+    condensed, col_cfg, title_col = _exc_cols_for(group_by)
+    section_chart = chart_cb if group_by == GROUP_DETAIL else \
+        partial(_render_aggregate_chart, agg, anchors, P, group_by)
+
+    # Roll up (identity for the default grain) BEFORE splitting by direction, so a
+    # group's net gap nets its under- and over-projected SKUs.
+    agg_frame = aggregate_exceptions(frame, group_by)
+    diverging = agg_frame[agg_frame[DIRECTION_COL] != ON_PLAN]
     if diverging.empty:
         st.info("No exceptions found — every SKU's recent sell-through tracks its projection.")
         return
@@ -450,18 +1184,17 @@ def _render_all_exceptions_tab(frame, P, today_str, chart_cb=None):
     c1, c2, _ = st.columns([1, 1, 2])
     min_pct = c1.number_input(
         "Min % deviation", min_value=0, max_value=1000, value=50, step=10,
-        help="Hide SKUs whose recent run-rate is within this % of the projection.",
+        help="Hide rows whose recent run-rate is within this % of the projection.",
     ) / 100.0
     min_dollar = c2.number_input(
         "Min revenue risk / wk", min_value=0, max_value=1_000_000, value=0, step=100,
-        help="Hide SKUs whose weekly revenue risk is below this (0 = off). "
-             "SKUs with no list price are always kept.",
+        help="Hide rows whose weekly revenue risk is below this (0 = off). "
+             "Rows with no list price are always kept.",
     )
 
     flagged = _apply_thresholds(diverging, min_pct, min_dollar)
-    total_active = frame["SKU"].nunique()
     st.caption(
-        f"{flagged['SKU'].nunique():,} SKUs flagged of {total_active:,} scanned "
+        f"{len(flagged):,} rows flagged of {len(agg_frame):,} scanned "
         f"(≥{int(min_pct * 100)}% deviation"
         + (f" and ≥${min_dollar:,}/wk revenue risk" if min_dollar else "") + ")."
     )
@@ -472,11 +1205,18 @@ def _render_all_exceptions_tab(frame, P, today_str, chart_cb=None):
 
     _section(flagged, UNDER, "exc_under", P, today_str,
              slug="exceptions_under-projected",
-             label="Understocked Exceptions table", chart_cb=chart_cb)
+             label="Understocked Exceptions table", chart_cb=section_chart,
+             condensed_cols=condensed, column_config=col_cfg, title_col=title_col)
     st.divider()
     _section(flagged, OVER, "exc_over", P, today_str,
              slug="exceptions_over-projected",
-             label="Overstocked Exceptions table", chart_cb=chart_cb)
+             label="Overstocked Exceptions table", chart_cb=section_chart,
+             condensed_cols=condensed, column_config=col_cfg, title_col=title_col)
+    st.divider()
+    _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
+                           key_skus=None, key_suffix="_all", chart_cb=chart_cb,
+                           container_load=container_load, onhand_by_sku=onhand_by_sku,
+                           group_by=group_by, anchors=anchors)
 
 
 def _render_key_skus_fetch_prompt():
@@ -508,7 +1248,9 @@ def _render_key_skus_fetch_prompt():
             st.warning(msg)
 
 
-def _render_key_skus_tab(frame, P, today_str, chart_cb=None):
+def _render_key_skus_tab(frame, P, today_str, chart_cb=None,
+                         agg=None, prices=None, sku_active_in=None, today_ts=None,
+                         container_load=None, onhand_by_sku=None, anchors=None):
     """The Key SKUs watchlist tab: every key SKU (from extract_key_skus.py) with
     its status, no threshold filtering — a always-on watchlist of important items."""
     path = discover_key_skus_file()
@@ -532,18 +1274,30 @@ def _render_key_skus_tab(frame, P, today_str, chart_cb=None):
         st.info("None of the key SKUs appear in the current demand data.")
         return
 
-    # Status is set centrally in compute_exceptions (shown on both tabs now).
+    group_by = st.segmented_control(
+        "Group by", GROUP_BY_OPTIONS, default=GROUP_DETAIL, key="grp_key",
+        help="Roll every table up to one row per Customer, SKU, or Region "
+             "(summing the metrics), or keep the SKU × Customer detail.",
+    ) or GROUP_DETAIL
+    condensed, col_cfg, title_col = _exc_cols_for(group_by)
+    section_chart = chart_cb if group_by == GROUP_DETAIL else \
+        partial(_render_aggregate_chart, agg, anchors, P, group_by)
+    # Status is set centrally in compute_exceptions; roll the key-SKU frame up to
+    # the chosen grain (identity for the default) before splitting by direction.
+    key_frame = aggregate_exceptions(key_frame, group_by)
 
     # Split into the two planning actions, same layout as the All-Exceptions tab.
     _section(key_frame, UNDER, "exc_key_under", P, today_str,
              slug="key_skus_under-projected", label="Understocked Key SKUs table",
              cols=KEY_DISPLAY_COLS, empty_msg="No under-projected key SKUs.",
-             chart_cb=chart_cb)
+             chart_cb=section_chart, condensed_cols=condensed, column_config=col_cfg,
+             title_col=title_col)
     st.divider()
     _section(key_frame, OVER, "exc_key_over", P, today_str,
              slug="key_skus_over-projected", label="Overstocked Key SKUs table",
              cols=KEY_DISPLAY_COLS, empty_msg="No over-projected key SKUs.",
-             chart_cb=chart_cb)
+             chart_cb=section_chart, condensed_cols=condensed, column_config=col_cfg,
+             title_col=title_col)
 
     # On-plan key SKUs belong to neither table; keep them in a collapsed section
     # so the watchlist still accounts for every key SKU.
@@ -551,17 +1305,24 @@ def _render_key_skus_tab(frame, P, today_str, chart_cb=None):
         "_sort", ascending=False
     )
     if not on_plan.empty:
-        with st.expander(f"On-plan key SKUs ({on_plan['SKU'].nunique():,})"):
+        with st.expander(f"On-plan key SKUs ({len(on_plan):,})"):
             render_selectable_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
-                                    condensed_cols=CONDENSED_EXCEPTION_COLS,
-                                    style=True, column_config=_CONDENSED_COLUMN_CONFIG,
-                                    detail_chart=chart_cb, detail_cols=EXCEPTION_CARD_COLS)
+                                    condensed_cols=condensed,
+                                    style=True, column_config=col_cfg,
+                                    detail_chart=section_chart, detail_cols=EXCEPTION_CARD_COLS,
+                                    title_col=title_col)
             _download_button(on_plan[KEY_DISPLAY_COLS], "key_skus_on-plan",
                              "On-plan Key SKUs table", today_str)
 
     if missing:
         with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):
             st.markdown("\n".join(f"- {s}" for s in missing))
+
+    st.divider()
+    _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
+                           key_skus=key_skus, key_suffix="_key", chart_cb=chart_cb,
+                           container_load=container_load, onhand_by_sku=onhand_by_sku,
+                           group_by=group_by, anchors=anchors)
 
 
 def _render_data_quality_expanders(
@@ -600,10 +1361,11 @@ def _render_data_quality_expanders(
 
 
 def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors, P=None,
+                      data_sig=None,
                       *, warehouse_df=None, plytix_df=None, check_ran=False,
                       inactive_df=None, excluded_counts_by_key=None,
                       disc_check_ran=False, discontinued_df=None,
-                      allocation_pairs=None):
+                      allocation_pairs=None, onhand_by_sku=None):
     """Render the EXCEPTIONS_VIEW. Mirrors _render_best_model_combined's call
     signature so main() can dispatch it the same way; the page title is already
     drawn by main(), so we start at the subheader.
@@ -636,11 +1398,17 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     price_marker = None if prices is None else int(len(prices))
     wh_marker = None if warehouse_df is None else int(len(warehouse_df))
     alloc_marker = None if allocation_pairs is None else len(allocation_pairs)
+    # On-hand feeds the On Hand / WOS columns on BOTH the exceptions frame and the
+    # spikes table, and is threaded in from the caller rather than derived here, so it
+    # needs its own marker — otherwise a new snapshot's on-hand would not invalidate
+    # either cache, both of which key off this signature.
+    onhand_marker = None if onhand_by_sku is None else int(len(onhand_by_sku))
     sig = (EXCEPTIONS_VIEW_SIG, today_str, price_marker, n_excluded_rows,
-           wh_marker, alloc_marker)
+           wh_marker, alloc_marker, onhand_marker)
     if st.session_state.get("exceptions_structural") != sig:
         with st.spinner("Scanning for exceptions…"):
-            frame = compute_exceptions(df, today_ts, prices, P)
+            frame = compute_exceptions(df, today_ts, prices, P,
+                                       onhand_by_sku=onhand_by_sku)
             st.session_state["exceptions_frame"] = frame
             # Per-SKU-week frame for the detail-card charts (same aggregation the
             # table uses, so the plotted series tie out with the row's numbers).
@@ -657,11 +1425,19 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
                 df, plytix_df, P, anchors=anchors
             )
             st.session_state["exceptions_cust_source"] = customer_source_map(frame)
+            # SKU -> "Active in" regions (Plytix) for the spikes table; None when the
+            # export lacks the columns (older list-price file) — the column stays blank.
+            st.session_state["exceptions_active_in"] = compute_active_products(plytix_df)[1]
+            # SKU -> Container Load (Plytix) for the spikes table's Container Impact.
+            st.session_state["exceptions_container_load"] = container_load_from_plytix(plytix_df)
         st.session_state["exceptions_structural"] = sig
     frame = st.session_state.get("exceptions_frame")
     missing_df = st.session_state.get("exceptions_missing_df")
     missing_pos_df = st.session_state.get("exceptions_missing_pos_df")
     cust_source = st.session_state.get("exceptions_cust_source")
+    sku_active_in = st.session_state.get("exceptions_active_in")
+    container_load = st.session_state.get("exceptions_container_load")
+    agg = st.session_state.get("exceptions_agg")
 
     if frame is None or frame.empty:
         st.info("No exceptions found — every SKU's recent sell-through tracks its projection.")
@@ -684,15 +1460,18 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     # per-SKU-week frame, anchors, and the cleaned df / prices / today (needed for the
     # optimized forecast); called as (row, key_base) per the detail_chart contract.
     chart_cb = partial(_render_exception_chart, st.session_state.get("exceptions_agg"),
-                       anchors, df, prices, today_ts)
+                       anchors, df, prices, today_ts, data_sig)
 
+    spike_kw = dict(agg=agg, prices=prices, sku_active_in=sku_active_in, today_ts=today_ts,
+                    container_load=container_load, onhand_by_sku=onhand_by_sku,
+                    anchors=anchors)
     tab_key, tab_all = st.tabs(["Key SKUs", "All Exceptions"])
     with tab_key:
-        _render_key_skus_tab(frame, P, today_str, chart_cb=chart_cb)
+        _render_key_skus_tab(frame, P, today_str, chart_cb=chart_cb, **spike_kw)
         if key_skus:
             st.divider()
             _render_data_quality_expanders(**dq_common, key_skus=key_skus, key_suffix="_key")
     with tab_all:
-        _render_all_exceptions_tab(frame, P, today_str, chart_cb=chart_cb)
+        _render_all_exceptions_tab(frame, P, today_str, chart_cb=chart_cb, **spike_kw)
         st.divider()
         _render_data_quality_expanders(**dq_common, key_skus=None, key_suffix="_all")

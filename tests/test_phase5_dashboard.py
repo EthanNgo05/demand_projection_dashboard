@@ -197,6 +197,281 @@ def test_exceptions_view_renders():
     assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min revenue risk / wk"}
 
 
+def _headings(at):
+    """The view body's "### ..." section headings, as one searchable string."""
+    return " ".join(m.value for m in at.markdown if m.value.startswith("###"))
+
+
+@needs_data
+def test_quick_default_view_is_all_customers_in_the_new_order():
+    """The default Quick Projections landing view, and its section order.
+
+    Region defaults to the ALL_REGIONS sentinel and Customer group to the raw
+    ALL_CUSTOMERS_VIEW string (raw, not the prettified label — several callers,
+    including the agent-run button, read the selected value as a view ID). The
+    body then reads KPIs -> total demand -> Customer detail -> the by-SKU-and-
+    customer table, with the view-level per-SKU table in a collapsed expander.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    assert at.session_state["quick_region"] == dashboard.ALL_REGIONS
+    assert at.selectbox(key="quick_group").value == dashboard.ALL_CUSTOMERS_VIEW
+
+    headings = _headings(at)
+    assert "### Customer detail" in headings
+    assert "### Summary table by SKU and customer" in headings
+    # Customer detail comes before the table.
+    assert headings.index("### Customer detail") < \
+        headings.index("### Summary table by SKU and customer")
+    # The old dropdown-driven SKU-detail section is gone (it lives in the table's
+    # row detail cards now).
+    assert "### SKU detail" not in headings
+    assert any("Summary table by SKU (view total)" in (e.label or "")
+               for e in at.expander)
+
+
+@needs_data
+def test_quick_region_change_resets_the_customer_group():
+    """Switching Region must re-option the Customer-group selectbox cleanly.
+
+    Both are keyed, which keeps the options list out of the widget's element
+    identity — so the stored group survives the switch and Streamlit is the one
+    that has to notice it is no longer offered and fall back to the first option
+    (that region's rollup), writing the corrected value back in the same run. If a
+    Streamlit upgrade changes that behaviour, this fails loudly rather than the
+    page throwing "value not in options" for a planner.
+
+    Only the two selectboxes matter here — they render into region_slot before the
+    body runs, so a region whose rollup has no recent demand (and therefore stops
+    the body with a "nothing to forecast" error) is still a valid probe.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    regions = [r for r in at.selectbox(key="quick_region").options
+               if r != dashboard.ALL_REGIONS]
+    # A region with at least one individual group, so there is something to hold
+    # across the switch.
+    for region in regions:
+        at.selectbox(key="quick_region").set_value(region).run()
+        assert not at.exception
+        # .options are FORMATTED labels; .value is the raw view string.
+        assert at.selectbox(key="quick_group").options[0] == \
+            dashboard.quick_group_label(dashboard.region_all_view(region))
+        if len(at.selectbox(key="quick_group").options) > 1:
+            break
+    else:
+        pytest.skip("no region has an individual customer group")
+
+    # Hold a specific group (index >= 1, where the label IS the raw group name).
+    at.selectbox(key="quick_group").select_index(1).run()
+    assert not at.exception
+    held = at.selectbox(key="quick_group").value
+    assert dashboard.region_from_view(held) is None, "expected a bare group"
+
+    # Switch to a DIFFERENT region: the held group is no longer offered, so
+    # Streamlit must fall back to the new region's rollup.
+    other = next(r for r in regions if r != region)
+    at.selectbox(key="quick_region").set_value(other).run()
+    assert not at.exception
+    assert at.selectbox(key="quick_group").value == dashboard.region_all_view(other)
+
+
+@needs_data
+def test_quick_single_group_renders_the_by_customer_table():
+    """A single customer group still gets the main by-SKU-and-customer table.
+
+    It used to be gated to the combined / region-rollup views, so this branch had
+    no coverage at all. It now runs through single_group_frames (the fast path that
+    reuses compute_view's frames). Customer detail and the view-total expander are
+    deliberately absent: with one group both would just restate the totals above.
+
+    Groups are probed rather than assumed — a group with no demand in the model's
+    window legitimately stops the body with a "nothing to forecast" error, and
+    which groups those are depends on the snapshot.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    for region in [r for r in at.selectbox(key="quick_region").options
+                   if r != dashboard.ALL_REGIONS]:
+        at.selectbox(key="quick_region").set_value(region).run()
+        assert not at.exception
+        for i in range(1, len(at.selectbox(key="quick_group").options)):
+            at.selectbox(key="quick_group").select_index(i).run()
+            assert not at.exception
+            if not at.error:
+                break
+        else:
+            continue
+        break
+    else:
+        pytest.skip("no individual customer group has demand in this snapshot")
+
+    headings = _headings(at)
+    assert "### Summary table by SKU and customer" in headings
+    assert "### Customer detail" not in headings
+    assert not any("Summary table by SKU (view total)" in (e.label or "")
+                   for e in at.expander)
+
+
+@needs_data
+def test_quick_detail_card_renders_its_kpis_as_tiles():
+    """Opening a row's detail card renders its KPIs as shaded metric tiles.
+
+    Detail-card KPIs are ``st.metric`` widgets now — that is what makes them inherit
+    the stylesheet's tile treatment instead of being flat markdown. Selecting a row
+    is driven through session_state because AppTest has no dataframe-selection API.
+
+    The card's tiles are additional metrics beyond the page's 7-KPI row, so the
+    assertion is on the DELTA between before and after selection: whatever the KPI
+    row contributes, opening a card must add the card's own fields on top.
+    """
+    import dashboard
+    from dashboard_app.config import PRICE_COL as PRICE_COL_LABEL
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    before = [m.label for m in at.metric]
+
+    # Select the first row of the by-customer table (key "filter_by_customer").
+    at.session_state["filter_by_customer__sel"] = {"selection": {"rows": [0]}}
+    at.run()
+    assert not at.exception, at.exception
+
+    after = [m.label for m in at.metric]
+    added = [lbl for lbl in after if lbl not in before]
+    if not added:
+        pytest.skip("no rows in the by-customer table for this snapshot")
+
+    # Every field the card asks for that exists on the row shows up as a tile.
+    for expected in ("Customer Grouping", "Data Source",
+                     "Current Projection Average", "Projection Difference"):
+        assert expected in added, (
+            f"{expected!r} missing from the card's tiles; got {added}"
+        )
+    # Data Source appeared in BOTH the old field grid and the old metrics column.
+    assert after.count("Data Source") == 1, (
+        f"Data Source rendered {after.count('Data Source')} times: {after}"
+    )
+    # The rendered tiles really are in KPI_ORDER — including the DERIVED ones. Sorting
+    # only the column-backed tiles left "Projected Revenue" stranded at the end of the
+    # grid, away from the List Price and Revenue Risk it is read against.
+    from dashboard_app.config import kpi_sort
+
+    assert added == kpi_sort(added), (
+        f"card tiles are not in canonical order:\n  got      {added}\n"
+        f"  expected {kpi_sort(added)}"
+    )
+    if "Projected Revenue" in added and PRICE_COL_LABEL in added:
+        assert added.index("Projected Revenue") > added.index(PRICE_COL_LABEL)
+    # The retired chart-side labels must not come back alongside the column names.
+    for retired in ("Current Forecast (avg/wk)", "Updated Forecast (avg/wk)",
+                    "Projection Difference (avg/wk)"):
+        assert retired not in added, (
+            f"{retired!r} is the old chart-column label; the tile uses the column name"
+        )
+
+
+def test_historical_window_label_covers_every_models_avg_column():
+    """The window prefix on the weekly-demand metrics, per model.
+
+    The figure's window follows the selected model, so the label has to be driven
+    off that model's own average-column name. Read the labels out of the real model
+    files rather than hardcoding them, so a model whose LOOKBACK_WEEKS changes (or a
+    new model file) shows up here instead of silently rendering a bare label.
+    """
+    from dashboard_app.compute import ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL
+    from dashboard_app.config import MODEL_OPTIONS
+    from dashboard_app.summaries import historical_window_label
+    from agent.model_loader import load_pipeline
+
+    # The canonical columns (compute.py's constants), which the model files match.
+    assert historical_window_label(EIGHT_WK_AVG_COL) == "8-Week"
+    assert historical_window_label(ALL_TIME_AVG_COL) == "All-Time"
+    # Legacy space-spelled column from a frame persisted by an older build.
+    assert historical_window_label("8 Week POS/Orders Average") == "8-Week"
+
+    seen = set()
+    for label, path in MODEL_OPTIONS.items():
+        P = load_pipeline(path)
+        avg_col = getattr(P, "AVG_COL_LABEL", EIGHT_WK_AVG_COL)
+        window = historical_window_label(avg_col)
+        assert window in {"8-Week", "All-Time"} or window.endswith("-Week"), (
+            f"{label}: {avg_col!r} produced an unusable window label {window!r}"
+        )
+        # Never leak the raw column name into a metric label.
+        assert "POS/Orders" not in window
+        seen.add(window)
+    assert seen >= {"8-Week", "All-Time"}, (
+        f"expected both windows across the model catalog, saw {seen}"
+    )
+
+
+def test_every_model_label_matches_a_canonical_average_column():
+    """A model's AVG_COL_LABEL must be one of the two canonical spellings.
+
+    ``attach_descriptive_averages`` replaces the model's average column with the
+    centrally-computed one BY NAME. A model spelling it differently (the old
+    "All-History ..." / space-spelled "8 Week ...") leaves both on the same table:
+    two columns, two definitions, one window — the exact confusion planners hit.
+    """
+    from dashboard_app.compute import ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL
+    from dashboard_app.config import MODEL_OPTIONS
+    from agent.model_loader import load_pipeline
+
+    canonical = {ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL}
+    for label, path in MODEL_OPTIONS.items():
+        P = load_pipeline(path)
+        avg_col = getattr(P, "AVG_COL_LABEL", None)
+        if avg_col is None:                    # regression: hardcoded DISPLAY_NAMES
+            avg_col = P.DISPLAY_NAMES["8_week_pos_avg"]
+        assert avg_col in canonical, (
+            f"{label}: average column {avg_col!r} is not one of {canonical} — "
+            "the dashboard would carry two copies of the same figure"
+        )
+
+
+@needs_data
+def test_quick_kpi_row_names_the_total_weekly_demand_window():
+    """The KPI row must say WHICH window its total weekly demand covers.
+
+    With the default 8-Week Moving Average model this reads "Total Weekly Demand
+    (8-Week avg)"; the other four models make it "(All-Time avg)". Without the
+    window the two are indistinguishable on screen even though they can differ
+    substantially.
+
+    It must also NOT be called "Historical Demand" any more: that name was shared
+    with a per-SKU metric on the detail card, which computed a different number
+    (weeks-with-demand denominator). This KPI is a view TOTAL and is deliberately
+    not the sum of the per-SKU average column, so its name says "Total".
+    """
+    from dashboard_app.compute import EIGHT_WK_AVG_COL
+    from dashboard_app.summaries import historical_window_label
+    from dashboard_app.pipeline import load_pipeline, pipeline_path
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+
+    P = load_pipeline(pipeline_path())
+    expected = historical_window_label(
+        getattr(P, "AVG_COL_LABEL", EIGHT_WK_AVG_COL)
+    )
+    labels = [m.label for m in at.metric]
+    assert f"Total Weekly Demand ({expected} avg)" in labels, (
+        f"expected a {expected}-labelled total-weekly-demand metric, got {labels}"
+    )
+    # No un-windowed one, and none of the retired "Historical Demand" wording.
+    assert "Total Weekly Demand" not in labels
+    assert not any("Historical Demand" in (lbl or "") for lbl in labels), (
+        f"the retired 'Historical Demand' wording is back: {labels}"
+    )
+
+
 @needs_data
 def test_provider_selector_change_does_not_call_llm(monkeypatch):
     """Moving the reasoning-LLM selector (a plain rerun) must not fire the LLM.
