@@ -319,6 +319,52 @@ def test_quick_single_group_renders_the_by_customer_table():
                    for e in at.expander)
 
 
+@needs_data
+def test_quick_detail_card_renders_its_kpis_as_tiles():
+    """Opening a row's detail card renders its KPIs as shaded metric tiles.
+
+    Detail-card KPIs are ``st.metric`` widgets now — that is what makes them inherit
+    the stylesheet's tile treatment instead of being flat markdown. Selecting a row
+    is driven through session_state because AppTest has no dataframe-selection API.
+
+    The card's tiles are additional metrics beyond the page's 7-KPI row, so the
+    assertion is on the DELTA between before and after selection: whatever the KPI
+    row contributes, opening a card must add the card's own fields on top.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    before = [m.label for m in at.metric]
+
+    # Select the first row of the by-customer table (key "filter_by_customer").
+    at.session_state["filter_by_customer__sel"] = {"selection": {"rows": [0]}}
+    at.run()
+    assert not at.exception, at.exception
+
+    after = [m.label for m in at.metric]
+    added = [lbl for lbl in after if lbl not in before]
+    if not added:
+        pytest.skip("no rows in the by-customer table for this snapshot")
+
+    # Every field the card asks for that exists on the row shows up as a tile.
+    for expected in ("Customer Grouping", "Data Source",
+                     "Current Projection Average", "Projection Difference"):
+        assert expected in added, (
+            f"{expected!r} missing from the card's tiles; got {added}"
+        )
+    # Data Source appeared in BOTH the old field grid and the old metrics column.
+    assert after.count("Data Source") == 1, (
+        f"Data Source rendered {after.count('Data Source')} times: {after}"
+    )
+    # The retired chart-side labels must not come back alongside the column names.
+    for retired in ("Current Forecast (avg/wk)", "Updated Forecast (avg/wk)",
+                    "Projection Difference (avg/wk)"):
+        assert retired not in added, (
+            f"{retired!r} is the old chart-column label; the tile uses the column name"
+        )
+
+
 def test_historical_window_label_covers_every_models_avg_column():
     """The window prefix on the weekly-demand metrics, per model.
 

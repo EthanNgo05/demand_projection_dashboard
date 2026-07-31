@@ -7,6 +7,7 @@ import streamlit as st
 
 from dashboard_app.config import (
     PRICE_COL, RISK_COL, fmt_dollar, MODEL_USED_COL, BEST_MODEL_COMBINED_VIEW,
+    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL, ONHAND_COL, WOS_COL, KPI_HELP,
 )
 from dashboard_app.summaries import (
     resolve_avg_col, avg_window_phrase, historical_window,
@@ -14,7 +15,7 @@ from dashboard_app.summaries import (
 )
 from dashboard_app.compute import (
     compute_by_customer_best, _agent_summaries_mtime, _agent_summaries_oldest_at,
-    summary_to_excel, ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL,
+    attach_supply_columns, summary_to_excel,
 )
 from dashboard_app.refresh import batch_in_progress
 from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart
@@ -25,14 +26,23 @@ from dashboard_app.tables import render_selectable_table
 # ships the full frame.
 BEST_MIX_CONDENSED_COLS = ["SKU", "Customer Grouping", EIGHT_WK_AVG_COL,
                            "Current Projection Average", RISK_COL]
-# Field row at the top of each detail card — identifies which group's card this
-# is (one SKU can have several cards open at once, one per customer group), and
-# carries the long-run average that the condensed row has no space for (the
-# 8-Week run-rate is in the row; both ship in the Excel download, so both must be
-# visible somewhere). The chart + stacked metrics below it are drawn by
-# render_sku_detail_card.
-BEST_MIX_CARD_COLS = ["Customer Grouping", MODEL_USED_COL,
-                      ALL_TIME_AVG_COL, "Weeks with data"]
+# The KPI tiles on each detail card. A SET, not a sequence — config.kpi_sort orders
+# them, so a field sits in the same place here as on every other view's card.
+# Identifies which group's card this is (one SKU can have several open at once, one
+# per customer group), then everything the condensed row has no space for.
+#
+# Forecast/money fields used to render as st.metric in a column beside the chart
+# inside render_sku_detail_card; they are tiles here now, so the card has ONE KPI
+# zone instead of two. Projected Revenue is derived rather than a column and comes
+# from projection_kpi_extras.
+BEST_MIX_CARD_COLS = [
+    "Customer Grouping", MODEL_USED_COL, "Data Source",
+    "Weeks with data", ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL,
+    "Current Projection Average", "Updated Projection Average",
+    "Projection Difference",
+    PRICE_COL, RISK_COL,
+    ONHAND_COL, WOS_COL,
+]
 
 
 def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
@@ -175,10 +185,16 @@ def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors
     """Detail-card body for one (SKU, Customer Grouping) row of a summary table.
 
     Shared by Optimized Projections and Quick Projections so the two views read
-    identically. Renders what the old dropdown-driven "SKU detail" sections
-    rendered — a date-range picker + per-SKU chart on the left, the stacked
-    metrics on the right — but scoped to the single group on the clicked row, so
-    the SKU and customer-group selectboxes that used to drive it are gone.
+    identically: a date-range picker + per-SKU chart, FULL WIDTH, scoped to the
+    single group on the clicked row.
+
+    This used to be a chart-left / metrics-right split, which put the card's KPIs in
+    two places at once — the tile grid ``_render_row_detail`` draws above, plus seven
+    ``st.metric`` calls here — with ``Data Source`` appearing in both. All seven now
+    live in that one grid (they read straight off ``row``; see ``QUICK_CARD_COLS`` /
+    ``BEST_MIX_CARD_COLS``), except ``Projected Revenue``, which is derived rather
+    than a column and comes through ``projected_revenue_kpi`` below. The chart gets
+    the whole card width as a result.
 
     ``(row, key_base)`` sit where ``render_selectable_table``'s ``detail_chart``
     contract passes them — positionally, and last of the required args. Callers
@@ -196,11 +212,10 @@ def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors
       never pass), and it is a whole-view figure, not this group's share — the
       caption says so.
 
-    The card shows no weekly-demand average of its own. Both averages are already
-    on the row and rendered in the card's field row (``QUICK_CARD_COLS`` /
-    ``BEST_MIX_CARD_COLS``), so recomputing one here only created a second number
-    that disagreed with the column beside it — same window, but dividing by weeks
-    that had a row instead of the SKU's full span.
+    The card computes no weekly-demand average of its own. Both averages are already
+    on the row and rendered as tiles, so recomputing one here only created a second
+    number that disagreed with the column beside it — same window, but dividing by
+    weeks that had a row instead of the SKU's full span.
     """
     sku = str(row["SKU"])
     group = str(row["Customer Grouping"])
@@ -224,65 +239,76 @@ def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors
     # One row → exactly one source (the old section's "(mixed)" case can't arise).
     source = row["Data Source"] if isinstance(row.get("Data Source"), str) else "POS"
 
-    cL, cR = st.columns([3, 1])
-    with cL:
-        sku_range = chart_range_control(sku_agg, sku_weekly, lcw, key=key)
-        st.plotly_chart(
-            sku_chart(sku, desc, source, sku_agg, sku_weekly, chart_anchors,
-                      date_range=sku_range, prices=pm),
-            width="stretch", key=f"{key}_plot",
-        )
-        # The row's own model wins when the table carries one (Optimized); else the
-        # caller's single-model label, and if neither, just name the group.
-        model = row[MODEL_USED_COL] if MODEL_USED_COL in row.index else model_label
-        st.caption(
-            f"Customer group **{group}** — forecast with {model}."
-            if model else f"Customer group **{group}**."
-        )
-    with cR:
-        # Every figure is this one (SKU, group) row's, so the metrics read
-        # straight off it — no summing across a SKU's groups any more.
-        st.metric("Data Source", source)
-        sysv = row["Current Projection Average"]
-        st.metric(
-            "Current Forecast (avg/wk)",
-            "—" if pd.isna(sysv) else f"{sysv:,.0f}",
-        )
-        updated = row["Updated Projection Average"]
-        st.metric("Updated Forecast (avg/wk)",
-                  "—" if pd.isna(updated) else f"{updated:,.0f}")
-        pdiff = row["Projection Difference"]
-        st.metric(
-            "Projection Difference (avg/wk)",
-            f"{pdiff:+,.0f}" if pd.notna(pdiff) else "—",
-        )
-        if RISK_COL in row.index:
-            price = row[PRICE_COL] if PRICE_COL in row.index else None
-            price = None if price is None or pd.isna(price) else price
-            rv = row[RISK_COL]
-            st.metric("List Price", fmt_dollar(price, decimals=2))
-            st.metric(
-                "Revenue Risk (avg/wk)", fmt_dollar(rv, signed=True),
-                help="Projection difference × list price for this SKU / group.",
+    sku_range = chart_range_control(sku_agg, sku_weekly, lcw, key=key)
+    st.plotly_chart(
+        sku_chart(sku, desc, source, sku_agg, sku_weekly, chart_anchors,
+                  date_range=sku_range, prices=pm),
+        width="stretch", key=f"{key}_plot",
+    )
+    # The row's own model wins when the table carries one (Optimized); else the
+    # caller's single-model label, and if neither, just name the group.
+    model = row[MODEL_USED_COL] if MODEL_USED_COL in row.index else model_label
+    st.caption(
+        f"Customer group **{group}** — forecast with {model}."
+        if model else f"Customer group **{group}**."
+    )
+    if top_groups:
+        breakdown = top_groups.get(sku)
+        if breakdown:
+            st.markdown("**Top Volume Groups**")
+            st.caption(breakdown)
+            st.caption(
+                ":gray[Across all customer groups in this view, not this "
+                "group's share.]"
             )
-            prv = price * updated if price is not None and pd.notna(updated) else None
-            st.metric(
-                "Projected Revenue (avg/wk)", fmt_dollar(prv),
-                help="List price × this group's updated weekly-avg forecast.",
-            )
-        if top_groups:
-            breakdown = top_groups.get(sku)
-            if breakdown:
-                st.markdown("**Top Volume Groups**")
-                st.caption(breakdown)
-                st.caption(
-                    ":gray[Across all customer groups in this view, not this "
-                    "group's share.]"
-                )
+
+
+def projection_kpi_extras(row):
+    """Derived KPI tiles for a projections-table row (the ``extra_kpis`` contract).
+
+    Two things the row's own columns can't express:
+
+    * **Projected Revenue** — list price × this row's updated weekly forecast. Every
+      other money figure is a column; this one is a product of two, so it has to be
+      computed at render time. It matches the page-top KPI of the same name, which is
+      this summed over the view.
+    * **% Deviation on Projection Difference** — the unit gap is meaningless without
+      its base (−4 is nothing on 2,000 and fatal on 20), so the gap's tile gets the
+      percentage in ``st.metric``'s delta slot, coloured by direction. The page-top
+      KPI row already does exactly this; the per-row card did not.
+
+    Returns ``[]`` when list prices aren't loaded — the same graceful degradation the
+    Revenue Risk column has, rather than a tile reading "—" for every row.
+    """
+    tiles = []
+    price = row[PRICE_COL] if PRICE_COL in row.index else None
+    price = None if price is None or pd.isna(price) else price
+    updated = row.get("Updated Projection Average")
+    if price is not None and pd.notna(updated):
+        tiles.append((
+            "Projected Revenue", fmt_dollar(price * updated), None,
+            KPI_HELP.get("Projected Revenue"), "stat",
+        ))
+    return tiles
+
+
+def projection_difference_delta(row):
+    """``Projection Difference`` as a percent of the current projection, or None.
+
+    None (rather than "0.0%") when the current projection is 0 or missing: there is
+    no base to be a percentage of, and showing 0% would imply agreement where there
+    is actually no plan to agree with.
+    """
+    pdiff = row.get("Projection Difference")
+    current = row.get("Current Projection Average")
+    if pd.isna(pdiff) or pd.isna(current) or not current:
+        return None
+    return f"{pdiff / current * 100:+.1f}%"
 
 
 def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows,
-                                anchors, P=None, data_sig=None):
+                                anchors, P=None, data_sig=None,
+                                onhand_by_sku=None):
     """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
 
     Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
@@ -335,6 +361,10 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded = (
         result if result is not None else (None, None, None, None, None, [])
     )
+    # On Hand / Weeks of Supply for the detail cards. Attached here, outside the
+    # session-cached result, because On Hand comes from a separately loaded map
+    # rather than from the fit (see attach_supply_columns).
+    combined = attach_supply_columns(combined, onhand_by_sku)
 
     # Freshness caption. While a batch is rewriting summaries, the table mixes
     # freshly-recomputed and prior-run recommendations, so say so plainly rather
@@ -492,6 +522,8 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         table, "filter_best_mix", P,
         condensed_cols=BEST_MIX_CONDENSED_COLS, style=True,
         detail_chart=sku_card, detail_cols=BEST_MIX_CARD_COLS,
+        extra_kpis=projection_kpi_extras,
+        kpi_deltas={"Projection Difference": projection_difference_delta},
     )
     st.download_button(
         "⬇️ Download the combined best-model table",

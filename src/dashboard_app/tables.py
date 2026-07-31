@@ -4,7 +4,10 @@ import re
 import pandas as pd
 import streamlit as st
 
-from dashboard_app.config import MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar
+from dashboard_app.config import (
+    MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar,
+    KPI_HELP, KPI_TEXT_FIELDS, ONHAND_COL, TREND_COL, WOS_COL, kpi_sort,
+)
 from dashboard_app.watchlist import (
     STAR_PREFIX, active_pairs, mark_starred_sku, starred_mask,
 )
@@ -406,6 +409,13 @@ def _fmt_detail_value(col, val):
         return fmt_dollar(val, decimals=0)
     if col == "% Deviation":
         return f"{int(val):,}%" if val == int(val) else f"{val:,.2f}%"
+    if col == TREND_COL:
+        # Signed, so "is this growing or dying" reads without hunting for a colour.
+        return f"{val:+,.1f}%"
+    if col == ONHAND_COL:
+        return f"{val:,.0f}"
+    if col in (WOS_COL, "Container Impact"):
+        return f"{val:,.1f}"
     int_cols = {
         "Weeks with data", "Current Projection Average",
         "Updated Projection Average", "Projection Difference",
@@ -415,6 +425,77 @@ def _fmt_detail_value(col, val):
     if col.endswith("POS/Orders Average") and isinstance(val, (int, float)):
         return f"{val:,.0f}" if float(val).is_integer() else f"{val:,.1f}"
     return str(val)
+
+
+def _tile_value(col, val):
+    """``_fmt_detail_value`` plus the one KPI whose blank carries meaning.
+
+    A blank trend is not "no data" — it means the earlier 8-week window had no
+    sales, so there is no baseline to measure against. "New" says that; "—" would
+    read as missing. Every other column keeps the shared "—" for NaN.
+    """
+    if col == TREND_COL and pd.isna(val):
+        return "New"
+    return _fmt_detail_value(col, val)
+
+
+def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, per_row=4):
+    """Render a detail card's KPIs as the same shaded tiles the KPI row uses.
+
+    Every card in the app funnels through here, which is the point: KPIs used to be
+    flat ``**Label**\\n\\nvalue`` markdown in this card, shaded ``st.metric`` tiles
+    beside the projections chart, and a hand-rolled coloured ``<span>`` in the
+    Exceptions card — three treatments for one kind of thing. Emitting ``st.metric``
+    means the tiles inherit the existing ``[data-testid="stMetric"]`` styling in
+    dashboard.py's stylesheet, so they match *by construction* rather than by a
+    second copy of the CSS that can drift.
+
+    ``cols`` is the field set; ``config.kpi_sort`` decides the order, so a field
+    lands in the same position no matter which view opened the card.
+
+    Two optional hooks, both bound per view via ``functools.partial``:
+
+    * ``extra``: ``callable(row) -> [(label, value, delta, help, kind), ...]`` for KPIs
+      that are derived rather than columns (e.g. Projected Revenue = price ×
+      forecast), appended after the column-backed tiles.
+    * ``deltas``: ``{column: callable(row) -> str | None}`` to hang a secondary
+      figure under an EXISTING tile — the small green/red line ``st.metric`` renders
+      below the value. Used for the percentage under Projection Difference, which has
+      to modify a tile rather than add one.
+
+    Each tile row is wrapped in a keyed container so the stylesheet can equalise
+    heights within the row — otherwise a value that wraps to three lines (a long
+    model name) leaves its neighbours short and the grid reads ragged.
+    """
+    deltas = deltas or {}
+    tiles = []
+    for c in kpi_sort(cols):
+        fn = deltas.get(c)
+        tiles.append((
+            c, _tile_value(c, row[c]), fn(row) if fn else None, KPI_HELP.get(c),
+            "text" if c in KPI_TEXT_FIELDS else "stat",
+        ))
+    if extra is not None:
+        tiles.extend(extra(row))
+    if not tiles:
+        return
+
+    for start in range(0, len(tiles), per_row):
+        chunk = tiles[start:start + per_row]
+        # Pad the final row so a lone trailing tile stays column-width instead of
+        # stretching across the card.
+        with st.container(key=f"kpitiles-{card_key}-{start}"):
+            slots = st.columns(per_row)
+            for slot, (label, value, delta, help_txt, kind) in zip(slots, chunk):
+                if kind == "text":
+                    # Keyed wrapper -> CSS can size identity values as captions
+                    # rather than headlines ("Holt-Winters (triple) exponential
+                    # smoothing" is not a number and must not look like one).
+                    slug = re.sub(r"[^0-9A-Za-z]+", "-", str(label)).strip("-")
+                    with slot.container(key=f"kpitile-text-{card_key}-{start}-{slug}"):
+                        st.metric(label, value, help=help_txt)
+                else:
+                    slot.metric(label, value, delta=delta, help=help_txt)
 
 
 def _dismiss_card(sel_key, pos):
@@ -432,15 +513,24 @@ def _dismiss_card(sel_key, pos):
 
 def _render_row_detail(row, shown, detail_chart=None, key_base=None,
                        sel_key=None, close_label=None, close_pos=None, card_cols=None,
-                       row_action=None, title_col="SKU"):
+                       row_action=None, title_col="SKU", extra_kpis=None,
+                       kpi_deltas=None):
     """Render a row's full detail in a bordered card beneath the table.
 
-    ``card_cols`` (if given) is the explicit, ordered list of fields to show in the
-    card, decoupled from the frame's full column set (which the condensed table,
-    sorting, and the Excel download still need). Without it the card falls back to
-    listing EVERY non-hidden field, so other callers keep their behaviour. ``shown``
-    is kept for signature stability but no longer hides columns. When ``detail_chart``
-    is given it is called with ``(row, key_base)`` to draw a chart below the fields.
+    Layout is the same for every view: the card's KPIs as one shaded tile grid
+    (``_render_kpi_tiles``), then the chart full-width beneath. The projections card
+    used to split into chart-left / metrics-right, which meant its KPIs lived in two
+    places at once — the grid here AND that column — with ``Data Source`` in both.
+
+    ``card_cols`` (if given) is the set of fields to show in the card, decoupled from
+    the frame's full column set (which the condensed table, sorting, and the Excel
+    download still need); ``config.kpi_sort`` orders them, so the list is a set, not
+    a sequence. Without it the card falls back to listing EVERY non-hidden field, so
+    other callers keep their behaviour. ``shown`` is kept for signature stability but
+    no longer hides columns. ``extra_kpis`` is passed straight to
+    ``_render_kpi_tiles`` for KPIs derived rather than read off the row. When
+    ``detail_chart`` is given it is called with ``(row, key_base)`` to draw a chart
+    below the tiles.
     A ✕ button (top-right) closes the card by deselecting its table row via
     ``sel_key``/``close_pos`` (so the row's checkbox clears too, matching an
     in-table deselect), letting the user close it without scrolling back up.
@@ -488,12 +578,8 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
                 "✕", key=f"{key_base}__close__{close_label}", help="Close this card",
                 on_click=_dismiss_card, args=(sel_key, close_pos),
             )
-        per_row = 3
-        for start in range(0, len(detail_cols), per_row):
-            chunk = detail_cols[start:start + per_row]
-            cols = st.columns(per_row)
-            for i, c in enumerate(chunk):
-                cols[i].markdown(f"**{c}**\n\n{_fmt_detail_value(c, row[c])}")
+        _render_kpi_tiles(row, detail_cols, card_key, extra=extra_kpis,
+                          deltas=kpi_deltas)
         if show_note:
             st.markdown(f"**Note**\n\n{_fmt_detail_value('Note', note_val)}")
         if detail_chart is not None:
@@ -519,7 +605,8 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
 @st.fragment
 def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
                             column_config=None, detail_chart=None, detail_cols=None,
-                            row_action=None, title_col="SKU"):
+                            row_action=None, title_col="SKU", extra_kpis=None,
+                            kpi_deltas=None):
     """Like render_filtered_table, but shows only ``condensed_cols`` per row and
     reveals the full row in a detail card below when a row is clicked.
 
@@ -533,7 +620,9 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
     (display only — filtering and the detail lookup use the un-prefixed frame).
     ``row_action`` is forwarded to each detail card (see ``_render_row_detail``) so
-    callers can add a per-row button (e.g. the watchlist's "Remove" affordance).
+    callers can add a per-row button (e.g. the watchlist's "Remove" affordance), and
+    ``extra_kpis`` / ``kpi_deltas`` likewise for KPI tiles a view derives rather than
+    reads off the row.
     """
     filtered = filter_table(df, key, P)
     display_cols = [c for c in condensed_cols if c in filtered.columns]
@@ -572,6 +661,7 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
                                detail_chart=detail_chart, key_base=key,
                                sel_key=sel_key, close_label=filtered.index[r],
                                close_pos=r, card_cols=detail_cols,
-                               row_action=row_action, title_col=title_col)
+                               row_action=row_action, title_col=title_col,
+                               extra_kpis=extra_kpis, kpi_deltas=kpi_deltas)
     else:
         st.caption("Select one or more rows to see their full details.")

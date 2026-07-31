@@ -139,10 +139,11 @@ from dashboard_app.datasources import (  # noqa: F401
     price_glob, raw_glob, read_plytix_from_bytes, read_plytix_from_path,
 )
 from dashboard_app.compute import (  # noqa: F401
-    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL,
+    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, ONHAND_COL, TREND_COL, WOS_COL,
     _agent_summaries_generated_at, _agent_summaries_mtime, _agent_summary_path,
     _best_model_for_group, _forecast_one_group, _load_agent_summary, _region_frame,
-    attach_descriptive_averages, compute_by_customer, compute_by_customer_best,
+    attach_descriptive_averages, attach_supply_columns,
+    compute_by_customer, compute_by_customer_best,
     compute_by_customer_frames, compute_view, list_views, run_autofit,
     single_group_frames, summary_to_excel, view_to_excel,
 )
@@ -163,6 +164,7 @@ from dashboard_app.agent_summary import (  # noqa: F401
 from dashboard_app.kpis import (  # noqa: F401
     BEST_MIX_CARD_COLS, BEST_MIX_CONDENSED_COLS,
     _render_best_model_combined, _render_kpis, render_sku_detail_card,
+    projection_difference_delta, projection_kpi_extras,
 )
 from dashboard_app.exceptions import (  # noqa: F401
     compute_exceptions, render_exceptions,
@@ -192,13 +194,23 @@ AUTOFIT_CACHE_MAX = 64
 # Quick Projections' main table mirrors Optimized Projections: the same five
 # scannable columns per row, with everything else one click away in the detail
 # card. There is no "Model Used" column here (one chosen model fits the whole
-# view, named in the Forecasting model selector), so the card carries the
-# long-run average in its place — the 8-week run-rate is already in the row, and
-# both ship in the Excel download, so both have to be visible somewhere.
+# view, named in the Forecasting model selector).
 QUICK_CONDENSED_COLS = ["SKU", "Customer Grouping", EIGHT_WK_AVG_COL,
                         "Current Projection Average", RISK_COL]
-QUICK_CARD_COLS = ["Customer Grouping", "Data Source",
-                   ALL_TIME_AVG_COL, "Weeks with data"]
+# The card's KPI tiles. A SET, not a sequence — config.kpi_sort orders them, so a
+# field sits in the same place as on Optimized / Exceptions / Watchlist cards.
+# Mirrors kpis.BEST_MIX_CARD_COLS minus "Model Used" (see above). The forecast and
+# money fields used to be st.metric calls in a column beside the chart inside
+# render_sku_detail_card; they are tiles here now, so the card has ONE KPI zone
+# instead of two — and "Data Source" appears once instead of in both.
+QUICK_CARD_COLS = [
+    "Customer Grouping", "Data Source",
+    "Weeks with data", ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL,
+    "Current Projection Average", "Updated Projection Average",
+    "Projection Difference",
+    PRICE_COL, RISK_COL,
+    ONHAND_COL, WOS_COL,
+]
 
 
 @st.cache_data(show_spinner=False)
@@ -395,6 +407,51 @@ def main():
         }}
         [data-testid="stMetricDelta"] {{
             font-variant-numeric: tabular-nums;
+        }}
+
+        /* ---- Detail-card KPI tiles --------------------------------------- */
+        /* The same st.metric card, re-proportioned for a detail card: a tile there
+           is 1/4 of the card, not 1/7 of the page, and its label ("All-Time
+           POS/Orders Average") is longer than the page row's. So the value steps
+           down and is allowed to wrap — without this, a long dollar amount or a
+           model name overflows its tile. Deliberately re-uses the tile chrome above
+           (fill, border, radius, hover) rather than restating it, so the cards and
+           the page KPI row can never drift apart. */
+        [class*="st-key-detailcard-"] [data-testid="stMetricValue"] {{
+            font-size: 1.2rem !important;
+            white-space: normal;
+        }}
+        /* Identity fields (Customer, Region, Model Used, Status, ...) are short
+           strings, not measurements. Sized as a caption and allowed to break mid-word
+           so "Holt-Winters (triple) exponential smoothing" reads as a label instead
+           of a headline, and tabular-nums is dropped — it only helps digits. */
+        [class*="st-key-kpitile-text-"] [data-testid="stMetricValue"] {{
+            font-size: 0.95rem !important;
+            font-weight: 500;
+            font-variant-numeric: normal;
+            line-height: 1.3;
+            overflow-wrap: anywhere;
+        }}
+        /* Equal-height tiles within each row of the grid. Same height cascade as the
+           page KPI row above (Streamlit's wrapper divs are auto-height, so height:100%
+           has to be carried down every level or the chain collapses). Without it a
+           value that wraps to three lines leaves its neighbours short and the grid
+           reads ragged. No min-height: card tiles size to their own content, unlike
+           the page row where a fixed floor keeps the seven bubbles uniform. */
+        [class*="st-key-kpitiles-"] [data-testid="stColumn"] {{
+            align-self: stretch;
+        }}
+        [class*="st-key-kpitiles-"] [data-testid="stColumn"] > div,
+        [class*="st-key-kpitiles-"] [data-testid="stVerticalBlockBorderWrapper"],
+        [class*="st-key-kpitiles-"] [data-testid="stVerticalBlock"],
+        [class*="st-key-kpitiles-"] [data-testid="stElementContainer"] {{
+            height: 100%;
+        }}
+        [class*="st-key-kpitiles-"] [data-testid="stMetric"] {{
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
         }}
 
         /* ---- Heading rhythm ---------------------------------------------- */
@@ -1324,7 +1381,7 @@ def main():
     if view == BEST_MODEL_COMBINED_VIEW:
         _render_best_model_combined(
             df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P,
-            data_sig=data_sig,
+            data_sig=data_sig, onhand_by_sku=onhand_by_sku,
         )
         st.stop()
 
@@ -1349,7 +1406,7 @@ def main():
     if view == WATCHLIST_VIEW:
         render_watchlist(
             df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P,
-            data_sig=data_sig,
+            data_sig=data_sig, onhand_by_sku=onhand_by_sku,
         )
         st.stop()
 
@@ -1512,6 +1569,12 @@ def main():
         )
         st.stop()
 
+    # On Hand / Weeks of Supply for the detail cards. Attached HERE, after the cache
+    # read, rather than inside compute_by_customer_frames: On Hand comes from a
+    # separately loaded map, not from the fit, so it must not become part of a
+    # forecast-cache key that only tracks forecast inputs.
+    by_cust = attach_supply_columns(by_cust, onhand_by_sku)
+
     # ----- Header / windows -------------------------------------------------
     st.subheader(quick_group_label(view))
     w1, w2 = st.columns(2)
@@ -1672,6 +1735,8 @@ def main():
             by_cust_table, "filter_by_customer", P,
             condensed_cols=QUICK_CONDENSED_COLS, style=True,
             detail_chart=sku_card, detail_cols=QUICK_CARD_COLS,
+            extra_kpis=projection_kpi_extras,
+            kpi_deltas={"Projection Difference": projection_difference_delta},
         )
         st.download_button(
             "⬇️ Download the summary table by SKU and Customer",

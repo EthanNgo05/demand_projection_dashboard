@@ -181,6 +181,150 @@ WAREHOUSE_REGIONS = ["AU", "CA", "EU", "JP", "US"]
 PRICE_COL = "List Price (USD)"
 RISK_COL = "Revenue Risk (avg/wk)"
 
+# The two descriptive-average column names, and the ONLY spellings the UI shows.
+# The model files' AVG_COL_LABEL / DISPLAY_NAMES match these exactly so
+# ``compute.attach_descriptive_averages`` replaces the model's column in place
+# instead of leaving two differently-named copies of one figure on the same table.
+#
+# They live HERE rather than in compute.py (which re-exports them for the callers
+# that have always imported them from there) because KPI_ORDER below needs them
+# and this module must stay streamlit-free — compute.py imports streamlit, and it
+# imports this module, so the dependency can only run one way.
+ALL_TIME_AVG_COL = "All-Time POS/Orders Average"
+EIGHT_WK_AVG_COL = "8-Week POS/Orders Average"
+# Percent change from the 8 weeks before last to the last 8 completed weeks — is
+# this SKU/customer accelerating or decaying? Derived in
+# ``compute._descriptive_averages`` from a prior-8-week average that is
+# deliberately NOT published as a column of its own: a third average column beside
+# the two above would recreate the same-window/different-number confusion that
+# ALL_TIME_AVG_COL's rename existed to remove.
+TREND_COL = "Recent Trend"
+# SKU-level supply figures (constant across a SKU's customer rows). ONHAND_COL is
+# the SKU's current total On Hand; WOS_COL is that divided by the SKU's total
+# CURRENT weekly projection across all customers. Same definition everywhere it
+# appears — there is deliberately no second "WOS vs the updated forecast".
+ONHAND_COL = "On Hand"
+WOS_COL = "WOS Impact"
+
+
+# --------------------------------------------------------------------------- #
+# Detail-card KPI tiles: one canonical order, one set of tooltips              #
+# --------------------------------------------------------------------------- #
+# Every view picks WHICH fields its detail card shows (the ``*_CARD_COLS`` lists in
+# dashboard.py / kpis.py / exceptions.py / watchlist_view.py); this list decides
+# WHERE each one lands, so a field sits in the same place no matter which view
+# opened the card. Before this existed each view ordered its own card and a
+# planner had to re-learn every one.
+#
+# The sequence reads as a story: who is this -> what did it sell -> what is
+# planned -> what is it worth -> what is on the shelf.
+#
+# Names owned by exceptions.py (Status, First Week Spike, Weeks Since Spike,
+# Container Impact) appear here as literals rather than imports: exceptions.py
+# imports tables.py, which imports this module, so importing back would cycle.
+# They mirror the constants at the top of exceptions.py — keep the two in sync.
+KPI_ORDER = [
+    # --- who ---------------------------------------------------------------
+    "Customer Grouping", "Customer", "Region", "Region Code",
+    "Data Source", "Active in", MODEL_USED_COL, "Status",
+    # --- what it sold ------------------------------------------------------
+    "Weeks with data", ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL,
+    "First Week Spike", "Weeks Since Spike",
+    # --- what is planned ---------------------------------------------------
+    "Current Projection Average", "Updated Projection Average",
+    "Projection Difference", "% Deviation",
+    # --- what it is worth --------------------------------------------------
+    PRICE_COL, RISK_COL, "Projected Revenue",
+    # --- what is on the shelf ----------------------------------------------
+    ONHAND_COL, WOS_COL, "Container Impact",
+]
+
+# Identity fields: short strings, not measurements. Rendered in the same tile as
+# everything else but with a smaller, wrapping value, so a long value like
+# "Holt-Winters (triple) exponential smoothing" reads as a caption instead of a
+# headline. Everything not listed here is treated as a stat (big tabular figures).
+KPI_TEXT_FIELDS = {
+    "Customer Grouping", "Customer", "Region", "Region Code",
+    "Data Source", "Active in", MODEL_USED_COL, "Status", "First Week Spike",
+}
+
+# Tile tooltips. Wording is lifted from the page-top KPI row's help text in
+# kpis._render_kpis where the same quantity appears there, so the card and the KPI
+# row explain a number the same way. Fields with no entry simply get no tooltip.
+KPI_HELP = {
+    ALL_TIME_AVG_COL: (
+        "Observed weekly demand (POS/Orders) averaged over this SKU's whole "
+        "history with this customer — total demand ÷ weeks from its first sale "
+        "through the last completed week, so silent weeks count as zeros."
+    ),
+    EIGHT_WK_AVG_COL: (
+        "Observed weekly demand over the last 8 completed weeks — the recent "
+        "run-rate. Compare against the all-time average to see if demand is "
+        "running hot or cold."
+    ),
+    TREND_COL: (
+        "Percent change from the 8 weeks before last to the last 8 completed "
+        "weeks. “New” means there were no sales in the earlier window, so there "
+        "is no baseline to compare against."
+    ),
+    "Weeks with data": "Completed weeks with any POS/Orders activity.",
+    "Current Projection Average": (
+        "Mean of the existing system projection over the forecast horizon (the "
+        "15 future weeks)."
+    ),
+    "Updated Projection Average": (
+        "Mean of this model's updated forecast over the same 15 future weeks."
+    ),
+    "Projection Difference": (
+        "Updated forecast − current projection, per week. Negative means the "
+        "forecast fell below the projection already in the system."
+    ),
+    "% Deviation": (
+        "Projection difference as a percent of the current projection — the same "
+        "gap in relative terms, so a small SKU and a large one are comparable."
+    ),
+    PRICE_COL: "List price per unit (Plytix).",
+    RISK_COL: (
+        "Projection difference × list price. Negative = forecast fell below the "
+        "original projection. Blank when the SKU has no list price."
+    ),
+    "Projected Revenue": (
+        "List price × this row's updated weekly-average forecast — the gross "
+        "value at list price of the demand being forecast."
+    ),
+    ONHAND_COL: (
+        "The SKU's current TOTAL On Hand across all warehouses — a SKU-level "
+        "figure, the same on every one of this SKU's customer rows."
+    ),
+    WOS_COL: (
+        "Weeks of Supply = the SKU's total On Hand ÷ its total current weekly "
+        "projection summed across ALL customers. SKU-level, so it is the same on "
+        "every one of this SKU's customer rows. Blank when On Hand is unavailable."
+    ),
+    "Container Impact": (
+        "The SKU's total cumulative spike units ÷ its Container Load — how many "
+        "containers of unplanned demand this represents. SKU-level."
+    ),
+    "Data Source": (
+        "Which signal the forecast used: POS (sell-through) where the SKU has "
+        "any, else Orders."
+    ),
+    MODEL_USED_COL: "The model that won this customer group's 5-model backtest.",
+    "Status": "Whether the recent run-rate sits above, below, or on the plan.",
+}
+
+
+def kpi_sort(cols):
+    """Order ``cols`` by ``KPI_ORDER``, keeping unknown names at the end.
+
+    Unknown names sort last (stably, in the order given) rather than raising, so a
+    view can pass a bespoke column without this module knowing about it. The
+    ordering test asserts the shipped ``*_CARD_COLS`` lists contain no unknowns —
+    a name that falls off the end is nearly always a typo, not an intent.
+    """
+    rank = {c: i for i, c in enumerate(KPI_ORDER)}
+    return sorted(cols, key=lambda c: rank.get(c, len(KPI_ORDER)))
+
 
 def fmt_dollar(v, decimals=0, signed=False):
     """Format a dollar amount with the sign OUTSIDE the $ (e.g. -$500, +$500).

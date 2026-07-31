@@ -12,6 +12,11 @@ import streamlit as st
 from dashboard_app.config import (
     ALL_CUSTOMERS_VIEW, region_from_view, MODEL_OPTIONS, MODEL_USED_COL,
     model_display, REPO_ROOT,
+    # Re-exported below, unchanged, for every caller that has always imported
+    # these from this module (dashboard.py, kpis.py, exceptions.py,
+    # watchlist_view.py, tests). They live in config.py so KPI_ORDER can name them
+    # without config importing this streamlit-dependent module.
+    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL, ONHAND_COL, WOS_COL,
 )
 from dashboard_app.pipeline import (
     load_pipeline, pipeline_path,
@@ -451,22 +456,24 @@ def _best_model_for_group(group):
     return label, path
 
 
-# The two descriptive-average column names, and the ONLY spellings the UI shows.
-# The model files' AVG_COL_LABEL / DISPLAY_NAMES match these exactly so
-# ``attach_descriptive_averages`` replaces the model's column in place instead of
-# leaving two differently-named copies of one figure on the same table.
-ALL_TIME_AVG_COL = "All-Time POS/Orders Average"
-EIGHT_WK_AVG_COL = "8-Week POS/Orders Average"
+# ALL_TIME_AVG_COL / EIGHT_WK_AVG_COL / TREND_COL are imported from config.py at
+# the top of this module and re-exported here, so `from dashboard_app.compute
+# import ALL_TIME_AVG_COL` and `compute.ALL_TIME_AVG_COL` both keep working.
+
+# Internal only: the 8 weeks BEFORE the recent 8, the baseline TREND_COL is
+# measured against. Never returned — see TREND_COL's note in config.py on why a
+# third visible average column would be a step backwards.
+_PRIOR_8WK_COL = "_prior_8wk"
 
 
 @st.cache_data(show_spinner=False)
 def _descriptive_averages(agg_by_group, today_ts):
-    """Per-(Customer Grouping, SKU) all-time and 8-week demand averages.
+    """Per-(Customer Grouping, SKU) all-time / 8-week averages + the recent trend.
 
     These are the CANONICAL figures behind ``ALL_TIME_AVG_COL`` /
-    ``EIGHT_WK_AVG_COL`` everywhere in the UI — observed demand, model-independent,
-    so one SKU/customer row reads the same whichever model produced it (see
-    ``attach_descriptive_averages``).
+    ``EIGHT_WK_AVG_COL`` / ``TREND_COL`` everywhere in the UI — observed demand,
+    model-independent, so one SKU/customer row reads the same whichever model
+    produced it (see ``attach_descriptive_averages``).
 
     Cached because several callers ask for it with the same inputs on one pass
     through a view — ``compute_exceptions`` and ``compute_spikes`` pass the same
@@ -481,22 +488,32 @@ def _descriptive_averages(agg_by_group, today_ts):
     * source per SKU = POS if the SKU has ANY POS in the window, else Orders
       (SKUs with neither are skipped) -- the POS-then-Orders fallback the models use;
     * average = total demand / weeks-in-span, where the span runs from the SKU's
-      first observation in the window through the last completed week (post-launch
-      gaps count as real zeros). Over the 8-week window this reproduces
+      first observation in the window through the window's end (post-launch gaps
+      count as real zeros). Over the 8-week window this reproduces
       ``regression.fit_regression``'s ``mean_val = y.sum() / weeks_since_first``.
 
     Note these are RAW observations: unlike the models' own reported average, no
     outlier cleansing is applied. Window, source fallback and span are otherwise
     identical to the models', so cleansing is the only difference between the two.
 
+    ``TREND_COL`` is the percent change from the 8 weeks BEFORE last to the last 8
+    completed weeks — the one KPI here that answers "is this accelerating or
+    decaying", which is what tells a planner whether a projection has gone stale.
+    Its prior-8-week baseline is computed the same way and then dropped; see
+    ``TREND_COL`` in config.py for why it is not published as its own column.
+
     Discontinued SKUs (name ending in '*') are dropped, matching the models.
-    Returns a frame: Customer Grouping, SKU, ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL.
+    Returns: Customer Grouping, SKU, ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL.
     """
     # In-progress week is excluded; the historical window ends last completed week.
     days_since_sunday = (today_ts.weekday() + 1) % 7          # Sun=0 ... Sat=6
     current_week_start = today_ts - pd.Timedelta(days=days_since_sunday)
     last_complete_week = current_week_start - pd.Timedelta(weeks=1)
     eight_wk_start = last_complete_week - pd.Timedelta(weeks=7)   # 8 weeks inclusive
+    # The 8 weeks immediately before that, as the trend's baseline. Ends the week
+    # before eight_wk_start so the two windows are adjacent and never overlap.
+    prior_8wk_end = eight_wk_start - pd.Timedelta(weeks=1)
+    prior_8wk_start = prior_8wk_end - pd.Timedelta(weeks=7)
     hist_start = today_ts - pd.DateOffset(years=3)   # matches HISTORY_YEARS (all history)
 
     A = agg_by_group.copy()
@@ -506,8 +523,12 @@ def _descriptive_averages(agg_by_group, today_ts):
 
     key = ["Customer Grouping", "SKU"]
 
-    def _avg(start, out_col):
+    def _avg(start, out_col, end=None):
         """Vectorised equivalent of the original per-(group, SKU) Python loop.
+
+        ``end`` defaults to ``last_complete_week`` — the only value the all-time and
+        8-week windows ever use. The trend's prior-8-week baseline is the one caller
+        that needs an earlier bound, so it passes ``end`` explicitly.
 
         The loop it replaces sliced the window frame once per (group, SKU) pair —
         ~11,000 slices, ~10s on the live snapshot — and this runs on the critical
@@ -530,7 +551,8 @@ def _descriptive_averages(agg_by_group, today_ts):
         ``tests/test_perf_parity.py::test_descriptive_averages_golden`` holds the
         whole thing to exact equality with the original output.
         """
-        win = A[(A["WeekDate"] >= start) & (A["WeekDate"] <= last_complete_week)]
+        end = last_complete_week if end is None else end
+        win = A[(A["WeekDate"] >= start) & (A["WeekDate"] <= end)]
         if win.empty:
             return pd.DataFrame(columns=key + [out_col])
 
@@ -568,9 +590,9 @@ def _descriptive_averages(agg_by_group, today_ts):
                           ord_first.reindex(idx).to_numpy())
 
         # Floor-divide to whole days, mirroring Timedelta.days (both bounds are
-        # week-start dates, and the window guarantees first <= last_complete_week,
-        # so this is exact rather than a truncation).
-        days = (last_complete_week.to_datetime64() - firsts[keep]) \
+        # week-start dates, and the window guarantees first <= end, so this is
+        # exact rather than a truncation).
+        days = (end.to_datetime64() - firsts[keep]) \
             // np.timedelta64(1, "D")
         spans = np.round(days / 7).astype("int64") + 1
         np.maximum(spans, 1, out=spans)
@@ -584,11 +606,37 @@ def _descriptive_averages(agg_by_group, today_ts):
 
     all_time = _avg(hist_start, ALL_TIME_AVG_COL)
     eight_wk = _avg(eight_wk_start, EIGHT_WK_AVG_COL)
-    return all_time.merge(eight_wk, on=["Customer Grouping", "SKU"], how="outer")
+    prior_8wk = _avg(prior_8wk_start, _PRIOR_8WK_COL, end=prior_8wk_end)
+
+    out = (all_time.merge(eight_wk, on=key, how="outer")
+                   .merge(prior_8wk, on=key, how="outer"))
+
+    # Trend = the recent 8-week run-rate against the 8 weeks before it.
+    #
+    # A NaN recent average means the pair had no rows in the last 8 weeks, which for
+    # sell-through/order demand means zero, not unknown — the same reading
+    # ``attach_descriptive_averages`` applies when it zero-fills the 8-week column.
+    # So it is filled to 0 here, and a SKU that was selling 30/wk and has stopped
+    # reads -100% instead of blank. That is the single most useful trend value on the
+    # board, so it must not be swallowed.
+    #
+    # A NaN PRIOR average is different: there is no baseline, so the change is
+    # genuinely undefined rather than +infinity. That stays NaN and the tile renders
+    # it "New". Guarding on `> 0` (not `!= 0`) also keeps a negative baseline — which
+    # returns/credits can produce — out of the denominator, where it would flip the
+    # sign of the answer.
+    recent = pd.to_numeric(out[EIGHT_WK_AVG_COL], errors="coerce").fillna(0.0)
+    prior = pd.to_numeric(out[_PRIOR_8WK_COL], errors="coerce")
+    usable = prior.notna() & (prior > 0)
+    out[TREND_COL] = np.where(
+        usable, (recent - prior) / prior.where(usable) * 100.0, np.nan,
+    ).round(1)
+    return out.drop(columns=[_PRIOR_8WK_COL])
 
 
 def attach_descriptive_averages(summary, agg_by_group, today_ts):
-    """Give every row of ``summary`` BOTH descriptive averages, centrally computed.
+    """Give every row of ``summary`` both descriptive averages + the recent trend,
+    all centrally computed.
 
     Each model reports only ONE average, and reports it as the mean of the series
     it actually fit — which for four of the five is outlier-CLEANSED (promo spikes
@@ -616,7 +664,12 @@ def attach_descriptive_averages(summary, agg_by_group, today_ts):
     value if it reported one and otherwise come back with a blank All-Time and a
     0.0 8-Week — harmless, since the models drop them too.
 
-    Stops deliberately after slotting the two columns in: callers that reorder
+    ``TREND_COL`` comes along too, unconditionally central: no model reports one, so
+    there is nothing to override. It is left BLANK rather than zero-filled — a
+    missing trend means "no baseline to compare against", which is genuinely
+    different from "flat".
+
+    Stops deliberately after slotting the three columns in: callers that reorder
     other columns (``compute_by_customer_best`` moves ``Model Used``) depend on
     this ordering being final.
     """
@@ -624,6 +677,9 @@ def attach_descriptive_averages(summary, agg_by_group, today_ts):
     # Legacy spelling from before the model files were aligned on EIGHT_WK_AVG_COL.
     # Harmless now, kept so a frame persisted by an older build still loads clean.
     summary = summary.drop(columns=["8 Week POS/Orders Average"], errors="ignore")
+    # Drop any incoming trend so the merge can't produce _x/_y suffixed columns on a
+    # re-attach (single_group_frames can hand back an already-attached summary).
+    summary = summary.drop(columns=[TREND_COL], errors="ignore")
     summary = summary.merge(
         avgs.rename(columns={
             ALL_TIME_AVG_COL: "_central_all_time",
@@ -646,15 +702,54 @@ def attach_descriptive_averages(summary, agg_by_group, today_ts):
     summary[EIGHT_WK_AVG_COL] = summary["_central_8wk"].fillna(0.0)
     summary = summary.drop(columns=["_central_all_time", "_central_8wk"])
 
-    # Slot both averages right after "Weeks with data" (All-Time then 8-Week),
-    # immediately ahead of "Updated Projection Average", for a stable layout.
-    if "Weeks with data" in summary.columns:
-        cols = [c for c in summary.columns
-                if c not in (ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL)]
-        pos = cols.index("Weeks with data") + 1
-        cols[pos:pos] = [ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL]
-        summary = summary[cols]
-    return summary
+    # Keep the three adjacent and in reading order (All-Time, 8-Week, then the trend
+    # between the recent window and the one before it): right after "Weeks with data"
+    # where that anchor exists, else at the end. Unconditional, because the order they
+    # arrive in is an accident of the merge — the trend comes through it while the two
+    # averages are assigned afterwards, so without this the trend sorts ahead of them.
+    trio = [ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL]
+    cols = [c for c in summary.columns if c not in trio]
+    pos = cols.index("Weeks with data") + 1 if "Weeks with data" in cols else len(cols)
+    cols[pos:pos] = trio
+    return summary[cols]
+
+
+def attach_supply_columns(summary, onhand_by_sku):
+    """Add the SKU-level ``ONHAND_COL`` / ``WOS_COL`` to a by-customer summary.
+
+    Kept OUT of ``attach_descriptive_averages`` (and therefore out of the forecast
+    cache) on purpose: On Hand comes from the raw snapshot via a separately loaded
+    map, not from the fit, so folding it in would put a second data source into a
+    cache key that only tracks the forecast inputs. Applied in the render path
+    instead, where the map is already in hand.
+
+    Definition is deliberately IDENTICAL to ``exceptions.compute_spikes``' and
+    ``exceptions.compute_exceptions``': the SKU's total On Hand ÷ its total CURRENT
+    weekly projection summed across ALL customers. Both figures are therefore
+    SKU-level and constant across a SKU's customer rows — the tile help says so.
+    There is no "WOS vs the updated forecast" variant; two same-named numbers over
+    one window is the confusion ALL_TIME_AVG_COL's rename existed to remove.
+
+    Returns ``summary`` untouched when there is no map to read (both columns absent,
+    so the cards simply don't show those tiles) — not zero-filled, since "unknown
+    stock" and "no stock" mean very different things to a planner.
+    """
+    if summary is None or summary.empty or onhand_by_sku is None:
+        return summary
+    out = summary.copy()
+    onhand = pd.to_numeric(
+        out["SKU"].astype(str).map(dict(onhand_by_sku)), errors="coerce"
+    )
+    if "Current Projection Average" in out.columns:
+        proj = pd.to_numeric(out["Current Projection Average"], errors="coerce")
+        total = out["SKU"].astype(str).map(proj.groupby(out["SKU"].astype(str)).sum())
+    else:
+        total = pd.Series(np.nan, index=out.index)
+    out[ONHAND_COL] = onhand
+    out[WOS_COL] = np.where(
+        onhand.notna() & (total > 0), onhand / total.where(total > 0), np.nan
+    ).round(1)
+    return out
 
 
 def compute_by_customer_frames(df, today_ts, model_path, prices=None, alpha=None,

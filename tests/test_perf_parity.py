@@ -229,16 +229,18 @@ def test_frames_change_only_the_average_columns(raw, prices):
 
     shared = [c for c in plain.columns if not c.endswith("POS/Orders Average")]
     pd.testing.assert_frame_equal(framed[shared], plain[shared], check_exact=True)
-    # Only the all-time average is genuinely new. The 8-week column already exists
-    # under its canonical name — the model files spell it exactly as compute.py's
-    # constant, so attach_descriptive_averages overwrites it in place rather than
-    # leaving a second, differently-spelled copy of the same figure behind.
-    assert set(framed.columns) - set(plain.columns) == {compute.ALL_TIME_AVG_COL}
+    # The all-time average and the recent trend are new. The 8-week column already
+    # exists under its canonical name — the model files spell it exactly as
+    # compute.py's constant, so attach_descriptive_averages overwrites it in place
+    # rather than leaving a second, differently-spelled copy of the same figure.
+    assert set(framed.columns) - set(plain.columns) == {
+        compute.ALL_TIME_AVG_COL, compute.TREND_COL,
+    }
     assert set(plain.columns) - set(framed.columns) == set()
-    # Both averages land right after "Weeks with data".
+    # All three land together right after "Weeks with data".
     pos = list(framed.columns).index("Weeks with data")
-    assert list(framed.columns)[pos + 1:pos + 3] == [
-        compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL,
+    assert list(framed.columns)[pos + 1:pos + 4] == [
+        compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL, compute.TREND_COL,
     ]
     # The per-group frames cover the same groups as the table, un-summed.
     for frame in (weekly_by_group, agg_by_group):
@@ -320,10 +322,10 @@ def test_attach_descriptive_averages_drops_the_space_spelled_column():
     )
     out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
     assert "8 Week POS/Orders Average" not in out.columns
-    # Both averages present and slotted immediately after "Weeks with data".
+    # All three descriptive columns present, slotted after "Weeks with data".
     assert list(out.columns) == [
         "SKU", "Customer Grouping", "Weeks with data",
-        compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL,
+        compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL, compute.TREND_COL,
         "Updated Projection Average",
     ]
 
@@ -398,7 +400,8 @@ def test_attach_descriptive_averages_without_weeks_with_data():
     )
     out = compute.attach_descriptive_averages(summary, agg, pd.Timestamp("2026-07-01"))
     assert list(out.columns) == [
-        "SKU", "Customer Grouping", compute.ALL_TIME_AVG_COL, compute.EIGHT_WK_AVG_COL,
+        "SKU", "Customer Grouping", compute.ALL_TIME_AVG_COL,
+        compute.EIGHT_WK_AVG_COL, compute.TREND_COL,
     ]
 
 
@@ -446,7 +449,7 @@ def test_compute_by_customer_best_golden(raw, prices, monkeypatch):
 
 
 def test_descriptive_averages_golden(raw):
-    """The all-history / 8-week demand averages used by the best-model views."""
+    """The all-time / 8-week demand averages every by-customer table now shows."""
     from dashboard_app import compute
 
     P = pipeline("regression")
@@ -474,17 +477,22 @@ def _descriptive_averages_reference(agg_by_group, today_ts):
     current_week_start = today_ts - pd.Timedelta(days=days_since_sunday)
     last_complete_week = current_week_start - pd.Timedelta(weeks=1)
     eight_wk_start = last_complete_week - pd.Timedelta(weeks=7)
+    prior_8wk_end = eight_wk_start - pd.Timedelta(weeks=1)
+    prior_8wk_start = prior_8wk_end - pd.Timedelta(weeks=7)
     hist_start = today_ts - pd.DateOffset(years=3)
 
-    from dashboard_app.compute import ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL
+    from dashboard_app.compute import (
+        ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL, _PRIOR_8WK_COL,
+    )
 
     A = agg_by_group.copy()
     A["SKU"] = A["SKU"].astype(str)
     A = A[~A["SKU"].str.endswith("*")]
     A["WeekDate"] = pd.to_datetime(A["WeekDate"])
 
-    def _avg(start, out_col):
-        win = A[(A["WeekDate"] >= start) & (A["WeekDate"] <= last_complete_week)]
+    def _avg(start, out_col, end=None):
+        end = last_complete_week if end is None else end
+        win = A[(A["WeekDate"] >= start) & (A["WeekDate"] <= end)]
         rows = []
         for (grp, sku), g in win.groupby(["Customer Grouping", "SKU"], sort=False):
             pos = g[g["POS"].notna()]
@@ -495,15 +503,29 @@ def _descriptive_averages_reference(agg_by_group, today_ts):
                 if orders.empty:
                     continue
                 vals, weeks = orders["Orders"], orders["WeekDate"]
-            weeks_span = int(round((last_complete_week - weeks.min()).days / 7)) + 1
+            weeks_span = int(round((end - weeks.min()).days / 7)) + 1
             rows.append({"Customer Grouping": grp, "SKU": sku,
                          out_col: round(vals.sum() / max(weeks_span, 1), 1)})
         return pd.DataFrame(rows, columns=["Customer Grouping", "SKU", out_col])
 
-    return _avg(hist_start, ALL_TIME_AVG_COL).merge(
-        _avg(eight_wk_start, EIGHT_WK_AVG_COL),
-        on=["Customer Grouping", "SKU"], how="outer",
-    )
+    key = ["Customer Grouping", "SKU"]
+    out = (_avg(hist_start, ALL_TIME_AVG_COL)
+           .merge(_avg(eight_wk_start, EIGHT_WK_AVG_COL), on=key, how="outer")
+           .merge(_avg(prior_8wk_start, _PRIOR_8WK_COL, end=prior_8wk_end),
+                  on=key, how="outer"))
+    # Trend, spelled out row-by-row rather than vectorised: a missing RECENT average
+    # is a real zero (the pair sold nothing lately), a missing PRIOR average is no
+    # baseline at all and stays blank. See _descriptive_averages for why.
+    trend = []
+    for _, r in out.iterrows():
+        prior, recent = r[_PRIOR_8WK_COL], r[EIGHT_WK_AVG_COL]
+        recent = 0.0 if pd.isna(recent) else float(recent)
+        if pd.isna(prior) or float(prior) <= 0:
+            trend.append(np.nan)
+        else:
+            trend.append(round((recent - float(prior)) / float(prior) * 100.0, 1))
+    out[TREND_COL] = pd.Series(trend, index=out.index, dtype="float64")
+    return out.drop(columns=[_PRIOR_8WK_COL])
 
 
 def _agg_frame(rows):

@@ -16,10 +16,14 @@ from dashboard_app.compute import (
     EIGHT_WK_AVG_COL,
     _agent_summaries_mtime,
     _agent_summaries_oldest_at,
+    attach_supply_columns,
     compute_by_customer_best,
 )
-from dashboard_app.config import BEST_MODEL_COMBINED_VIEW, PRICE_COL
+from dashboard_app.config import (
+    BEST_MODEL_COMBINED_VIEW, ONHAND_COL, PRICE_COL, RISK_COL, TREND_COL, WOS_COL,
+)
 from dashboard_app.exceptions import _render_exception_chart, sku_week_by_group
+from dashboard_app.kpis import projection_difference_delta, projection_kpi_extras
 from dashboard_app.tables import render_selectable_table
 from dashboard_app.watchlist import (
     DEFAULT_NAME, active_name, active_pairs, create_watchlist, delete_watchlist,
@@ -31,17 +35,21 @@ from dashboard_app.watchlist import (
 # cleared on removal to stop a stale selection reopening the wrong card.
 _WATCHLIST_SEL_KEY = "watchlist__sel"
 
-# Detail-card field order for the watchlist (decoupled from the best-model table's
-# full column set). Renders as three rows:
-#   Customer Grouping · Region · Data Source
-#   All-Time Avg · 8-Week Avg · Current Projection Average
-#   List Price · Weeks with data
-# The projection change (new value, difference, revenue risk) comes from the card's
-# "Calculate Optimal Projection" button, so it's intentionally left off the grid.
+# The watchlist card's KPI tiles (decoupled from the best-model table's full column
+# set). A SET, not a sequence — config.kpi_sort orders it, so these land in the same
+# positions as on every other view's card.
+#
+# The card's own "Calculate Optimal Projection" button produces the OPTIMIZED
+# projection and its revenue risk, rendered as tiles beside that button. The model's
+# forecast columns already on the row are tiles here, so a planner sees the plan of
+# record and the model's view without having to press anything.
 WATCHLIST_CARD_COLS = [
     "Customer Grouping", "Region", "Data Source",
-    ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, "Current Projection Average",
-    PRICE_COL, "Weeks with data",
+    "Weeks with data", ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL,
+    "Current Projection Average", "Updated Projection Average",
+    "Projection Difference",
+    PRICE_COL, RISK_COL,
+    ONHAND_COL, WOS_COL,
 ]
 
 
@@ -215,7 +223,7 @@ def _list_controls():
 
 
 def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, P,
-                     data_sig=None):
+                     data_sig=None, onhand_by_sku=None):
     """Render the WATCHLIST_VIEW. Signature mirrors render_exceptions /
     _render_best_model_combined so main()'s dispatch call is uniform."""
     st.subheader("Watchlist")
@@ -319,11 +327,16 @@ def render_watchlist(df, today_ts, today_str, prices, n_excluded_rows, anchors, 
                 lambda g: str(P.region_for_group(g))
             )
         )
+        # On Hand / WOS: same helper (and therefore the same definition) the
+        # Projections and Exceptions cards use.
+        watch_df = attach_supply_columns(watch_df, onhand_by_sku)
         render_selectable_table(
             watch_df, "watchlist", P,
             condensed_cols=["SKU", "Customer Grouping"],
             detail_chart=chart_cb,
             detail_cols=WATCHLIST_CARD_COLS,
+            extra_kpis=projection_kpi_extras,
+            kpi_deltas={"Projection Difference": projection_difference_delta},
             row_action={
                 "label": f"🗑 Remove from “{active}”",
                 "help": "Remove this combination from the active watchlist",
