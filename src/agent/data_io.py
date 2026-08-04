@@ -767,6 +767,15 @@ class ExclusionResult(NamedTuple):
     excluded_counts_by_key: pd.Series   # per SKU||Customer dropped-row counts
     n_disc_rows: int                    # demand rows dropped as discontinued/inactive
     n_disc_skus: int                    # distinct SKUs dropped as discontinued/inactive
+    # The frame AFTER the active-in drop but BEFORE the discontinued drop, for the
+    # Historical Summary view. The discontinued filter below removes a SKU's ENTIRE
+    # history, not just its recent weeks, so a purely historical view that read
+    # ``df`` would show no trace of a product that sold for years before being
+    # retired -- and its prior-year totals would be understated, making
+    # year-over-year growth look better than it was. Every forecast path keeps
+    # using ``df``; nothing that must not project a discontinued SKU sees this.
+    # Appended last so the existing fields keep their positions.
+    df_with_discontinued: pd.DataFrame = None
 
 
 def apply_exclusions(df, plytix_df, P, anchors=None):
@@ -824,6 +833,9 @@ def apply_exclusions(df, plytix_df, P, anchors=None):
     disc_mask = sku_base.isin(disc_bases)
     n_disc_rows = int(disc_mask.sum())
     n_disc_skus = 0
+    # Captured before the drop below (a reference, not a copy -- the filter
+    # rebinds `df` rather than mutating it, so this stays the pre-drop frame).
+    df_with_discontinued = df
     if n_disc_rows:
         n_disc_skus = int(sku_base[disc_mask].nunique())
         df = df[~disc_mask].reset_index(drop=True)
@@ -838,6 +850,7 @@ def apply_exclusions(df, plytix_df, P, anchors=None):
         excluded_counts_by_key=excluded_counts_by_key,
         n_disc_rows=n_disc_rows,
         n_disc_skus=n_disc_skus,
+        df_with_discontinued=df_with_discontinued,
     )
 
 

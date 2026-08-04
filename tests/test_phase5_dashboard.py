@@ -197,6 +197,207 @@ def test_exceptions_view_renders():
     assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min revenue risk / wk"}
 
 
+@needs_data
+def test_historical_summary_view_renders():
+    """Selecting the Historical Summary scope renders its forecast-free view.
+
+    Pins the routing branch, the render_historical_summary wiring, the filter bar
+    and the four chart tabs. The tiles are plain st.metric calls (deliberately not
+    tables._render_kpi_tiles), so this also catches a duplicate-container-key
+    regression in the three stacked KPI rows.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.run()
+    assert not at.exception
+
+    tab_labels = {t.label for t in at.tabs}
+    assert {"Trend & Seasonality", "Mix & Breakdown", "Movers & Concentration",
+            "Seasonal Heatmap"} <= tab_labels
+
+    metric_labels = {m.label for m in at.metric}
+    assert {"YTD Revenue", "YTD Units", "Active SKUs",
+            "Top-10 Revenue Share"} <= metric_labels
+
+    # The filter bar and the window selector both render. There is deliberately no
+    # SKU-type filter — planners never slice by it — but the SKU Type COLUMN must
+    # survive, because the Mix & Breakdown donut reads it.
+    assert "hist_window" in at.session_state
+    filter_labels = {ms.label for ms in at.multiselect}
+    assert {"Region", "Customer group"} <= filter_labels
+    assert "SKU type" not in filter_labels
+    assert "SKU Type" in at.session_state["hist_base"].columns
+
+
+@needs_data
+def test_historical_summary_tile_grid_is_three_by_four():
+    """Twelve tiles in three sections of four, each with a click target.
+
+    The uniform grid is the fix for the tiles reading as a scattered list, so its
+    shape is pinned: a stray 13th tile or a missing button would reintroduce the
+    ragged row this replaced.
+    """
+    import dashboard
+    from dashboard_app import historical_summary as hs
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.run()
+    assert not at.exception
+
+    assert [len(ids) for _, ids in hs._SECTIONS] == [4, 4, 4]
+    tile_ids = [t for _, ids in hs._SECTIONS for t in ids]
+    assert len(tile_ids) == len(set(tile_ids)) == 12
+    # Every tile in the grid must have a spec, and every spec must be on the grid —
+    # otherwise a tile opens the wrong breakdown or a KPI silently disappears.
+    assert set(tile_ids) == set(hs._TILES)
+
+    rendered = {m.label for m in at.metric}
+    for tile_id in tile_ids:
+        label = hs._tile_label(tile_id, at.session_state["hist_window"])
+        assert label in rendered, f"{tile_id} tile did not render"
+
+    button_keys = {b.key for b in at.button}
+    for tile_id in tile_ids:
+        assert f"histkpi-go-{tile_id}" in button_keys, f"{tile_id} has no click target"
+
+    # Section captions anchor the grid visually.
+    captions = " ".join(c.value for c in at.caption)
+    assert all(name in captions for name, _ in hs._SECTIONS)
+
+
+@needs_data
+@pytest.mark.parametrize("tile_id", ["dormant_skus", "top10_share", "ytd_revenue",
+                                     "active_customers", "units_4w"])
+def test_clicking_a_tile_opens_its_breakdown(tile_id):
+    """Clicking a tile must open a modal with a table, not raise.
+
+    dormant_skus and top10_share are the two the request named explicitly.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.run()
+    assert not at.exception
+
+    n_tables_before = len(at.dataframe)
+    at.button(key=f"histkpi-go-{tile_id}").click().run()
+    assert not at.exception, f"clicking {tile_id} raised"
+    assert len(at.dataframe) > n_tables_before, \
+        f"{tile_id} modal rendered no breakdown table"
+
+
+@needs_data
+@pytest.mark.parametrize("window", ["Last 4 weeks", "Last 26 weeks",
+                                    "Last full calendar year"])
+def test_historical_summary_renders_every_new_window(window):
+    """Each added window must render — a 4-week span is the likeliest to be sparse."""
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.session_state["hist_window"] = window
+    at.run()
+    assert not at.exception
+    assert {m.label for m in at.metric}, "no tiles rendered"
+
+
+@needs_data
+def test_custom_window_renders_and_reports_the_snapped_range():
+    """A custom range must render and caption the weeks it ACTUALLY covers."""
+    import pandas as pd
+    import dashboard
+    from dashboard_app import historical_metrics as hm
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.session_state["hist_window"] = hm.WINDOW_CUSTOM
+    at.run()
+    assert not at.exception
+
+    P = dashboard.load_pipeline(dashboard.pipeline_path())
+    _, lcw, _ = P.week_anchors(pd.Timestamp(at.session_state["hist_base_sig"][0]))
+    # Mid-week edges, so snapping is actually exercised.
+    at.session_state["hist_custom_range"] = (
+        (lcw - pd.Timedelta(weeks=8, days=3)).date(),
+        (lcw + pd.Timedelta(days=2)).date(),
+    )
+    at.run()
+    assert not at.exception
+    captions = " ".join(c.value for c in at.caption)
+    assert "snapped to whole weeks" in captions, \
+        "the caption must state the range actually measured, not the dates typed"
+
+
+@needs_data
+def test_breakdown_row_counts_match_their_tiles_on_real_data():
+    """The tile number and its modal's row count must agree on the live snapshot.
+
+    Unit tests pin this on a synthetic frame; this catches a real-data-only
+    divergence (odd SKU codes, all-NaN rows, discontinued duplicates).
+    """
+    import pandas as pd
+    import dashboard
+    from dashboard_app import historical_metrics as hm
+    from dashboard_app import historical_summary as hs
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.run()
+    assert not at.exception
+
+    base = at.session_state["hist_base"]
+    # Derive lcw the way the app does rather than re-deriving the week maths here —
+    # the snapshot date is the first element of the base-frame signature.
+    P = dashboard.load_pipeline(dashboard.pipeline_path())
+    _, lcw, _ = P.week_anchors(pd.Timestamp(at.session_state["hist_base_sig"][0]))
+    start, end = hm.window_bounds(hm.WINDOW_YTD, lcw)
+
+    counts = hm.breadth(base, start, end)
+    for key, fn in [("active_skus", hm.active_skus_breakdown),
+                    ("active_customers", hm.active_customers_breakdown),
+                    ("new_skus", hm.new_skus_breakdown),
+                    ("dormant_skus", hm.dormant_skus_breakdown)]:
+        assert counts[key] == len(fn(base, start, end)), (
+            f"{key} tile would show {counts[key]} above a list of "
+            f"{len(fn(base, start, end))} rows"
+        )
+    assert set(hs._TILES) >= set(counts)
+
+
+@needs_data
+def test_historical_summary_counts_discontinued_skus():
+    """The view must read the pre-discontinued-drop frame.
+
+    This is the whole reason ExclusionResult grew a df_with_discontinued field: the
+    exclusion step deletes a retired SKU's ENTIRE history, so a Historical Summary
+    built from the forecast frame would understate every prior year and flatter
+    year-over-year growth. Asserted at the data layer rather than through the UI so
+    the failure message points at the cause.
+    """
+    import dashboard
+    from agent import data_io
+    from dashboard_app import historical_metrics as hm
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    excl = at.session_state["_excl_result"]
+    if not excl.n_disc_rows:
+        pytest.skip("this snapshot has no discontinued SKUs to distinguish")
+
+    assert len(excl.df_with_discontinued) > len(excl.df)
+    P = dashboard.load_pipeline(dashboard.pipeline_path())
+    kept = set(hm.historical_weekly_frame(excl.df_with_discontinued, P)["SKU"])
+    forecast = set(hm.historical_weekly_frame(excl.df, P)["SKU"])
+    assert kept - forecast, "discontinued SKUs must survive into the historical frame"
+    assert not any(str(s).endswith("*") for s in kept), "'*' must be normalised away"
+    assert data_io  # the field is defined on data_io.ExclusionResult
+
+
 def _headings(at):
     """The view body's "### ..." section headings, as one searchable string."""
     return " ".join(m.value for m in at.markdown if m.value.startswith("###"))

@@ -22,7 +22,7 @@ forecast, and the "Data Source" is surfaced throughout.
 Run it locally with two terminals:
 
     Terminal 1: streamlit run dashboard.py --server.headless true
-    Terminal 2: ngrok http 8501
+    Terminal 2: ngrok http 12589
 
     Use link like: https://reissue-ninetieth-deeply.ngrok-free.dev 
 
@@ -104,7 +104,8 @@ if not logger.handlers:
 from dashboard_app.config import (  # noqa: F401
     ALL_CUSTOMERS_VIEW, ALL_REGIONS, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID,
     C_ORIGINAL, C_UPDATED,
-    DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, LOGO_PATH, MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
+    DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, HISTORICAL_VIEW, LOGO_PATH, MODEL_DISPLAY,
+    MODEL_OPTIONS, MODEL_USED_COL,
     PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
     SCOPE_LABELS, WATCHLIST_VIEW,
     _ENV_PIPELINE,
@@ -171,6 +172,7 @@ from dashboard_app.exceptions import (  # noqa: F401
 )
 from dashboard_app import forecast_cache  # noqa: F401
 from dashboard_app.watchlist_view import render_watchlist  # noqa: F401
+from dashboard_app.historical_summary import render_historical_summary  # noqa: F401
 
 
 # Bounds for the per-view session caches below. Entries are keyed per
@@ -385,6 +387,86 @@ def main():
             display: flex;
             flex-direction: column;
             justify-content: flex-start;
+        }}
+        /* ---- Historical Summary: clickable KPI tiles ---------------------- */
+        /* Three labelled sections of four. Streamlit rejects a repeated container
+           key, so these rows cannot reuse kpi_bubble_row's exact class; a prefix
+           selector gives them the identical equal-height treatment. Additive: the
+           rules above are untouched and keep applying to every existing view. */
+        [class*="st-key-histkpi-row-"] [data-testid="stColumn"] {{
+            align-self: stretch;
+        }}
+        /* stLayoutWrapper, NOT stVerticalBlockBorderWrapper: that testid does not
+           exist in Streamlit 1.58 (zero occurrences in its bundle), so the selector
+           it replaces was dead. 1.58 inserts an unkeyed stLayoutWrapper twice in
+           this chain — between the row container and the columns, and between each
+           column and its tile container — and height:100% has to be carried through
+           every level or the chain collapses to auto. */
+        [class*="st-key-histkpi-row-"] [data-testid="stColumn"] > div,
+        [class*="st-key-histkpi-row-"] [data-testid="stLayoutWrapper"],
+        [class*="st-key-histkpi-row-"] [data-testid="stVerticalBlock"],
+        [class*="st-key-histkpi-row-"] [data-testid="stElementContainer"] {{
+            height: 100%;
+        }}
+        [class*="st-key-histkpi-tile-"] [data-testid="stMetric"] {{
+            height: 100%;
+            min-height: 7.25rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+        }}
+        /* Fixed label height — two lines at the 0.74rem label size. This is what
+           makes the VALUES line up: "Top-10 Revenue Share" wraps to two lines while
+           "Active SKUs" fits on one, so without a floor the numbers beside each
+           other start at different heights and twelve tidy figures read as a ragged
+           list. The vertical half of the consistency fix; fmt_compact is the
+           horizontal half.
+           (Card height itself is handled by min-height on the metric above. Only 5
+           of the 12 tiles carry a year-over-year delta, and Streamlit omits the
+           delta element entirely when there is none — so nothing here can reserve
+           its space; top-aligned content plus the card floor is what keeps a
+           delta-less tile the same size as its neighbour.) */
+        [class*="st-key-histkpi-tile-"] [data-testid="stMetricLabel"] {{
+            min-height: 2.2rem;
+            display: flex;
+            align-items: flex-start;
+        }}
+        /* Whole-tile click target. st.metric has no click event, so each tile pairs
+           it with a real keyed button that CSS stretches over the card.
+           DEGRADATION: the button is an ordinary button that CSS merely MOVES — if a
+           Streamlit release changes this DOM and the selector stops matching, every
+           tile falls back to a plainly visible working button rather than a dead
+           card. opacity (not display:none) keeps it in tab order, and focus-within
+           reveals it so keyboard users can see where they are. */
+        [class*="st-key-histkpi-tile-"] {{
+            position: relative;
+            cursor: pointer;
+        }}
+        [class*="st-key-histkpi-go-"] {{
+            position: absolute;
+            inset: 0;
+            z-index: 3;
+            opacity: 0;
+        }}
+        /* THE FIX for "only the top of the tile was clickable". Streamlit's
+           div[data-testid="stButton"] is emitted with NO height — its styled-component
+           takes width and height as props and Button.tsx passes only width — so it
+           computes to auto. height:100% on the <button> then resolved against an
+           auto parent, collapsed to auto, and the button fell back to its min-height
+           (~2.5rem) pinned at the top of a 7.25rem card, leaving the lower two thirds
+           of the tile dead. Giving stButton a definite height repairs the chain.
+           This is also why the tile button carries NO help=: a tooltip inserts three
+           further auto-height wrappers AND makes Streamlit emit two <button>s
+           (desktop + mobile), which would break the chain again. */
+        [class*="st-key-histkpi-go-"] [data-testid="stButton"] {{
+            height: 100%;
+        }}
+        [class*="st-key-histkpi-go-"] button {{
+            width: 100%;
+            height: 100%;
+        }}
+        [class*="st-key-histkpi-go-"]:focus-within {{
+            opacity: 1;
         }}
         [data-testid="stMetric"]:hover {{
             border-color: rgba(128,128,128,0.40);
@@ -627,7 +709,8 @@ def main():
         # (the model-selection logic above resolves the pipeline off it).
         scope = st.segmented_control(
             "View",
-            [QUICK_VIEW, BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW, WATCHLIST_VIEW],
+            [QUICK_VIEW, BEST_MODEL_COMBINED_VIEW, EXCEPTIONS_VIEW,
+             HISTORICAL_VIEW, WATCHLIST_VIEW],
             default=QUICK_VIEW,
             key="scope",
             format_func=lambda s: SCOPE_LABELS.get(s, s),
@@ -723,7 +806,10 @@ def main():
         # column keeps its width regardless of scope; col_llm is simply dropped
         # for the model-agnostic Exceptions scope, leaving the right side blank.
         col_data, col_llm = st.columns([2, 1], gap="large", vertical_alignment="top")
-        if scope == EXCEPTIONS_VIEW:
+        # Both of these scopes are model-agnostic — Exceptions is a pure
+        # actuals-vs-plan scan and Historical Summary runs no forecast at all — so
+        # the reasoning-LLM selector has nothing to act on in either.
+        if scope in (EXCEPTIONS_VIEW, HISTORICAL_VIEW):
             col_llm = None
         with col_data:
             # Sync writes fresh data to a new dated snapshot on disk. While the
@@ -1111,6 +1197,11 @@ def main():
         st.session_state["_excl_result"] = excl
         st.session_state["_excl_sig"] = excl_sig
     df = excl.df
+    # Same frame minus the discontinued drop, for the Historical Summary only. That
+    # filter removes a retired SKU's ENTIRE history, which is right for forecasting
+    # and wrong for a backward-looking view — see agent/data_io.ExclusionResult.
+    # Every forecast path below keeps using `df`.
+    df_hist = excl.df_with_discontinued
     check_ran = excl.active_check_ran
     inactive_df = excl.inactive_df
     disc_check_ran = excl.disc_check_ran
@@ -1373,6 +1464,18 @@ def main():
     # has run the agent on this session — clicking is what reveals it.
     if view in st.session_state.get("agent_ran_views", set()):
         _render_agent_summary(view)
+
+    # ----- Historical Summary view -----------------------------------------
+    # Backward-looking analytics with no forecast in it at all, so it comes first
+    # in the branch chain and stops before every compute path below. Note the
+    # frame: df_hist keeps discontinued SKUs' active years, which the projection
+    # views correctly drop (see the exclusions block above).
+    if view == HISTORICAL_VIEW:
+        render_historical_summary(
+            df_hist, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw),
+            P, plytix_df=plytix_df, data_sig=data_sig, onhand_by_sku=onhand_by_sku,
+        )
+        st.stop()
 
     # ----- Combined best-model-per-group view ------------------------------
     # This view has no single model, so it skips the smoothing/autofit step, the

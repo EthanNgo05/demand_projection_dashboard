@@ -91,6 +91,21 @@ WATCHLIST_VIEW = "Watchlist"
 # whole run, so the model selector and the page body branch on it directly.
 QUICK_VIEW = "Quick Projections"
 
+# A backward-looking analytics view: what sell-through ALREADY did, with no
+# forecast anywhere in it. Every other view exists to produce or interrogate the
+# 15-week projection; this one answers the descriptive questions that come before
+# that ("how much revenue have we booked this year?", "is this quarter up or down
+# on last?", "which SKUs actually pay the bills?", "when does our season hit?").
+# Like EXCEPTIONS_VIEW and WATCHLIST_VIEW this string is a dashboard-only top-level
+# scope token -- it never reaches the compute path and is never returned by
+# list_views/enumerate_views, so the agent never forecasts it.
+#
+# It is the one view that reads ExclusionResult.df_with_discontinued rather than
+# .df: a discontinued SKU is correctly never projected, but it still SOLD for the
+# years it was active, and dropping that history would understate every prior-year
+# total and flatter every year-over-year comparison. See agent/data_io.py.
+HISTORICAL_VIEW = "Historical Summary"
+
 # Friendly labels shown in the view tab strip. The keys are the stable internal
 # view IDs (also the agent-summary filenames / agent config), so we rename only
 # what the planner sees, never the ID.
@@ -98,6 +113,7 @@ SCOPE_LABELS = {
     QUICK_VIEW: "Quick Projections",
     BEST_MODEL_COMBINED_VIEW: "Optimized Projections",
     EXCEPTIONS_VIEW: "Exceptions",
+    HISTORICAL_VIEW: "Historical Summary",
     WATCHLIST_VIEW: "Watchlist",
 }
 
@@ -118,6 +134,13 @@ SCOPE_CAPTIONS = {
         "Scans every customer group for SKUs whose recent actual sell-through has "
         "diverged sharply from the existing system projection (the plan of "
         "record). Model-agnostic — no forecast is run."
+    ),
+    HISTORICAL_VIEW: (
+        "What sell-through has already done — no forecast anywhere in this view. "
+        "Revenue and unit KPIs across YTD / rolling windows with year-over-year "
+        "comparisons, plus trend, mix, mover and seasonality charts. Unlike the "
+        "projection views this one counts discontinued SKUs for the years they "
+        "were active, so its totals run higher than theirs."
     ),
     WATCHLIST_VIEW: (
         "Star SKU / customer-group combinations on named lists to pin their "
@@ -338,6 +361,39 @@ def fmt_dollar(v, decimals=0, signed=False):
     return f"{sign}${abs(v):,.{decimals}f}"
 
 
+def fmt_compact(v, money=False, decimals=1):
+    """Abbreviate a large number for a KPI tile: 1.2K / $210.0M / $2.1B.
+
+    SCOPE: KPI tiles ONLY. charts.py deliberately sets ``tickformat=",.0f"`` to get
+    plain grouped integers "instead of Plotly's default SI abbreviation", and that
+    decision stands -- axis ticks and table cells must stay exact, because reading a
+    value off an axis is a precision job. A tile is a different job: twelve of them
+    sit side by side in quarter-width columns, and "$210,022,936" next to "24%" gives
+    the grid no common rhythm and nothing comparable at a glance. The exact figure is
+    always one hover (or one click into the breakdown) away, so nothing is lost.
+
+    One decimal place at every magnitude on purpose -- "$210.0M" and "$2.1B" occupy
+    the same width, which is the entire point. ``None``/NaN render as an em dash,
+    matching ``fmt_dollar``.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    try:
+        val = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if pd.isna(val):
+        return "—"
+    prefix = "$" if money else ""
+    sign = "-" if val < 0 else ""
+    n = abs(val)
+    for cutoff, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= cutoff:
+            return f"{sign}{prefix}{n / cutoff:,.{decimals}f}{suffix}"
+    # Below 1,000 an abbreviation would lose information for no width saving.
+    return f"{sign}{prefix}{n:,.0f}"
+
+
 def bounded_put(store, key, value, cap):
     """Insert ``key -> value`` into an insertion-ordered dict, evicting the
     oldest entries once ``cap`` is exceeded. Popping the key first gives
@@ -360,3 +416,76 @@ C_ACTUAL = "#2563eb"   # blue   - historical actual demand (POS or Orders)
 C_UPDATED = "#ea580c"  # orange - our recomputed 15-week forecast
 C_ORIGINAL = "#9ca3af"   # grey   - the existing projection
 C_GRID = "rgba(148,163,184,0.18)"
+
+# --------------------------------------------------------------------------- #
+# Categorical palette (Historical Summary breakdowns)                          #
+# --------------------------------------------------------------------------- #
+# The three colors above are SEMANTIC -- each means one specific thing, and they
+# are not a categorical set. The breakdown charts (region donut, region stacked
+# area, SKU-type donut) encode IDENTITY across up to eight categories, which needs
+# a palette whose members stay distinguishable from each other, not just from the
+# background.
+#
+# These eight hues were validated with the dataviz skill's checker against BOTH of
+# this app's real surfaces -- the light theme's #ffffff and the dark theme's
+# #141416 (.streamlit/config.toml) -- and pass every gate in both:
+#   lightness band, chroma floor, contrast >= 3:1 vs surface,
+#   worst adjacent CVD dE 8.4 (protan; >= 8 target),
+#   worst adjacent normal-vision dE 19.3 (>= 15 floor).
+# One mode-invariant set rather than a light/dark pair, matching how C_ACTUAL and
+# friends already work: charts.py deliberately does not branch on the server-side
+# theme (that read can lag the displayed theme), so a trace color has to be legible
+# either way. The light-stepped variant of these hues FAILS the dark lightness band,
+# which is why these specific steps are the ones written down.
+#
+# ORDER IS THE CVD-SAFETY MECHANISM, not decoration -- the checks above are on
+# ADJACENT pairs, so reordering invalidates them. Re-run the validator before
+# changing the sequence. Assign slots in order and never cycle: a ninth category
+# folds into "Other" (see historical_metrics.OTHER_LABEL) rather than reusing slot 1.
+C_CATEGORICAL = (
+    "#3987e5",  # 1 blue
+    "#d95926",  # 2 orange
+    "#199e70",  # 3 aqua
+    "#c98500",  # 4 yellow
+    "#d55181",  # 5 magenta
+    "#008300",  # 6 green
+    "#9085e9",  # 7 violet
+    "#e66767",  # 8 red
+)
+
+# Sequential blue ramp for continuous magnitude (the month x year heatmap).
+# One hue, light -> dark, per the sequential rule. Heatmap cells tile the whole
+# plot area so the surface never shows through, which is what lets a single ramp
+# serve both themes; cell labels pick their own ink from the cell's value (see
+# historical_charts._cell_text_color) rather than from the page theme.
+C_SEQUENTIAL_BLUE = (
+    "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec",
+    "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab",
+    "#184f95", "#104281", "#0d366b",
+)
+
+# Growth / decline for the year-over-year movers chart. Deliberately the SAME two
+# hues the app already uses for money moving up or down (charts._RISK_POS /
+# _RISK_NEG, tables.colour_diff), so a planner reads one visual language across
+# every view. Red/green alone is not colorblind-safe, so this pairing is never the
+# only signal: the movers chart sorts gainers and decliners into separate blocks
+# and direct-labels every bar with a signed dollar figure.
+C_GROWTH = "#16a34a"   # green - revenue up vs the prior year
+C_DECLINE = "#dc2626"  # red   - revenue down vs the prior year
+
+
+def categorical_color_map(keys):
+    """Stable ``{key: hex}`` over ``C_CATEGORICAL``, assigned in slot order.
+
+    Colour follows the ENTITY, never its rank: the mapping is built from the keys
+    sorted by name, so filtering a region out of the Historical Summary never
+    repaints the regions that remain (assigning by position in a
+    largest-first list would). Keys past slot 8 all get the last slot -- callers
+    are expected to have folded the tail into a single "Other" bucket before
+    calling, so that is a backstop, not the intended path.
+    """
+    ordered = sorted({str(k) for k in keys})
+    return {
+        k: C_CATEGORICAL[min(i, len(C_CATEGORICAL) - 1)]
+        for i, k in enumerate(ordered)
+    }

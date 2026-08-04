@@ -10,6 +10,12 @@
 # viewer picks Dark (Settings -> Appearance). Chart text/grid colors adapt separately in
 # charts.py via st.context.theme.type.
 
+# The app serves on a fixed non-default port (Streamlit's default is 8501). A --server.port
+# flag or STREAMLIT_SERVER_PORT env var still overrides this, so hosted deployments
+# (Streamlit Community Cloud) keep assigning their own port.
+[server]
+port = 12589
+
 [theme]
 base = "light"
 

@@ -22,12 +22,12 @@
     "server": "streamlit run src/dashboard.py --server.enableCORS false --server.enableXsrfProtection false"
   },
   "portsAttributes": {
-    "8501": {
+    "12589": {
       "label": "Application",
       "onAutoForward": "openPreview"
     }
   },
   "forwardPorts": [
-    8501
+    12589
   ]
 }
