@@ -108,6 +108,12 @@ _ROLLING_WEEKS = {
     WINDOW_52W: 52, WINDOW_2Y: 104, WINDOW_3Y: 156,
 }
 
+# Reference year every season is re-dated into so the chart tabs can overlay years
+# on one Jan-Dec axis (see ``weekly_by_year``). Deliberately NOT a leap year: a leap
+# year would offer a Feb 29 position that no 365-day year can occupy. Its identity is
+# otherwise meaningless -- it is an axis coordinate, never a date shown to anyone.
+_ALIGN_YEAR = 2001
+
 _FRAME_COLS = ["Customer Grouping", "SKU", "WeekDate", "POS", "Orders",
                "Projection", "Description"]
 
@@ -356,6 +362,49 @@ def all_history_bounds(frame, lcw):
     if pd.isna(earliest) or earliest > lcw:
         return None
     return pd.Timestamp(earliest), lcw
+
+
+def available_years(frame, lcw=None):
+    """Calendar years present in ``frame``, oldest first.
+
+    Drives the chart tabs' year pickers AND their colour assignment, which is why it
+    reads the whole frame rather than a selection: a hue must follow the YEAR, so the
+    map has to be built over every year that exists, not over the years currently
+    ticked. Filtering to a subset and colouring from that would repaint the survivors
+    every time one was deselected.
+    """
+    if frame is None or frame.empty or "WeekDate" not in frame.columns:
+        return []
+    weeks = pd.to_datetime(frame["WeekDate"]).dropna()
+    if lcw is not None:
+        weeks = weeks[weeks <= pd.Timestamp(lcw)]
+    return sorted({int(y) for y in weeks.dt.year})
+
+
+def calendar_year_bounds(year, frame, lcw):
+    """(start, end) for one calendar year, clamped to the data and to ``lcw``.
+
+    Both clamps matter and neither is cosmetic. The in-progress year must end at the
+    last complete week, or the span printed above the charts would claim a December
+    that has not happened. The earliest year on record usually starts mid-year (the
+    extract's history anchor is a fixed date, not a January), so an unclamped Jan 1
+    would advertise months the snapshot has no rows for.
+
+    Returns None when the year holds no data, matching ``snap_window`` /
+    ``all_history_bounds``' "nothing to measure" contract.
+    """
+    if frame is None or frame.empty or "WeekDate" not in frame.columns:
+        return None
+    weeks = pd.to_datetime(frame["WeekDate"]).dropna()
+    if weeks.empty:
+        return None
+    year = int(year)
+    lcw = pd.Timestamp(lcw)
+    start = max(pd.Timestamp(year=year, month=1, day=1), weeks.min())
+    end = min(pd.Timestamp(year=year, month=12, day=31), weeks.max(), lcw)
+    if start > end:
+        return None
+    return start, end
 
 
 def snap_window(start, end, lcw):
@@ -790,23 +839,40 @@ def monthly_totals(frame, value_col="revenue"):
     return out[cols]
 
 
-def seasonality_frame(frame, value_col="revenue"):
-    """Year x week-of-year totals for overlaying seasons on one axis.
+def weekly_by_year(frame, value_col="revenue"):
+    """Year x week-of-year totals for overlaying seasons on one Jan-Dec axis.
 
-    Week-of-year is an ordinal counted from each year's own January 1st
-    (``(WeekDate - Jan 1).days // 7 + 1``) rather than an ISO week number, so
-    every year's week 1 starts at the same point in the calendar and the curves
-    are comparable. ISO numbering would offset Sunday-anchored dates by a week.
+    Supersedes the old ``seasonality_frame``, which returned the same totals
+    against a bare week NUMBER. The extra column is ``SeasonDate``: every week
+    re-dated into one shared reference year, which is what lets a chart put all
+    years on a real calendar axis (Plotly then renders "Jan, Feb, ... Dec" ticks
+    itself) instead of approximating month boundaries from week numbers.
+
+    Week-of-year is kept alongside it, and is an ordinal counted from each year's
+    own January 1st (``(WeekDate - Jan 1).days // 7 + 1``) rather than an ISO week
+    number, so every year's week 1 starts at the same point in the calendar and the
+    curves are comparable. ISO numbering would offset Sunday-anchored dates by a
+    week. ``SeasonDate`` is derived from the same day offset, so the two agree by
+    construction.
+
+    ``_ALIGN_YEAR`` is a non-leap year on purpose: re-dating into a leap year would
+    give the 366-day years an axis position the 365-day ones cannot reach. A week
+    starting Dec 31 lands on the following January in the reference year, which is
+    correct -- it is week 53, past the end of the season.
     """
-    cols = ["Year", "WeekOfYear", value_col]
+    cols = ["Year", "WeekOfYear", "SeasonDate", value_col]
     if frame is None or frame.empty or value_col not in frame.columns:
         return pd.DataFrame(columns=cols)
     out = frame.copy()
     year_start = pd.to_datetime(out["WeekDate"].dt.year.astype(str) + "-01-01")
+    day_offset = (out["WeekDate"] - year_start).dt.days
     out["Year"] = out["WeekDate"].dt.year
-    out["WeekOfYear"] = ((out["WeekDate"] - year_start).dt.days // 7) + 1
-    return (out.groupby(["Year", "WeekOfYear"])[value_col].sum(min_count=1)
-            .reset_index().sort_values(["Year", "WeekOfYear"]))[cols]
+    out["WeekOfYear"] = (day_offset // 7) + 1
+    out["SeasonDate"] = (pd.Timestamp(year=_ALIGN_YEAR, month=1, day=1)
+                         + pd.to_timedelta(day_offset, unit="D"))
+    return (out.groupby(["Year", "WeekOfYear", "SeasonDate"])[value_col]
+            .sum(min_count=1).reset_index()
+            .sort_values(["Year", "SeasonDate"]))[cols]
 
 
 def fold_to_top_n(totals, n=8, label_col=None, value_col="revenue"):

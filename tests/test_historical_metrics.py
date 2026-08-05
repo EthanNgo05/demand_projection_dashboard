@@ -714,12 +714,12 @@ def test_by_dimension_sorted_largest_first(three_year_frame):
 # --------------------------------------------------------------------------- #
 # Chart-shaped helpers                                                         #
 # --------------------------------------------------------------------------- #
-def test_seasonality_week_of_year_starts_at_one():
+def test_week_of_year_starts_at_one():
     frame = pd.DataFrame({
         "WeekDate": [pd.Timestamp("2026-01-04"), pd.Timestamp("2026-01-11")],
         "revenue": [1.0, 2.0],
     })
-    s = hm.seasonality_frame(frame)
+    s = hm.weekly_by_year(frame)
     assert list(s["WeekOfYear"]) == [1, 2]
     assert set(s["Year"]) == {2026}
 
@@ -739,10 +739,110 @@ def test_weekly_totals_sorted_by_date(three_year_frame):
 @pytest.mark.parametrize("fn,args", [
     (hm.weekly_totals, ()),
     (hm.monthly_totals, ()),
-    (hm.seasonality_frame, ()),
+    (hm.weekly_by_year, ()),
 ])
 def test_chart_helpers_tolerate_an_empty_frame(fn, args):
     assert fn(pd.DataFrame(), *args).empty
+
+
+# --------------------------------------------------------------------------- #
+# Year selection: what the chart tabs pick their periods from                  #
+# --------------------------------------------------------------------------- #
+def test_weekly_by_year_puts_every_year_on_one_axis(three_year_frame):
+    """The overlay's premise: the same point of the calendar lands on one x position.
+
+    Alignment is by DAY OFFSET from each year's own January 1st, not by week number.
+    Week 1's Sunday therefore differs between years by up to six days -- January 1st
+    falls on a different weekday each year -- and that is correct: it keeps a week
+    sitting where it actually falls in the calendar rather than snapping it to a
+    shared grid it does not occupy.
+    """
+    frame, _ = three_year_frame
+    out = hm.weekly_by_year(frame)
+    assert not out.empty
+
+    # Nothing escapes the reference year, bar a Dec-31 week spilling into January.
+    years = set(out["SeasonDate"].dt.year)
+    assert years <= {hm._ALIGN_YEAR, hm._ALIGN_YEAR + 1}
+
+    # Every year's week N lands within one week of every other year's week N, which
+    # is what makes the curves comparable.
+    spread = out.groupby("WeekOfYear")["SeasonDate"].agg(lambda s: s.max() - s.min())
+    assert spread.max() <= pd.Timedelta(days=6), (
+        f"week numbers drifted apart by {spread.max()} across years"
+    )
+
+    # The offset is preserved exactly, which is the actual contract.
+    align_start = pd.Timestamp(year=hm._ALIGN_YEAR, month=1, day=1)
+    assert ((out["SeasonDate"] - align_start).dt.days >= 0).all()
+
+    # The reference year is never a leap year: Feb 29 is a position no 365-day year
+    # could reach, so re-dating into one would misalign every year after February.
+    assert not pd.Timestamp(year=hm._ALIGN_YEAR, month=1, day=1).is_leap_year
+
+
+def test_weekly_by_year_totals_match_weekly_totals(three_year_frame):
+    """Re-dating is an axis operation and must not move a single dollar."""
+    frame, _ = three_year_frame
+    assert hm.weekly_by_year(frame)["revenue"].sum() == pytest.approx(
+        hm.weekly_totals(frame)["revenue"].sum()
+    )
+
+
+def test_available_years_is_bounded_by_lcw(three_year_frame):
+    """The frame carries forward projection weeks; a year picker must not offer
+    a year that exists only in them."""
+    frame, _ = three_year_frame
+    years = hm.available_years(frame, LCW)
+    assert years == sorted(years), "years must come back oldest first"
+    assert all(y <= LCW.year for y in years)
+    assert hm.available_years(pd.DataFrame()) == []
+
+
+def test_a_364_day_shift_is_wrong_for_a_calendar_year():
+    """Why the movers tab passes an explicit calendar prior instead of the default.
+
+    prior_year_window shifts by 364 days so whole weeks meet whole weeks — correct
+    for a rolling window, and wrong for a calendar year: the shifted span runs one
+    day INTO the year being measured, so a SKU's January revenue would be counted on
+    both sides of its own comparison.
+    """
+    start = pd.Timestamp("2025-01-01")
+    end = pd.Timestamp("2025-12-31")
+    shifted_start, shifted_end = hm.prior_year_window(start, end)
+    assert shifted_end >= start, (
+        "if this ever stops overlapping, the calendar shift in _tab_movers can go"
+    )
+
+    # What the tab uses instead: both endpoints back one calendar year, which for a
+    # full year is exactly the previous full year and cannot overlap.
+    prior = (start - pd.DateOffset(years=1), end - pd.DateOffset(years=1))
+    assert prior == (pd.Timestamp("2024-01-01"), pd.Timestamp("2024-12-31"))
+    assert prior[1] < start
+
+    # And for a part-elapsed year it stays like-for-like: same calendar span, one
+    # year back, rather than a whole year against a fraction of one.
+    partial_end = pd.Timestamp("2026-07-19")
+    partial = (pd.Timestamp("2026-01-01") - pd.DateOffset(years=1),
+               partial_end - pd.DateOffset(years=1))
+    assert partial == (pd.Timestamp("2025-01-01"), pd.Timestamp("2025-07-19"))
+
+
+def test_calendar_year_bounds_clamps_both_ends(three_year_frame):
+    """The current year stops at the last complete week, not at December."""
+    frame, _ = three_year_frame
+    start, end = hm.calendar_year_bounds(LCW.year, frame, LCW)
+    assert start == pd.Timestamp(year=LCW.year, month=1, day=1)
+    assert end <= LCW, "the in-progress year must not claim weeks it has no data for"
+
+    # A year with nothing in it resolves to None rather than an empty span.
+    assert hm.calendar_year_bounds(1999, frame, LCW) is None
+
+    # A completed year keeps its December, clamped only by the data itself.
+    earlier = LCW.year - 1
+    bounds = hm.calendar_year_bounds(earlier, frame, LCW)
+    assert bounds is not None
+    assert bounds[1] <= pd.Timestamp(year=earlier, month=12, day=31)
 
 
 # --------------------------------------------------------------------------- #

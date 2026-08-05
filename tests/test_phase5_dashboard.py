@@ -418,29 +418,70 @@ def test_mix_tab_no_longer_charts_sku_type():
 
 
 @needs_data
-def test_seasonal_heatmap_has_its_own_date_range():
-    """A month x year grid needs several seasons, so it cannot follow a 4-week window.
+def test_chart_tabs_pick_years_and_default_sensibly():
+    """Trend opens on every year; Mix and Movers open on the latest one.
 
-    It used to silently ignore the analysis window instead, which reads as a broken
-    control. An explicit range control -- the pattern the trend tab already uses --
-    says so on screen, and defaults to All.
+    The tabs used to carry free date-range pickers. What a planner compares here is
+    calendar years, so Trend takes a multiselect (years overlay on one Jan-Dec axis)
+    and Mix/Movers take one year at a time (a donut or a Pareto over several years
+    merges them rather than comparing them).
     """
     import dashboard
+    from dashboard_app import historical_summary as hs
 
     at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
     at.session_state["scope"] = dashboard.HISTORICAL_VIEW
     at.run()
     assert not at.exception
 
-    # Its own widget key, distinct from the trend tab's, and its own default: All,
-    # because the seasonal question is "which months, across every year we have".
-    assert at.session_state["hist_heatmap_preset"] == "All"
-    assert at.session_state["hist_trend_preset"] == "2 Years"
+    years = at.session_state["hist_trend_years"]
+    assert years, "the trend tab should open with every year selected"
+    assert sorted(years) == list(years), "years should arrive oldest first"
 
-    # And it renders when narrowed.
-    at.session_state["hist_heatmap_preset"] = "1 Year"
+    latest = max(years)
+    assert at.session_state["hist_mix_year"] == latest
+    assert at.session_state["hist_movers_year"] == latest
+
+    # The retired date-range keys must be gone, not merely unused.
+    for stale in ["hist_trend_preset", "hist_mix_preset", "hist_movers_preset",
+                  "hist_heatmap_preset", "hist_heatmap_year"]:
+        assert stale not in at.session_state, f"{stale} survived the rewrite"
+
+    # Every year selection renders: a single year, all years, and none at all.
+    for value in [hs.ALL_YEARS, latest, min(years)]:
+        at.session_state["hist_mix_year"] = value
+        at.session_state["hist_movers_year"] = value
+        at.run()
+        assert not at.exception, f"year selection {value!r} broke the view"
+
+    at.session_state["hist_trend_years"] = []
+    at.run()
+    assert not at.exception, "deselecting every year must render an empty panel"
+
+
+@needs_data
+def test_year_pickers_do_not_move_the_kpi_tiles():
+    """The decoupling: a tab's year selection must leave every tile untouched."""
+    import dashboard
+    from dashboard_app import historical_summary as hs
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
     at.run()
     assert not at.exception
+    before = {m.label: m.value for m in at.metric}
+    assert before, "no tiles rendered"
+
+    # The widest and the narrowest chart selections available — if the tiles
+    # followed a chart's period at all, one of these would show it.
+    at.session_state["hist_mix_year"] = hs.ALL_YEARS
+    at.session_state["hist_movers_year"] = min(at.session_state["hist_trend_years"])
+    at.session_state["hist_trend_years"] = []
+    at.run()
+    assert not at.exception
+    assert {m.label: m.value for m in at.metric} == before, \
+        "a chart's year selection moved the KPI tiles — they must follow only the " \
+        "analysis window"
 
 
 @needs_data

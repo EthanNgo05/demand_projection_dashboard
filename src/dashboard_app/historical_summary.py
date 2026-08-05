@@ -99,9 +99,9 @@ def _filter_bar(base, lcw):
 
     window = c3.selectbox(
         "Analysis window", list(hm.WINDOW_OPTIONS), index=0, key="hist_window",
-        help="The period EVERY tile is measured over, and the period the Mix and "
-             "Movers charts cover. The Trend and Seasonal Heatmap tabs are about "
-             "multi-year shape, so they carry their own date range instead.",
+        help="The period EVERY tile is measured over. It does not move the charts: "
+             "the chart tabs each carry their own year selection, so you can read a "
+             "chart over a different period without repointing the tiles.",
     )
 
     # Two windows have no span derivable from lcw alone, so they resolve here and
@@ -117,9 +117,11 @@ def _filter_bar(base, lcw):
 def _custom_range(base, lcw):
     """Date picker for a custom analysis window, snapped to whole weeks.
 
-    Mirrors the "Custom…" branch of historical_charts.history_range_control,
-    including its guard that ``st.date_input`` returns a SINGLE date mid-selection
-    and must only be applied once both ends have been chosen.
+    The only free date picker left in this view, and it belongs to the TILES. The
+    chart tabs used to carry one each; they now pick calendar years instead, because
+    that is the unit their figures compare. Note the guard below: ``st.date_input``
+    returns a SINGLE date mid-selection, so a range must only be applied once both
+    ends have been chosen.
 
     Returns the snapped ``(start, end)``, or None when the pick is incomplete or too
     narrow to hold a complete week (the caller then falls back and warns).
@@ -380,9 +382,12 @@ def _render_window_dates(m):
     reaches the floor of the snapshot, so there is no earlier stretch) -- exactly
     the case where those tiles render without a delta.
 
-    Every span is read straight off ``m`` — the same pairs every tile, breakdown and
-    chart is computed from — so the dates displayed are by construction the dates
-    used, not a re-derivation that could drift out of step.
+    Every span is read straight off ``m`` — the same pairs every tile and breakdown is
+    computed from — so the dates displayed are by construction the dates used, not a
+    re-derivation that could drift out of step. The charts are NOT among them: each
+    tab picks its own years and states its own dates through ``_range_note``, which is
+    why this line says "Analysis window" rather than naming a period for the whole
+    view.
     """
     start, end = m["bounds"]
     weeks = m["window"]["weeks"]
@@ -597,11 +602,11 @@ def _render_caption(m, frame, lcw, base_rows, filtered_rows):
     win = m["window"]
     bits.append(
         f"That window ({win['units']:,.0f} units / {fmt_dollar(win['revenue'])}) "
-        f"is the period for **every tile** and for the Mix and Movers charts; the "
-        f"Trend and Seasonal Heatmap tabs have their own date range. Two "
-        f"definitions reach past it on purpose: **New SKUs** tests a first-ever "
-        f"sale across all history, and **Dormant SKUs** looks back a fixed 52 weeks "
-        f"before the window opened."
+        f"is the period for **every tile**; the charts below do not follow it — "
+        f"each tab picks its own years and states the dates it plots. Two tile "
+        f"definitions reach past the window on purpose: **New SKUs** tests a "
+        f"first-ever sale across all history, and **Dormant SKUs** looks back a "
+        f"fixed 52 weeks before the window opened."
     )
     if filtered_rows != base_rows:
         bits.append(f"Filtered to **{filtered_rows:,}** of {base_rows:,} SKU-weeks.")
@@ -611,33 +616,129 @@ def _render_caption(m, frame, lcw, base_rows, filtered_rows):
 # --------------------------------------------------------------------------- #
 # Chart tabs                                                                   #
 # --------------------------------------------------------------------------- #
-def _tab_trend(frame, value_col):
-    st.caption(
-        "Full history, independent of the analysis window above — these charts "
-        "have their own date range."
+# The "show everything" entry in the single-year pickers. A sentinel string rather
+# than None so it can sit in a selectbox option list beside the real years.
+ALL_YEARS = "All years"
+
+
+def _year_multiselect(years, key):
+    """Year picker for the trend tab: any combination, all of them by default.
+
+    A multiselect rather than a date range because the trend charts overlay years on
+    one Jan-Dec axis -- the unit a planner compares here IS the year, and an arbitrary
+    span (say Mar 2024 to Aug 2025) would cut two seasons in half and overlay the
+    halves. Returns a list of ints; an empty list is a legitimate state and the
+    figures render their empty panel for it.
+    """
+    picked = st.multiselect(
+        "Years", years, default=years, key=key,
+        format_func=str,
+        help="Each selected year is drawn as its own line/bar. Colours follow the "
+             "year, so removing one never recolours the others.",
     )
-    rng = hc.history_range_control(frame, key="hist_trend")
-    scoped = hm.clip(frame, *rng) if rng else frame
-
-    st.plotly_chart(hc.weekly_trend_chart(hm.weekly_totals(scoped, value_col),
-                                          value_col), width="stretch")
-    monthly = hm.monthly_totals(scoped, value_col)
-    # From `scoped`, not `frame`: the year pair the chart plots has to come from the
-    # data the chart plots, or trimming the range to 2023 would still label the
-    # current-vs-prior pair 2026 and draw two empty series.
-    latest_year = int(pd.Timestamp(scoped["WeekDate"].max()).year) \
-        if not scoped.empty else None
-    st.plotly_chart(hc.monthly_yoy_chart(monthly, value_col, latest_year),
-                    width="stretch")
-    st.plotly_chart(hc.seasonality_chart(hm.seasonality_frame(scoped, value_col),
-                                         value_col), width="stretch")
+    return [int(y) for y in picked]
 
 
-def _tab_mix(frame, value_col, start, end):
+def _year_select(years, key):
+    """Year picker for the mix and movers tabs: exactly one year, or all of them.
+
+    Single-select because these tabs' charts each collapse a period into one ranking
+    -- a share donut or a Pareto curve over several years merges them rather than
+    comparing them, so offering a multi-select would promise a comparison the figures
+    cannot draw. Defaults to the latest year, which is the one a planner opens for.
+
+    Returns an int, or ``ALL_YEARS``.
+    """
+    options = [ALL_YEARS] + [int(y) for y in reversed(years)]
+    return st.selectbox(
+        "Year", options, index=1 if years else 0, key=key, format_func=str,
+        help="One calendar year at a time. The current year runs to the last "
+             "complete week, not to December.",
+    )
+
+
+def _year_bounds(frame, choice, lcw):
+    """(start, end) for a ``_year_select`` choice, or None when it holds no data."""
+    if choice == ALL_YEARS:
+        weeks = pd.to_datetime(frame["WeekDate"])
+        return (weeks.min(), weeks.max()) if not weeks.empty else None
+    return hm.calendar_year_bounds(choice, frame, lcw)
+
+
+def _range_note(frame, start, end):
+    """State the dates the charts below are ACTUALLY plotting.
+
+    Sits directly under the tab label and above the first figure. A named selection
+    ("2026", "All years") never tells you which weeks it covers, and the answer is
+    not guessable: the current year stops at the last complete week rather than
+    December, and the earliest year on record starts wherever the extract's history
+    anchor happens to sit rather than at January.
+
+    The week count is weeks that carry DATA, counted off the plotted frame, and is
+    labelled as such -- calling it "complete weeks" would overclaim for a sparse
+    selection where a filter has emptied some of the span.
+    """
+    if start is None or end is None:
+        return
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    weeks = int(pd.to_datetime(frame["WeekDate"]).nunique()) if not frame.empty else 0
+    bits = [f"**Showing:** {_span(start, end)}",
+            f"{weeks} week{'' if weeks == 1 else 's'} of data"]
+    # Only for a year that has not finished -- a completed year ending in December
+    # needs no caveat, and printing one would imply the data were incomplete.
+    if end < pd.Timestamp(year=end.year, month=12, day=31):
+        bits.append(f"{end.year} is still in progress")
+    st.markdown(" &nbsp;·&nbsp; ".join(bits))
+
+
+def _tab_trend(frame, value_col, years, colors):
+    """All history, every year overlaid on one Jan-Dec axis.
+
+    Two charts, not the three this tab used to carry. The third was a seasonality
+    line chart against a bare week-of-year number, which plotted exactly the curves
+    the weekly overlay now does -- the only difference was the axis tick labels.
+    """
+    st.caption(
+        "All history, independent of the analysis window above. Years are overlaid "
+        "on a shared January–December axis, so the same week of each year lines up."
+    )
+    picked = _year_multiselect(years, "hist_trend_years")
+    if picked:
+        scoped = frame[frame["WeekDate"].dt.year.isin(picked)]
+        weeks = pd.to_datetime(scoped["WeekDate"])
+        _range_note(scoped, weeks.min(), weeks.max())
+
+    # The builders get the WHOLE frame and filter through `years`, rather than being
+    # handed a pre-filtered one. Two reasons: an empty selection then reaches them as
+    # "no years chosen" instead of "no data", which is a far more useful panel to read;
+    # and `colors` is keyed on every year, so the filtering has to happen where the
+    # colour lookup does or the two could disagree about which years exist.
+    st.plotly_chart(
+        hc.weekly_year_overlay(hm.weekly_by_year(frame, value_col), value_col,
+                               colors=colors, years=picked), width="stretch")
+    st.plotly_chart(
+        hc.monthly_year_overlay(hm.monthly_totals(frame, value_col), value_col,
+                                colors=colors, years=picked), width="stretch")
+
+
+def _tab_mix(frame, value_col, years, lcw):
     # Three charts. There was a fourth -- a revenue-share-by-SKU-type donut -- which
     # planners didn't want; the `SKU Type` column stays on the frame (see
     # historical_metrics.attach_sku_type) so that analysis can come back cheaply, but
     # nothing reads it today.
+    st.caption(
+        "One year at a time, independent of the analysis window above."
+    )
+    choice = _year_select(years, "hist_mix_year")
+    bounds = _year_bounds(frame, choice, lcw)
+    if bounds is None:
+        st.info("No sell-through history in that year for this selection.")
+        return
+    start, end = bounds
+    _range_note(hm.clip(frame, start, end), start, end)
+
+    # Bounds, not a clipped frame: by_dimension already clips internally, so
+    # pre-clipping here would filter the same rows twice.
     st.plotly_chart(
         hc.share_donut(hm.by_dimension(frame, "Region", start, end, value_col),
                        "Region", value_col), width="stretch")
@@ -648,16 +749,27 @@ def _tab_mix(frame, value_col, start, end):
             "Customer Grouping", value_col,
             title=f"Top customer groups by {_measure_word(value_col)}"),
         width="stretch")
-    # Clipped like the two charts above it. Handing this the whole frame put one tab's
-    # three charts on two different periods -- the donut and the bars on the window,
-    # the area on all history.
+    # Clipped explicitly, because weekly_by_dimension takes a frame rather than
+    # bounds. Handing it the whole frame put one tab's three charts on two different
+    # periods -- the donut and the bars on the year, the lines on all history.
     st.plotly_chart(
-        hc.stacked_area(hm.weekly_by_dimension(hm.clip(frame, start, end),
-                                               "Region", value_col),
-                        "Region", value_col), width="stretch")
+        hc.dimension_lines(hm.weekly_by_dimension(hm.clip(frame, start, end),
+                                                  "Region", value_col),
+                           "Region", value_col), width="stretch")
 
 
-def _tab_movers(frame, value_col, start, end, prior_year):
+def _tab_movers(frame, value_col, years, lcw):
+    st.caption(
+        "One year at a time, independent of the analysis window above."
+    )
+    choice = _year_select(years, "hist_movers_year")
+    bounds = _year_bounds(frame, choice, lcw)
+    if bounds is None:
+        st.info("No sell-through history in that year for this selection.")
+        return
+    start, end = bounds
+    _range_note(hm.clip(frame, start, end), start, end)
+
     # top_skus always returns BOTH measures; pick the one being displayed rather
     # than renaming a column (renaming revenue -> demand would plot dollars under
     # a units label).
@@ -684,29 +796,59 @@ def _tab_movers(frame, value_col, start, end, prior_year):
     # let a high-volume, low-value SKU outrank the business's actual earners.
     st.caption("Movers and concentration are measured in revenue regardless of "
                "the measure toggle — ranking them by units would let cheap, "
-               "high-volume SKUs outrank the real earners. Movers compare the "
-               "analysis window against the same weeks a year earlier.")
-    # `prior_year` is the tiles' own comparison window, passed rather than re-derived
-    # so the chart and the Revenue tile's delta can never disagree about which weeks
-    # "last year" means (they differ for Year to date, which anchors to January 1).
-    st.plotly_chart(
-        hc.movers_chart(hm.yoy_movers(frame, start, end, prior=prior_year, n=10)),
-        width="stretch")
+               "high-volume SKUs outrank the real earners.")
+
+    if choice == ALL_YEARS:
+        # No honest comparable: "all history against the year before all history"
+        # is not a period that exists. Saying so beats drawing a chart whose prior
+        # side is empty and whose every SKU therefore reads as a record gainer.
+        st.info(
+            "Pick a single year to see year-over-year movers — with every year "
+            "selected there is no earlier period to compare against."
+        )
+    else:
+        # The same span one CALENDAR year earlier, passed explicitly. yoy_movers
+        # defaults to a 364-day shift, which is right for a rolling window (it keeps
+        # whole weeks aligned) but wrong for a calendar year: shifting Jan 1–Dec 31
+        # 2025 back 364 days gives Jan 2 2024 – Jan 1 2025, a span overlapping the
+        # very year being measured. A calendar shift is what "versus last year" means
+        # once the selector is a year.
+        prior = (start - pd.DateOffset(years=1), end - pd.DateOffset(years=1))
+        st.caption(f"Compared against {_span(*prior)}.")
+        st.plotly_chart(
+            hc.movers_chart(hm.yoy_movers(frame, start, end, prior=prior, n=10)),
+            width="stretch")
+
     st.plotly_chart(hc.pareto_chart(hm.pareto(frame, start, end)), width="stretch")
+    with st.expander("How to read the concentration chart"):
+        st.markdown(
+            "Each point is one SKU, ranked highest-revenue first, and the line is "
+            "the running share of total revenue those SKUs account for. Where it "
+            "crosses the dotted 80% line tells you how many SKUs carry four-fifths "
+            "of the business.\n\n"
+            "- **A steep early climb** means revenue is concentrated in a handful of "
+            "SKUs. Those are where a forecast miss or a stockout costs the most, and "
+            "where extra forecasting attention pays for itself.\n"
+            "- **A shallow, straight line** means revenue is spread thin across many "
+            "SKUs. No single miss hurts much, but the long tail is expensive to plan "
+            "in aggregate and is usually where safety stock quietly accumulates.\n\n"
+            "Switching the year selector above and watching the crossing point move "
+            "tells you whether the business is consolidating onto fewer winners or "
+            "diversifying — which changes where forecasting effort is worth spending."
+        )
 
 
 def _tab_heatmap(frame, value_col):
-    # Its own date range, like the trend tab and for the same reason: a month x year
-    # grid is a multi-year instrument, and following a 4-week analysis window would
-    # reduce it to a single part-filled column. Defaults to All -- the seasonal
-    # question is "which months, across every year we have".
+    # The only tab with no control at all, and deliberately so: a month x year grid
+    # already HAS a year axis, so a year picker would just delete columns from a chart
+    # whose entire point is comparing them side by side.
     st.caption(
-        "Every year in the snapshot by default, independent of the analysis window "
-        "— this grid needs several seasons side by side to say anything."
+        "Every year in the snapshot, independent of the analysis window above — "
+        "this grid needs several seasons side by side to say anything."
     )
-    rng = hc.history_range_control(frame, key="hist_heatmap", default="All")
-    scoped = hm.clip(frame, *rng) if rng else frame
-    st.plotly_chart(hc.month_year_heatmap(hm.month_year_matrix(scoped, value_col),
+    weeks = pd.to_datetime(frame["WeekDate"])
+    _range_note(frame, weeks.min(), weeks.max())
+    st.plotly_chart(hc.month_year_heatmap(hm.month_year_matrix(frame, value_col),
                                           value_col), width="stretch")
 
 
@@ -754,7 +896,6 @@ def _render_body(base, lcw):
     cache_key = (st.session_state.get("hist_base_sig"),
                  tuple(regions), tuple(groups), window, bounds, len(frame))
     m = _metrics(frame, window, lcw, cache_key, bounds=bounds)
-    start, end = m["bounds"]
 
     _render_kpis(m, window, frame)
     _render_caption(m, frame, lcw, len(base), len(frame))
@@ -769,12 +910,21 @@ def _render_body(base, lcw):
 
     t1, t2, t3, t4 = st.tabs(["Trend & Seasonality", "Mix & Breakdown",
                               "Movers & Concentration", "Seasonal Heatmap"])
+    # No spans passed down: every tab resolves its own from its year picker. `m` stays
+    # the single source for the TILES' three spans, which is what it was always for.
+    #
+    # `years` and `colors` are built ONCE here, off the whole filtered frame, and
+    # handed to the tabs. That is what makes a year's colour stable: rebuilt inside a
+    # tab from its own selection, deselecting 2023 would shift 2024 into slot 1 and
+    # repaint a line the planner never touched.
+    years = hm.available_years(frame, lcw)
+    colors = hc.year_color_map(years)
     with t1:
-        _tab_trend(frame, value_col)
+        _tab_trend(frame, value_col, years, colors)
     with t2:
-        _tab_mix(frame, value_col, start, end)
+        _tab_mix(frame, value_col, years, lcw)
     with t3:
-        _tab_movers(frame, value_col, start, end, m["prior_year_bounds"])
+        _tab_movers(frame, value_col, years, lcw)
     with t4:
         _tab_heatmap(frame, value_col)
 
