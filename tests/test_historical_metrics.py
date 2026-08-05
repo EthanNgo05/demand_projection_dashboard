@@ -258,13 +258,57 @@ def test_unknown_window_raises():
 
 
 def test_custom_window_sentinel_raises_rather_than_guessing():
-    """WINDOW_CUSTOM has no fixed span; resolving it silently would be a wrong answer."""
-    with pytest.raises(ValueError, match="sentinel"):
+    """WINDOW_CUSTOM has no fixed span; resolving it silently would be a wrong answer.
+
+    The message must name the resolver, so the traceback tells a caller what to do.
+    """
+    with pytest.raises(ValueError, match="snap_window"):
         hm.window_bounds(hm.WINDOW_CUSTOM, LCW)
 
 
-def test_named_windows_excludes_only_the_custom_sentinel():
-    assert set(hm.WINDOW_OPTIONS) - set(hm.NAMED_WINDOWS) == {hm.WINDOW_CUSTOM}
+def test_named_windows_excludes_exactly_the_data_dependent_ones():
+    assert (set(hm.WINDOW_OPTIONS) - set(hm.NAMED_WINDOWS)
+            == set(hm.DATA_DEPENDENT_WINDOWS)
+            == {hm.WINDOW_CUSTOM, hm.WINDOW_ALL})
+
+
+def test_all_history_window_raises_from_window_bounds():
+    """Its span comes from the DATA, so lcw alone cannot resolve it."""
+    with pytest.raises(ValueError, match="all_history_bounds"):
+        hm.window_bounds(hm.WINDOW_ALL, LCW)
+
+
+def test_all_history_bounds_spans_the_whole_snapshot(three_year_frame):
+    frame, _ = three_year_frame
+    start, end = hm.all_history_bounds(frame, LCW)
+    assert start == pd.Timestamp(frame["WeekDate"].min())
+    assert end == LCW
+    # Every week on record, so it must be the widest window available.
+    widest = max(hm.window_totals(frame, *hm.window_bounds(w, LCW))["weeks"]
+                 for w in hm.NAMED_WINDOWS)
+    assert hm.window_totals(frame, start, end)["weeks"] >= widest
+
+
+def test_all_history_bounds_ignores_forward_projection_weeks(P):
+    """The frame carries 15 weeks of forward projections; they are not history."""
+    weeks = _weeks(LCW, 5) + [LCW + pd.Timedelta(weeks=n) for n in (1, 2, 3)]
+    frame = hm.build_frame(
+        raw_rows("AAA", "C", "US Retail", weeks, pos=[1.0] * len(weeks)),
+        P, {"AAA": 1.0},
+    )
+    start, end = hm.all_history_bounds(frame, LCW)
+    assert end == LCW, "must not reach past the last complete week"
+    assert hm.window_totals(frame, start, end)["weeks"] == 5
+
+
+def test_all_history_bounds_is_none_when_there_is_nothing(P):
+    assert hm.all_history_bounds(pd.DataFrame(), LCW) is None
+    # A frame holding only future weeks has no history to span.
+    future = hm.build_frame(
+        raw_rows("AAA", "C", "US Retail", [LCW + pd.Timedelta(weeks=2)], pos=[1.0]),
+        P, {},
+    )
+    assert hm.all_history_bounds(future, LCW) is None
 
 
 @pytest.mark.parametrize("kind,weeks", [
@@ -375,6 +419,88 @@ def test_ytd_prior_year_anchors_to_prior_january_first():
     p_start, p_end = hm.prior_year_window(start, end, anchor_to_year_start=True)
     assert p_start == pd.Timestamp("2025-01-01")
     assert p_end == LCW - pd.Timedelta(days=364)
+
+
+@pytest.mark.parametrize("window", list(hm.NAMED_WINDOWS))
+def test_prior_period_abuts_the_window_without_gap_or_overlap(window):
+    """The momentum comparison: the equal-length stretch immediately before.
+
+    Lengths are compared in WEEKS TOTALLED, not in days between endpoints. A rolling
+    window's endpoints are both Sundays and so sit (weeks - 1) * 7 days apart, and a
+    calendar window's edges fall mid-week — measuring either in raw days hands the
+    calendar year a 53-week comparable for its 52 weeks.
+    """
+    start, end = hm.window_bounds(window, LCW)
+    p_start, p_end = hm.prior_period_window(start, end)
+    assert p_end == start - pd.Timedelta(days=1), "must end the day before the window"
+    assert p_start.weekday() == start.weekday(), "shifted by whole weeks"
+    assert hm._anchor_weeks(p_start, p_end) == hm._anchor_weeks(start, end)
+
+
+def test_prior_period_of_a_four_week_window_is_the_four_weeks_before(three_year_frame):
+    frame, _ = three_year_frame
+    start, end = hm.window_bounds(hm.WINDOW_4W, LCW)
+    p_start, p_end = hm.prior_period_window(start, end)
+    assert (p_start, p_end) == (LCW - pd.Timedelta(weeks=7),
+                                LCW - pd.Timedelta(weeks=3, days=1))
+    assert hm.window_totals(frame, p_start, p_end)["weeks"] == 4
+
+
+def test_prior_period_and_prior_year_are_different_questions():
+    """One is momentum, one is season; nothing may quietly conflate them."""
+    start, end = hm.window_bounds(hm.WINDOW_13W, LCW)
+    assert hm.prior_period_window(start, end) != hm.prior_year_window(start, end)
+
+
+@pytest.fixture
+def step_up_frame(P):
+    """One SKU at 1 unit/wk, except 5 a year ago and 10 in the last 4 weeks.
+
+    ``three_year_frame`` is flat, so a 4-week window there compares 10 units against
+    10 units a year earlier and yoy_movers correctly reports nothing moved. This
+    fixture gives the short window real movement AND makes each candidate comparison
+    period a distinct level, so a test can tell which one was actually measured:
+
+    * weeks[156:160] -- the current 4 weeks           -> 10/wk
+    * weeks[104:108] -- the same 4 weeks a year back  ->  5/wk
+    * everything else (incl. two years back)          ->  1/wk
+    """
+    weeks = _weeks(LCW, 160)
+    pos = [1.0] * 160
+    pos[104:108] = [5.0] * 4
+    pos[156:160] = [10.0] * 4
+    raw = raw_rows("STEP", "C", "US Retail", weeks, pos=pos)
+    return hm.build_frame(raw, P, {"STEP": 1.0})
+
+
+def test_yoy_movers_follows_the_window_it_is_given(step_up_frame):
+    """It used to hardcode the trailing 52 weeks and ignore its caller entirely."""
+    short = hm.yoy_movers(step_up_frame, *hm.window_bounds(hm.WINDOW_4W, LCW))
+    long = hm.yoy_movers(step_up_frame, *hm.window_bounds(hm.WINDOW_52W, LCW))
+    assert not short.empty and not long.empty
+    # The step is 4 weeks of +9 units either way, but the 52-week window carries 48
+    # flat weeks alongside it, so the two windows cannot report the same current.
+    assert short["current"].sum() == pytest.approx(40.0)
+    assert long["current"].sum() == pytest.approx(88.0)
+
+
+def test_yoy_movers_accepts_an_explicit_prior_window(step_up_frame):
+    """So the chart can reuse the tiles' comparison instead of deriving a second.
+
+    The Year-to-date window anchors its comparable to the prior January 1 rather than
+    364 days back, and only the caller knows that rule applies — hence the parameter.
+    """
+    start, end = hm.window_bounds(hm.WINDOW_4W, LCW)
+    two_years_back = tuple(d - pd.Timedelta(days=364)
+                           for d in hm.prior_year_window(start, end))
+    explicit = hm.yoy_movers(step_up_frame, start, end, prior=two_years_back)
+    default = hm.yoy_movers(step_up_frame, start, end)
+    assert not explicit.empty and not default.empty
+    assert hm.window_totals(step_up_frame, *two_years_back)["weeks"] == 4
+    # One year back the SKU ran at 5/wk, two years back at 1/wk -- so the figure
+    # names which window was measured.
+    assert default["prior"].sum() == pytest.approx(20.0)
+    assert explicit["prior"].sum() == pytest.approx(4.0)
 
 
 def test_yoy_comparison_is_like_for_like(three_year_frame):
@@ -515,7 +641,7 @@ def test_yoy_movers_sorted_gainers_first(P):
         raw_rows("DOWN", "C", "US Retail", current, pos=[1.0] * len(current)),
     ], ignore_index=True)
     frame = hm.build_frame(raw, P, {"UP": 1.0, "DOWN": 1.0})
-    movers = hm.yoy_movers(frame, LCW, n=5)
+    movers = hm.yoy_movers(frame, *hm.window_bounds(hm.WINDOW_52W, LCW), n=5)
     assert movers["delta"].is_monotonic_decreasing
     assert movers["SKU"].iloc[0] == "UP" and movers["delta"].iloc[0] > 0
     assert movers["SKU"].iloc[-1] == "DOWN" and movers["delta"].iloc[-1] < 0
@@ -528,7 +654,7 @@ def test_yoy_movers_counts_a_launch_as_a_gain(P):
         raw_rows("LAUNCH", "C", "US Retail", weeks, pos=[10.0] * 20), P,
         {"LAUNCH": 5.0},
     )
-    movers = hm.yoy_movers(frame, LCW, n=5)
+    movers = hm.yoy_movers(frame, *hm.window_bounds(hm.WINDOW_52W, LCW), n=5)
     assert movers["prior"].iloc[0] == 0.0
     assert movers["delta"].iloc[0] > 0
 
@@ -840,39 +966,55 @@ def _metrics_for(frame, lcw, window):
     """The metrics dict historical_summary._render_kpis consumes.
 
     Mirrors historical_summary._metrics without Streamlit's session cache, so the
-    tile specs can be exercised as pure functions.
+    tile specs can be exercised as pure functions. Three spans, all derived from the
+    selected window — see test_metrics_hold_no_span_the_window_did_not_set.
     """
     start, end = hm.window_bounds(window, lcw)
-    ytd = hm.window_bounds(hm.WINDOW_YTD, lcw)
-    ytd_prior = hm.prior_year_window(*ytd, anchor_to_year_start=True)
-    w13 = hm.window_bounds(hm.WINDOW_13W, lcw)
-    w52 = hm.window_bounds(hm.WINDOW_52W, lcw)
-    w4 = (lcw - pd.Timedelta(weeks=3), lcw)
+    prior_period = hm.prior_period_window(start, end)
+    prior_year = hm.prior_year_window(
+        start, end, anchor_to_year_start=(window == hm.WINDOW_YTD))
     return {
         "bounds": (start, end), "window_kind": window,
+        "prior_period_bounds": prior_period,
+        "prior_year_bounds": prior_year,
         "window": hm.window_totals(frame, start, end),
-        "ytd": hm.window_totals(frame, *ytd),
-        "ytd_prior": hm.window_totals(frame, *ytd_prior),
-        "w4": hm.window_totals(frame, *w4),
-        "w4_prev": hm.window_totals(frame, w4[0] - pd.Timedelta(weeks=4),
-                                    w4[0] - pd.Timedelta(days=1)),
-        "w13": hm.window_totals(frame, *w13),
-        "w13_prev": hm.window_totals(frame, w13[0] - pd.Timedelta(weeks=13),
-                                     w13[0] - pd.Timedelta(days=1)),
-        "w52": hm.window_totals(frame, *w52),
+        "prior_period": hm.window_totals(frame, *prior_period),
+        "prior_year": hm.window_totals(frame, *prior_year),
         "breadth": hm.breadth(frame, start, end),
         "concentration": hm.concentration(frame, start, end),
         "coverage": hm.price_coverage(frame, start, end),
     }
 
 
+def test_metrics_hold_no_span_the_window_did_not_set():
+    """The structural guard against the defect this grid was rebuilt to fix.
+
+    Seven of the twelve original tiles read spans derived from ``lcw`` alone — a
+    fixed YTD, 13 weeks, 52 weeks — so choosing "Last 4 weeks" moved five tiles and
+    left the rest insisting on 52 weeks. If no such key can exist in the metrics
+    dict, no tile can read one. Compares the real ``_metrics`` source against this
+    module's clone so the two cannot drift apart either.
+    """
+    import inspect
+    from dashboard_app import historical_summary as hs
+
+    source = inspect.getsource(hs._metrics)
+    for banned in ("WINDOW_52W", "WINDOW_13W", '"ytd"', '"w52"', '"w13"', '"w4"'):
+        assert banned not in source, (
+            f"_metrics computes {banned}, which is a span the analysis window did "
+            f"not set — the tile reading it will ignore the selector"
+        )
+    # window_bounds may be called exactly once: to resolve the SELECTED window.
+    assert source.count("window_bounds") == 1
+
+
 @pytest.mark.parametrize("window", list(hm.NAMED_WINDOWS))
 def test_no_two_tiles_show_the_same_thing(three_year_frame, window):
     """Two tiles must never be the same number at any window setting.
 
-    A window-scoped "Revenue (window)" tile used to duplicate "YTD Revenue" exactly
-    whenever the window was Year to date — the default — so the default view showed
-    one figure twice and both tiles opened the same breakdown.
+    Now held structurally rather than by pinning each tile to a fixed span: the
+    eight tiles are eight different QUESTIONS about one window (a total, an average,
+    a share, four counts), so none can collapse onto another whatever the window.
     """
     from dashboard_app import historical_summary as hs
 
@@ -889,6 +1031,30 @@ def test_no_two_tiles_show_the_same_thing(three_year_frame, window):
     assert not dupes, f"tiles duplicate each other at {window!r}: {dupes}"
 
 
+@pytest.mark.parametrize("tile_id", ["revenue", "units", "revenue_per_week",
+                                     "active_skus"])
+def test_the_analysis_window_actually_changes_the_tiles(three_year_frame, tile_id):
+    """The reported complaint, as a test: pick a different window, get a different
+    number. A trailing-52-week figure shown while four weeks are selected is the
+    exact symptom this must fail on.
+
+    ``top10_share`` is deliberately absent: the fixture has fewer than ten priced
+    SKUs, so its share is 100% over any window. It is covered by
+    test_metrics_hold_no_span_the_window_did_not_set instead.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    short = _metrics_for(frame, LCW, hm.WINDOW_4W)
+    # 3 years rather than 52 weeks: the discontinued SKU last sold 80 weeks ago, so
+    # only a window that reaches past it changes the assortment counts too.
+    long = _metrics_for(frame, LCW, hm.WINDOW_3Y)
+    assert hs._tile_value(tile_id, short) != hs._tile_value(tile_id, long), (
+        f"{tile_id} reads the same over 4 weeks as over 52 — it is not measured "
+        f"over the analysis window"
+    )
+
+
 def test_every_tile_has_a_breakdown(three_year_frame):
     """No tile may be a dead end — the whole point of making them clickable."""
     from dashboard_app import historical_summary as hs
@@ -896,10 +1062,69 @@ def test_every_tile_has_a_breakdown(three_year_frame):
     frame, _ = three_year_frame
     m = _metrics_for(frame, LCW, hm.WINDOW_3Y)
     for tile_id in hs._TILES:
-        table, note = hs._breakdown_frame(tile_id, frame, m, LCW)
+        table, note = hs._breakdown_frame(tile_id, frame, m)
         assert table is not None, f"{tile_id} has no breakdown"
         assert list(table.columns), f"{tile_id} breakdown has no columns"
         assert note, f"{tile_id} breakdown has no explanatory note"
+
+
+def test_every_breakdown_covers_the_windows_own_weeks(three_year_frame):
+    """A modal must describe the period of the tile that opened it.
+
+    The date-bearing breakdowns used to re-derive fixed YTD / 13-week / 52-week
+    spans from ``lcw``, so clicking a tile could open a table about a different
+    quarter entirely.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_13W)
+    start, end = m["bounds"]
+    for tile_id in ("revenue_per_week",):
+        table, _ = hs._breakdown_frame(tile_id, frame, m)
+        weeks = pd.to_datetime(table["Week"])
+        assert weeks.min() >= start and weeks.max() <= end, (
+            f"{tile_id} breakdown reaches outside the window "
+            f"({weeks.min()}–{weeks.max()} vs {start}–{end})"
+        )
+
+
+def test_revenue_per_week_is_the_windows_average(three_year_frame):
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_13W)
+    assert m["window"]["weeks"] == 13
+    expected = m["window"]["revenue"] / 13
+    assert hs._TILES["revenue_per_week"]["value"](m) == pytest.approx(expected)
+
+
+def test_revenue_per_week_is_blank_for_an_empty_window(three_year_frame):
+    """No complete week means no average — "—", not a confident $0/week."""
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame.iloc[:0], LCW, hm.WINDOW_13W)
+    assert hs._TILES["revenue_per_week"]["value"](m) is None
+    assert hs._tile_value("revenue_per_week", m) == "—"
+
+
+@pytest.mark.parametrize("window", list(hm.NAMED_WINDOWS))
+def test_headline_deltas_compare_against_a_stated_window(three_year_frame, window):
+    """Every delta's base must be one of the two spans the header names."""
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, window)
+    for tile_id in ("revenue", "units", "revenue_per_week"):
+        # Not asserting a value -- asserting the delta is computable from the two
+        # comparison windows in `m` and nothing else, by removing them.
+        blank = {"revenue": None, "units": None, "weeks": 0}
+        stripped = dict(m, prior_period=blank, prior_year=blank)
+        assert hs._TILES[tile_id]["delta"](stripped) is None, (
+            f"{tile_id}'s delta survives with both comparison windows blanked, so "
+            f"it is reading a period the header never states"
+        )
 
 
 def test_percent_tile_tooltip_is_more_precise_than_the_tile(three_year_frame):

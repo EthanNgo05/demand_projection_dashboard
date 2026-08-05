@@ -135,6 +135,10 @@ def history_range_control(frame, key, default="2 Years"):
         "1 Year": pd.DateOffset(years=1),
         "2 Years": pd.DateOffset(years=2),
         "3 Years": pd.DateOffset(years=3),
+        # 4 Years exists because the extract's history anchor is pinned rather than
+        # rolling, so the snapshot now reaches back further than 3 years and keeps
+        # growing. "All" always reaches the true floor whatever that is.
+        "4 Years": pd.DateOffset(years=4),
         "All": None,
         "Custom…": "custom",
     }
@@ -174,8 +178,12 @@ def weekly_trend_chart(weekly, value_col="revenue"):
     if weekly is None or weekly.empty:
         return _empty_figure("No history in this selection.")
     label = _value_label(value_col)
-    hover = ("%{x|%b %d, %Y}<br>" +
-             (f"{label}: %{{y:$,.0f}}" if _is_money(value_col)
+    # No %{x} prefix: hovermode="x unified" already prints the date once in the
+    # box header, so repeating it on the value row is pure duplication. The
+    # "label: value" text itself IS required -- an explicit hovertemplate suppresses
+    # Plotly's automatic trace-name row (see charts.py _hover_template, which this
+    # now matches).
+    hover = ((f"{label}: %{{y:$,.0f}}" if _is_money(value_col)
               else f"{label}: %{{y:,.0f}}") + "<extra></extra>")
     fig = go.Figure(go.Scatter(
         x=weekly["WeekDate"], y=weekly[value_col], mode="lines",
@@ -213,7 +221,9 @@ def monthly_yoy_chart(monthly, value_col="revenue", current_year=None):
         fig.add_trace(go.Bar(
             x=_MONTHS, y=_series(year), name=str(year),
             marker=dict(color=color, cornerradius=4),
-            hovertemplate=(f"{year} %{{x}}<br>{label}: " +
+            # The year is series IDENTITY (two bars share each month), so it
+            # stays; %{x} was the month, which the unified header already shows.
+            hovertemplate=(f"{year}: " +
                            ("%{y:$,.0f}" if _is_money(value_col) else "%{y:,.0f}") +
                            "<extra></extra>"),
         ))
@@ -251,7 +261,9 @@ def seasonality_chart(seasonal, value_col="revenue"):
             x=sub["WeekOfYear"], y=sub[value_col], mode="lines", name=str(year),
             line=dict(color=C_SEQUENTIAL_BLUE[int(round(step))],
                       width=3 if is_latest else 2),
-            hovertemplate=(f"{year} · week %{{x}}<br>{label}: " +
+            # Year kept (it identifies the line); the week number dropped (the
+            # unified header carries it).
+            hovertemplate=(f"{year}: " +
                            ("%{y:$,.0f}" if _is_money(value_col) else "%{y:,.0f}") +
                            "<extra></extra>"),
         ))
@@ -284,6 +296,10 @@ def share_donut(totals, dim, value_col="revenue", title=None):
         marker=dict(colors=[colors[x] for x in labels],
                     line=dict(color=_SEPARATOR, width=2)),
         textinfo="label+percent", textposition="outside",
+        # Outside labels sit beyond the pie's own box, so without automargin the
+        # topmost one was clipped off the top of the figure. automargin lets Plotly
+        # grow the margins to fit the labels instead of cropping them.
+        automargin=True,
         hovertemplate=("%{label}<br>" + label + ": " +
                        ("%{value:$,.0f}" if _is_money(value_col)
                         else "%{value:,.0f}") +
@@ -293,7 +309,10 @@ def share_donut(totals, dim, value_col="revenue", title=None):
         title=dict(text=title or
                    f"{_value_word(value_col).capitalize()} share by {_dim_word(dim)}",
                    font=dict(size=16)),
-        height=420, margin=dict(l=10, r=10, t=80, b=10),
+        # Taller, with real top/side room: automargin can only spend margin that
+        # exists, and the title needs clearance from whichever label lands highest.
+        # Full width now that this is the only donut on the tab.
+        height=460, margin=dict(l=40, r=40, t=90, b=30),
         showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
     )
@@ -350,7 +369,9 @@ def stacked_area(stacked, dim, value_col="revenue", title=None):
             mode="lines", stackgroup="one",
             line=dict(width=1.5, color=_SEPARATOR),
             fillcolor=colors[str(cat)],
-            hovertemplate=("%{x|%b %d, %Y}<br>" + str(cat) + ": " +
+            # Region + amount only. With one row per region in a unified hover,
+            # repeating the week date on every row buried the actual numbers.
+            hovertemplate=(str(cat) + ": " +
                            ("%{y:$,.0f}" if _is_money(value_col) else "%{y:,.0f}") +
                            "<extra></extra>"),
         ))
@@ -386,16 +407,20 @@ def movers_chart(movers, n=10):
             ordered["Description"].fillna("").astype(str),
             ordered["current"], ordered["prior"],
         ], axis=-1),
+        # Neither side names a week count: the comparison now follows the analysis
+        # window (see historical_metrics.yoy_movers), so it is whatever span the
+        # planner selected against the same weeks a year earlier.
         hovertemplate=("%{y} — %{customdata[0]}<br>"
-                       "Last 52 wks: %{customdata[1]:$,.0f}<br>"
-                       "Prior 52 wks: %{customdata[2]:$,.0f}<br>"
+                       "This window: %{customdata[1]:$,.0f}<br>"
+                       "Same weeks last year: %{customdata[2]:$,.0f}<br>"
                        "Change: %{x:$,.0f}<extra></extra>"),
     ))
     fig = _base_layout(fig, f"Biggest year-over-year movers (top {n} each way)",
                        None, y_title=None)
     fig.update_layout(showlegend=False, bargap=0.3,
                       height=max(360, 30 * len(ordered) + 130))
-    fig.update_xaxes(title="Revenue change vs prior 52 weeks", tickprefix="$",
+    fig.update_xaxes(title="Revenue change vs the same weeks last year",
+                     tickprefix="$",
                      zeroline=True, zerolinewidth=1, zerolinecolor=C_GRID)
     fig.update_yaxes(rangemode="normal", tickformat=None, automargin=True)
     return fig
@@ -474,22 +499,37 @@ def month_year_heatmap(matrix, value_col="revenue"):
     ))
     # Direct labels: the grid is small enough that every cell can carry its value,
     # which also covers the contrast-relief rule for the lighter ramp steps.
-    for col, year in enumerate(years):
-        for row, month in enumerate(_MONTHS):
+    #
+    # Positioned by INDEX, not by category name. On a `category` axis an annotation
+    # coordinate is a category index, and Plotly resolves it numeric-FIRST: a
+    # numeric-looking name like "2023" is read as the coordinate 2023 rather than as
+    # the label of column 0. Passing the year string here put every label at
+    # x = 2023..2026 in index units, stretched the autorange to 2026, and squashed
+    # the real columns into a sliver at the left. ("Jan" survived that bug only
+    # because it isn't numeric.) Indices are what the axis actually speaks.
+    for col in range(len(years)):
+        for row in range(len(_MONTHS)):
             v = values[row][col]
             if pd.isna(v):
                 continue
             fig.add_annotation(
-                x=year, y=month, text=_fmt_value(v, value_col), showarrow=False,
+                x=col, y=row, text=_fmt_value(v, value_col), showarrow=False,
                 font=dict(size=10, color=_cell_text_color(v, vmax)),
             )
     fig.update_layout(
         title=dict(text=f"{_value_word(value_col).capitalize()} by month and year",
                    font=dict(size=16)),
-        height=520, margin=dict(l=10, r=10, t=80, b=10),
+        # b=30 (not 10) leaves the year tick labels room along the bottom -- the same
+        # clipping share_donut's automargin fixed.
+        height=520, margin=dict(l=10, r=10, t=80, b=30),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         # A heatmap carries a colorbar, not a series legend.
         showlegend=False,
     )
+    # Years are CATEGORIES, not a number line. They are passed as strings, but Plotly
+    # autodetects a linear axis from numeric-looking strings and then interpolates
+    # half-steps — which is where "2022.5", "2023.5" came from. Forcing the axis type
+    # gives exactly one centred tick per year column.
+    fig.update_xaxes(type="category", automargin=True)
     fig.update_yaxes(autorange="reversed")
     return fig

@@ -99,14 +99,18 @@ def _filter_bar(base, lcw):
 
     window = c3.selectbox(
         "Analysis window", list(hm.WINDOW_OPTIONS), index=0, key="hist_window",
-        help="Scopes the Assortment tiles, the top-10 share, and the Mix / Movers "
-             "charts. The Revenue and Units tiles cover their own named windows, "
-             "and the trend charts keep their own date range.",
+        help="The period EVERY tile is measured over, and the period the Mix and "
+             "Movers charts cover. The Trend and Seasonal Heatmap tabs are about "
+             "multi-year shape, so they carry their own date range instead.",
     )
 
+    # Two windows have no span derivable from lcw alone, so they resolve here and
+    # travel to _metrics as an explicit bounds override.
     bounds = None
     if window == hm.WINDOW_CUSTOM:
         bounds = _custom_range(base, lcw)
+    elif window == hm.WINDOW_ALL:
+        bounds = hm.all_history_bounds(base, lcw)
     return picked_regions, picked_groups, window, bounds
 
 
@@ -150,43 +154,44 @@ def _apply_filters(base, regions, groups):
 
 
 def _metrics(frame, window, lcw, cache_key, bounds=None):
-    """Every window-scoped figure the tiles need, cached per filter+window combo.
+    """Every figure the tiles need, all measured over the SELECTED window.
 
     ``bounds`` overrides the named window's own span — that is how a custom range
     (already snapped to whole weeks) gets in.
+
+    Exactly three spans exist here: the window, the equal-length period before it
+    (momentum) and the same weeks a year earlier (season). There are deliberately
+    NO spans derived from ``lcw`` alone -- tiles used to read fixed YTD / 13-week /
+    52-week windows, which is why changing the selector left most of the grid
+    sitting still. Those periods are still reachable: they are window OPTIONS, and
+    Year to date is the default.
     """
     store = st.session_state.setdefault("hist_metrics", {})
     if cache_key in store:
         return store[cache_key]
 
     start, end = bounds if bounds is not None else hm.window_bounds(window, lcw)
-    ytd_start, ytd_end = hm.window_bounds(hm.WINDOW_YTD, lcw)
-    ytd_prior = hm.prior_year_window(ytd_start, ytd_end, anchor_to_year_start=True)
-    w4_start, w4_end = lcw - pd.Timedelta(weeks=3), lcw
-    w13_start, w13_end = hm.window_bounds(hm.WINDOW_13W, lcw)
-    w52_start, w52_end = hm.window_bounds(hm.WINDOW_52W, lcw)
+    prior_start, prior_end = hm.prior_period_window(start, end)
+    # The one place the window's KIND still matters: Year to date must compare
+    # against the prior year FROM JANUARY 1, not against the 364 days before this
+    # January 1. Every other window is a like-for-like 364-day shift.
+    ly_start, ly_end = hm.prior_year_window(
+        start, end, anchor_to_year_start=(window == hm.WINDOW_YTD))
 
     result = {
         "bounds": (start, end),
-        # Kept so the modal can re-derive the prior-year window with the same
-        # YTD anchoring rule the tile used.
+        # Carried so _render_window_dates can name the window and the breakdowns can
+        # reuse the tiles' own comparison rather than re-deriving it.
         "window_kind": window,
+        "prior_period_bounds": (prior_start, prior_end),
+        "prior_year_bounds": (ly_start, ly_end),
         "window": hm.window_totals(frame, start, end),
-        # No prior-year total for the SELECTED window: every tile compares against a
-        # fixed window of its own (see _TILES), so a "prior" here went unread. Its
-        # removal is also what keeps a custom or calendar-year window from needing a
-        # year-over-year alignment rule of its own.
-        "ytd": hm.window_totals(frame, ytd_start, ytd_end),
-        "ytd_prior": hm.window_totals(frame, *ytd_prior),
-        "w4": hm.window_totals(frame, w4_start, w4_end),
-        # The four weeks immediately before the last four -- a sequential
-        # comparison, NOT year-over-year, so a planner reads momentum not season.
-        "w4_prev": hm.window_totals(frame, w4_start - pd.Timedelta(weeks=4),
-                                    w4_start - pd.Timedelta(days=1)),
-        "w13": hm.window_totals(frame, w13_start, w13_end),
-        "w13_prev": hm.window_totals(frame, w13_start - pd.Timedelta(weeks=13),
-                                     w13_start - pd.Timedelta(days=1)),
-        "w52": hm.window_totals(frame, w52_start, w52_end),
+        "prior_period": hm.window_totals(frame, prior_start, prior_end),
+        # For "All history" both comparison spans fall entirely before the earliest
+        # week on record, so these come back at zero and pct_change returns None for
+        # a zero base -- the tiles then render with no delta at all, which is the
+        # honest reading of "there is nothing earlier to compare against".
+        "prior_year": hm.window_totals(frame, ly_start, ly_end),
         "breadth": hm.breadth(frame, start, end),
         "concentration": hm.concentration(frame, start, end, n=10),
         "coverage": hm.price_coverage(frame, start, end),
@@ -213,9 +218,23 @@ def _delta(pct):
 # One spec table drives BOTH the grid and the modals, so a tile can never open the
 # wrong breakdown and a new KPI cannot be added to one without the other.
 #
-# Three sections of exactly FOUR. The uniform width is the point: at 4/4/5 the last
+# Two sections of exactly FOUR. The uniform width is the point: at 4/4/5 the last
 # row's tiles were narrower than the ones above and nothing lined up vertically,
-# which is most of why twelve perfectly good numbers read as a scattered list.
+# which is most of why perfectly good numbers read as a scattered list.
+#
+# EVERY tile is measured over the selected analysis window. The grid used to hold
+# twelve, seven of which were pinned to fixed spans (YTD / 13 wks / 52 wks) read off
+# lcw -- so picking "Last 4 weeks" moved five tiles and left seven insisting on 52
+# weeks, which reads as a broken control. Those periods were not deleted, they were
+# demoted to what they always were: window options. Year to date is still the
+# default, so the default grid still opens on YTD figures.
+#
+# The two headline totals carry the SEASONAL comparison (same weeks last year),
+# because that is what a planner reads a total against. Revenue / Week carries the
+# MOMENTUM one (the equal-length period just before) and is also the figure that
+# makes windows of different lengths comparable at all -- the job the fixed tiles
+# used to do. No two tiles can collide on a value, which is the property the
+# fixed-window design was protecting, now held structurally instead.
 #
 # Fields:
 #   id     -- stable slug; keys the container, the button and the modal dispatch
@@ -226,71 +245,62 @@ def _delta(pct):
 #   help   -- tooltip AND the definition line inside the modal, so one sentence
 #             defines each KPI in exactly one place
 _SECTIONS = [
-    ("Revenue", ["ytd_revenue", "rev_13w", "rev_52w", "top10_share"]),
-    ("Units", ["ytd_units", "units_4w", "units_13w", "units_52w"]),
+    ("Sell-through", ["revenue", "units", "revenue_per_week", "top10_share"]),
     ("Assortment", ["active_skus", "active_customers", "new_skus", "dormant_skus"]),
 ]
 
+
+def _per_week(total, weeks):
+    """A per-week average, or None when the window holds no complete week.
+
+    None (not 0) so the tile renders "—": an empty window has no average, and a
+    confident "$0 / week" would be a different claim.
+    """
+    if not weeks or total is None or pd.isna(total):
+        return None
+    return total / weeks
+
+
 _TILES = {
-    "ytd_revenue": dict(
-        label="YTD Revenue", kind="money",
-        value=lambda m: m["ytd"]["revenue"],
-        delta=lambda m: hm.pct_change(m["ytd"]["revenue"], m["ytd_prior"]["revenue"]),
-        help="Units × Plytix list price for every completed week since Jan 1 — a "
-             "retail-value proxy, not invoiced revenue. Compared against the same "
-             "stretch of last year (Jan 1 to 364 days before the last complete "
-             "week, so whole weeks meet whole weeks).",
+    "revenue": dict(
+        label="Revenue", kind="money",
+        value=lambda m: m["window"]["revenue"],
+        delta=lambda m: hm.pct_change(m["window"]["revenue"],
+                                      m["prior_year"]["revenue"]),
+        help="Units × Plytix list price over the analysis window — a retail-value "
+             "proxy, not invoiced revenue. Compared against the same weeks a year "
+             "earlier (a 364-day shift, so whole weeks meet whole weeks; a "
+             "Year-to-date window anchors to the prior January 1 instead).",
     ),
-    # Fixed 13 weeks, NOT the selected analysis window. A window-scoped revenue
-    # tile duplicated YTD Revenue exactly whenever the window was Year to date --
-    # which is the default -- so the default view showed one number twice and both
-    # tiles opened the same modal. Fixed windows here mirror the Units row below and
-    # can never collide; the analysis window still scopes the Assortment tiles,
-    # the concentration share, and every Mix / Movers / Heatmap chart.
-    "rev_13w": dict(
-        label="Last 13 Wks Revenue", kind="money",
-        value=lambda m: m["w13"]["revenue"],
-        delta=lambda m: hm.pct_change(m["w13"]["revenue"],
-                                      m["w13_prev"]["revenue"]),
-        help="Revenue over the last 13 complete weeks — a quarter — against the "
-             "quarter before it.",
+    "units": dict(
+        label="Units", kind="units",
+        value=lambda m: m["window"]["units"],
+        delta=lambda m: hm.pct_change(m["window"]["units"],
+                                      m["prior_year"]["units"]),
+        help="Actual sell-through units over the analysis window (POS, falling back "
+             "to Orders for customers who report no POS), against the same weeks a "
+             "year earlier.",
     ),
-    "rev_52w": dict(
-        label="Trailing 52-Wk Revenue", kind="money",
-        value=lambda m: m["w52"]["revenue"], delta=lambda m: None,
-        help="The last 52 complete weeks — a full season, independent of where we "
-             "are in the calendar year.",
+    # Delta is per-week against per-week, not total against total. The two agree
+    # whenever both periods are dense, and when they aren't, an average tile whose
+    # delta came from totals would be comparing a different pair of numbers than the
+    # one it displays.
+    "revenue_per_week": dict(
+        label="Revenue / Week", kind="money",
+        value=lambda m: _per_week(m["window"]["revenue"], m["window"]["weeks"]),
+        delta=lambda m: hm.pct_change(
+            _per_week(m["window"]["revenue"], m["window"]["weeks"]),
+            _per_week(m["prior_period"]["revenue"], m["prior_period"]["weeks"])),
+        help="Average revenue per complete week in the window — the figure that "
+             "stays comparable when you change the window's length. Its delta is "
+             "MOMENTUM: this window against the equal-length period immediately "
+             "before it, not against last year.",
     ),
     "top10_share": dict(
         label="Top-10 Revenue Share", kind="percent",
         value=lambda m: m["concentration"], delta=lambda m: None,
         help="Share of window revenue earned by the ten biggest SKUs. Shows '—' "
              "when nothing in the window carries a list price.",
-    ),
-    "ytd_units": dict(
-        label="YTD Units", kind="units",
-        value=lambda m: m["ytd"]["units"],
-        delta=lambda m: hm.pct_change(m["ytd"]["units"], m["ytd_prior"]["units"]),
-        help="Actual sell-through units since Jan 1 (POS, falling back to Orders "
-             "for customers who report no POS), vs the same stretch last year.",
-    ),
-    "units_4w": dict(
-        label="Last 4 Wks Units", kind="units",
-        value=lambda m: m["w4"]["units"],
-        delta=lambda m: hm.pct_change(m["w4"]["units"], m["w4_prev"]["units"]),
-        help="The last 4 complete weeks against the 4 before them — momentum, not a "
-             "year-over-year comparison, so a seasonal peak reads as a rise.",
-    ),
-    "units_13w": dict(
-        label="Last 13 Wks Units", kind="units",
-        value=lambda m: m["w13"]["units"],
-        delta=lambda m: hm.pct_change(m["w13"]["units"], m["w13_prev"]["units"]),
-        help="A quarter of complete weeks, against the quarter before it.",
-    ),
-    "units_52w": dict(
-        label="Trailing 52 Wks Units", kind="units",
-        value=lambda m: m["w52"]["units"], delta=lambda m: None,
-        help="Units over the last 52 complete weeks.",
     ),
     "active_skus": dict(
         label="Active SKUs", kind="count",
@@ -302,17 +312,22 @@ _TILES = {
         value=lambda m: m["breadth"]["active_customers"], delta=lambda m: None,
         help="Customer groups with any sell-through inside the window.",
     ),
+    # One of only two figures on this screen that reach outside the window, and both
+    # do so because their DEFINITION requires it, not because a span was left
+    # hardcoded. Said plainly in the tooltip so it can't read as the old bug.
     "new_skus": dict(
         label="New SKUs", kind="count",
         value=lambda m: m["breadth"]["new_skus"], delta=lambda m: None,
         help="SKUs whose FIRST EVER week of sell-through in this snapshot falls "
-             "inside the window.",
+             "inside the window. \"First ever\" is measured across all history — "
+             "that is what makes a SKU new.",
     ),
     "dormant_skus": dict(
         label="Dormant SKUs", kind="count",
         value=lambda m: m["breadth"]["dormant_skus"], delta=lambda m: None,
         help="Sold in the 52 weeks before the window opened, but nothing inside it "
-             "— assortment drifting away.",
+             "— assortment drifting away. The 52-week lookback is fixed whatever "
+             "the window: over four weeks, \"dormant\" would mean nothing.",
     ),
 }
 
@@ -343,8 +358,65 @@ def _tile_value(tile_id, m, compact=True):
     return fmt_compact(v) if compact else f"{v:,.0f}"
 
 
-def _render_kpis(m, window, frame, lcw):
-    """Twelve clickable tiles in three labelled sections of four.
+def _span(start, end):
+    """A date range as one string, not repeating a year both ends share."""
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    if start.year == end.year:
+        return f"{start:%b %d} – {end:%b %d, %Y}"
+    return f"{start:%b %d, %Y} – {end:%b %d, %Y}"
+
+
+def _render_window_dates(m):
+    """The analysis window's ACTUAL dates, stated above the tiles.
+
+    A named window ("Last 13 weeks") never tells you which weeks it covers, so a
+    planner reading a number had no way to know what period it spanned. Sits above
+    the tiles rather than in the caption below them, because you need the period
+    before you read the figures, not after.
+
+    The two comparison spans are named on the same line, because the tiles' deltas
+    are percentages against them and a percentage whose base is unstated is not a
+    fact. They are omitted when the comparison period holds nothing (All history
+    reaches the floor of the snapshot, so there is no earlier stretch) -- exactly
+    the case where those tiles render without a delta.
+
+    Every span is read straight off ``m`` — the same pairs every tile, breakdown and
+    chart is computed from — so the dates displayed are by construction the dates
+    used, not a re-derivation that could drift out of step.
+    """
+    start, end = m["bounds"]
+    weeks = m["window"]["weeks"]
+
+    label = m["window_kind"]
+    note = ""
+    if label == hm.WINDOW_CUSTOM:
+        # The picker snaps to whole weeks, so what was typed and what was measured
+        # can differ by up to six days at each end — exactly when seeing the real
+        # dates matters most.
+        label = "Custom range"
+        note = " · snapped to whole weeks"
+
+    line = (f"**Analysis window — {label}:** {_span(start, end)} &nbsp;·&nbsp; "
+            f"{weeks} complete week{'' if weeks == 1 else 's'}{note}")
+    st.markdown(line, help="Every figure below is measured over exactly these "
+                           "weeks. Weeks start on Sunday, and the in-progress week "
+                           "is always excluded.")
+
+    comparisons = []
+    if m["prior_period"]["weeks"]:
+        # "the period before" rather than a week count: `weeks` above counts weeks
+        # that carry DATA, which a sparse window can make smaller than its span.
+        comparisons.append(
+            f"vs the period before ({_span(*m['prior_period_bounds'])})")
+    if m["prior_year"]["weeks"]:
+        comparisons.append(
+            f"vs the same weeks last year ({_span(*m['prior_year_bounds'])})")
+    if comparisons:
+        st.caption("Deltas: " + " &nbsp;·&nbsp; ".join(comparisons))
+
+
+def _render_kpis(m, window, frame):
+    """Eight clickable tiles in two labelled sections of four.
 
     Plain ``st.metric`` calls rather than tables._render_kpi_tiles -- those are for
     per-row detail cards driven by config.KPI_ORDER, and these are view-level
@@ -357,6 +429,8 @@ def _render_kpis(m, window, frame, lcw):
     changes the DOM under that selector, the tile degrades to a plainly visible
     working button rather than a dead card.
     """
+    _render_window_dates(m)
+
     for section, tile_ids in _SECTIONS:
         st.caption(f"**{section}**")
         with st.container(key=f"histkpi-row-{section.lower()}"):
@@ -377,7 +451,7 @@ def _render_kpis(m, window, frame, lcw):
                               delta=_delta(spec["delta"](m)))
                     if st.button("Breakdown", key=f"histkpi-go-{tile_id}",
                                  width="stretch"):
-                        _breakdown_dialog(tile_id, frame, m, lcw, window)
+                        _breakdown_dialog(tile_id, frame, m, window)
 
 
 # --------------------------------------------------------------------------- #
@@ -414,47 +488,37 @@ _COL_CONFIG = {
 }
 
 
-def _breakdown_frame(tile_id, frame, m, lcw):
+def _breakdown_frame(tile_id, frame, m):
     """(table, caption) for a tile's modal.
 
     Each entry answers the question the tile provokes -- "which ones?" for a count,
     "made up of what?" for a total.
+
+    Every table is built from ``m["bounds"]`` and ``m["prior_year_bounds"]``, so a
+    modal cannot describe a different period from the tile that opened it. This used
+    to re-derive fixed YTD / 13-week / 52-week spans from ``lcw``, which is why the
+    parameter is gone.
     """
     start, end = m["bounds"]
-    ytd_start, ytd_end = hm.window_bounds(hm.WINDOW_YTD, lcw)
-    ytd_prior = hm.prior_year_window(ytd_start, ytd_end, anchor_to_year_start=True)
-    w52 = hm.window_bounds(hm.WINDOW_52W, lcw)
 
-    if tile_id == "ytd_revenue":
-        return (hm.monthly_breakdown(frame, ytd_start, ytd_end, *ytd_prior),
-                "Month by month since Jan 1, against the same months last year.")
-    if tile_id == "rev_13w":
-        w13 = hm.window_bounds(hm.WINDOW_13W, lcw)
-        return (hm.monthly_breakdown(frame, *w13),
-                "Month by month across the trailing quarter. (The Units tile below "
-                "breaks the same quarter down week by week.)")
-    if tile_id == "rev_52w":
-        return (hm.monthly_breakdown(frame, *w52),
-                "Month by month across the last 52 complete weeks.")
+    if tile_id == "revenue":
+        return (hm.monthly_breakdown(frame, start, end, *m["prior_year_bounds"]),
+                "Month by month across the window, against the same months last "
+                "year. A part-month at either end is a part-month: the window is "
+                "whole WEEKS, which don't align to month boundaries.")
+    if tile_id == "units":
+        return (hm.monthly_breakdown(frame, start, end, *m["prior_year_bounds"]),
+                "Month by month across the window. Units are the left column; "
+                "revenue is shown alongside for context.")
+    if tile_id == "revenue_per_week":
+        return (hm.weekly_breakdown(frame, start, end),
+                "Every week in the window, most recent first — the weeks the "
+                "average is taken over, so an outlier week is visible rather than "
+                "buried in the mean.")
     if tile_id == "top10_share":
         return (hm.top_share_breakdown(frame, start, end, n=10),
                 "The ten biggest SKUs by revenue, with units and each SKU's share "
                 "of ALL window revenue (not just of this table).")
-    if tile_id == "ytd_units":
-        return (hm.monthly_breakdown(frame, ytd_start, ytd_end, *ytd_prior),
-                "Month by month since Jan 1. Units are the left column; revenue is "
-                "shown alongside for context.")
-    if tile_id == "units_4w":
-        return (hm.weekly_breakdown(frame, start=lcw - pd.Timedelta(weeks=7),
-                                    end=lcw),
-                "The last 4 complete weeks and the 4 before them, so the comparison "
-                "the tile makes is visible week by week.")
-    if tile_id == "units_13w":
-        return (hm.weekly_breakdown(frame, *hm.window_bounds(hm.WINDOW_13W, lcw)),
-                "Every week of the trailing quarter, most recent first.")
-    if tile_id == "units_52w":
-        return (hm.monthly_breakdown(frame, *w52),
-                "Month by month across the last 52 complete weeks.")
     if tile_id == "active_skus":
         return (hm.active_skus_breakdown(frame, start, end),
                 "Every SKU that sold inside the window, biggest revenue first.")
@@ -473,7 +537,7 @@ def _breakdown_frame(tile_id, frame, m, lcw):
 
 
 @st.dialog("KPI breakdown", width="large")
-def _breakdown_dialog(tile_id, frame, m, lcw, window):
+def _breakdown_dialog(tile_id, frame, m, window):
     """The list behind one tile: heading, exact figure, definition, table, CSV."""
     spec = _TILES[tile_id]
     st.subheader(_tile_label(tile_id, window))
@@ -487,7 +551,7 @@ def _breakdown_dialog(tile_id, frame, m, lcw, window):
                 unsafe_allow_html=True)
     st.caption(spec["help"])
 
-    table, note = _breakdown_frame(tile_id, frame, m, lcw)
+    table, note = _breakdown_frame(tile_id, frame, m)
     if table is None or table.empty:
         st.info("Nothing to break down for this selection.")
         return
@@ -526,24 +590,18 @@ def _render_caption(m, frame, lcw, base_rows, filtered_rows):
         "so these totals run higher than the projection views, which correctly "
         "drop them."
     )
-    # The Revenue and Units tiles all cover FIXED windows (YTD / 13 / 52 weeks), so
-    # say plainly what the Analysis window selector does move -- otherwise changing
-    # it and seeing the top two rows sit still reads as a broken control.
+    # The window's DATES and its two comparison spans are stated above the tiles by
+    # _render_window_dates -- once, where they're needed before reading the numbers.
+    # What's left to say here is the window's own totals and the two figures that
+    # reach outside it by definition, so neither reads as a span left hardcoded.
     win = m["window"]
-    start, end = m["bounds"]
-    # A custom range is named by the WEEKS IT ACTUALLY COVERS, not by what was typed:
-    # the picker snaps to whole weeks, so the two can differ by up to six days at each
-    # end and a planner must be able to see what was really measured.
-    if m["window_kind"] == hm.WINDOW_CUSTOM:
-        span = (f"**Custom range**, snapped to whole weeks: "
-                f"**{pd.Timestamp(start):%b %d %Y} – {pd.Timestamp(end):%b %d %Y}**")
-    else:
-        span = f"The **{m['window_kind']}** analysis window"
     bits.append(
-        f"{span} ({win['weeks']} complete weeks, {win['units']:,.0f} units / "
-        f"{fmt_dollar(win['revenue'])}) scopes the **Assortment** tiles, the "
-        f"top-10 share, and the Mix / Movers / Heatmap charts. The Revenue and "
-        f"Units tiles above cover their own named windows."
+        f"That window ({win['units']:,.0f} units / {fmt_dollar(win['revenue'])}) "
+        f"is the period for **every tile** and for the Mix and Movers charts; the "
+        f"Trend and Seasonal Heatmap tabs have their own date range. Two "
+        f"definitions reach past it on purpose: **New SKUs** tests a first-ever "
+        f"sale across all history, and **Dormant SKUs** looks back a fixed 52 weeks "
+        f"before the window opened."
     )
     if filtered_rows != base_rows:
         bits.append(f"Filtered to **{filtered_rows:,}** of {base_rows:,} SKU-weeks.")
@@ -564,8 +622,11 @@ def _tab_trend(frame, value_col):
     st.plotly_chart(hc.weekly_trend_chart(hm.weekly_totals(scoped, value_col),
                                           value_col), width="stretch")
     monthly = hm.monthly_totals(scoped, value_col)
-    latest_year = int(pd.Timestamp(frame["WeekDate"].max()).year) \
-        if not frame.empty else None
+    # From `scoped`, not `frame`: the year pair the chart plots has to come from the
+    # data the chart plots, or trimming the range to 2023 would still label the
+    # current-vs-prior pair 2026 and draw two empty series.
+    latest_year = int(pd.Timestamp(scoped["WeekDate"].max()).year) \
+        if not scoped.empty else None
     st.plotly_chart(hc.monthly_yoy_chart(monthly, value_col, latest_year),
                     width="stretch")
     st.plotly_chart(hc.seasonality_chart(hm.seasonality_frame(scoped, value_col),
@@ -573,16 +634,13 @@ def _tab_trend(frame, value_col):
 
 
 def _tab_mix(frame, value_col, start, end):
-    left, right = st.columns(2)
-    with left:
-        st.plotly_chart(
-            hc.share_donut(hm.by_dimension(frame, "Region", start, end, value_col),
-                           "Region", value_col), width="stretch")
-    with right:
-        st.plotly_chart(
-            hc.share_donut(
-                hm.by_dimension(frame, "SKU Type", start, end, value_col, top_n=8),
-                "SKU Type", value_col), width="stretch")
+    # Three charts. There was a fourth -- a revenue-share-by-SKU-type donut -- which
+    # planners didn't want; the `SKU Type` column stays on the frame (see
+    # historical_metrics.attach_sku_type) so that analysis can come back cheaply, but
+    # nothing reads it today.
+    st.plotly_chart(
+        hc.share_donut(hm.by_dimension(frame, "Region", start, end, value_col),
+                       "Region", value_col), width="stretch")
     st.plotly_chart(
         hc.ranked_bars(
             hm.by_dimension(frame, "Customer Grouping", start, end, value_col,
@@ -590,12 +648,16 @@ def _tab_mix(frame, value_col, start, end):
             "Customer Grouping", value_col,
             title=f"Top customer groups by {_measure_word(value_col)}"),
         width="stretch")
+    # Clipped like the two charts above it. Handing this the whole frame put one tab's
+    # three charts on two different periods -- the donut and the bars on the window,
+    # the area on all history.
     st.plotly_chart(
-        hc.stacked_area(hm.weekly_by_dimension(frame, "Region", value_col),
+        hc.stacked_area(hm.weekly_by_dimension(hm.clip(frame, start, end),
+                                               "Region", value_col),
                         "Region", value_col), width="stretch")
 
 
-def _tab_movers(frame, value_col, start, end, lcw):
+def _tab_movers(frame, value_col, start, end, prior_year):
     # top_skus always returns BOTH measures; pick the one being displayed rather
     # than renaming a column (renaming revenue -> demand would plot dollars under
     # a units label).
@@ -622,14 +684,29 @@ def _tab_movers(frame, value_col, start, end, lcw):
     # let a high-volume, low-value SKU outrank the business's actual earners.
     st.caption("Movers and concentration are measured in revenue regardless of "
                "the measure toggle — ranking them by units would let cheap, "
-               "high-volume SKUs outrank the real earners.")
-    st.plotly_chart(hc.movers_chart(hm.yoy_movers(frame, lcw, n=10)),
-                    width="stretch")
+               "high-volume SKUs outrank the real earners. Movers compare the "
+               "analysis window against the same weeks a year earlier.")
+    # `prior_year` is the tiles' own comparison window, passed rather than re-derived
+    # so the chart and the Revenue tile's delta can never disagree about which weeks
+    # "last year" means (they differ for Year to date, which anchors to January 1).
+    st.plotly_chart(
+        hc.movers_chart(hm.yoy_movers(frame, start, end, prior=prior_year, n=10)),
+        width="stretch")
     st.plotly_chart(hc.pareto_chart(hm.pareto(frame, start, end)), width="stretch")
 
 
 def _tab_heatmap(frame, value_col):
-    st.plotly_chart(hc.month_year_heatmap(hm.month_year_matrix(frame, value_col),
+    # Its own date range, like the trend tab and for the same reason: a month x year
+    # grid is a multi-year instrument, and following a 4-week analysis window would
+    # reduce it to a single part-filled column. Defaults to All -- the seasonal
+    # question is "which months, across every year we have".
+    st.caption(
+        "Every year in the snapshot by default, independent of the analysis window "
+        "— this grid needs several seasons side by side to say anything."
+    )
+    rng = hc.history_range_control(frame, key="hist_heatmap", default="All")
+    scoped = hm.clip(frame, *rng) if rng else frame
+    st.plotly_chart(hc.month_year_heatmap(hm.month_year_matrix(scoped, value_col),
                                           value_col), width="stretch")
 
 
@@ -646,6 +723,12 @@ def _render_body(base, lcw):
     """
     regions, groups, window, bounds = _filter_bar(base, lcw)
     frame = _apply_filters(base, regions, groups)
+    # Drop the snapshot's forward projection weeks ONCE, here, so nothing downstream
+    # can see them: not a chart, and not either range control's data maximum (which
+    # is read off the frame and was reaching ~15 weeks past the last complete week).
+    # all_history_bounds already clips for exactly this reason; this generalises it.
+    # _filter_bar keeps reading `base`, so the custom-range picker is unaffected.
+    frame = frame[frame["WeekDate"] <= pd.Timestamp(lcw)]
 
     if frame.empty:
         st.info("No sell-through history matches these filters. Clear one to "
@@ -665,12 +748,15 @@ def _render_body(base, lcw):
         return
 
     # The snapped dates are part of the cache key, or two different custom ranges
-    # would collide on the same entry.
-    cache_key = (tuple(regions), tuple(groups), window, bounds, len(frame))
+    # would collide on the same entry. The snapshot signature is in it too: without
+    # one, a refreshed workbook that happens to yield the same row count for the same
+    # filters would be served last load's numbers.
+    cache_key = (st.session_state.get("hist_base_sig"),
+                 tuple(regions), tuple(groups), window, bounds, len(frame))
     m = _metrics(frame, window, lcw, cache_key, bounds=bounds)
     start, end = m["bounds"]
 
-    _render_kpis(m, window, frame, lcw)
+    _render_kpis(m, window, frame)
     _render_caption(m, frame, lcw, len(base), len(frame))
 
     # Revenue is the primary lens for this view; units stay available in every
@@ -688,7 +774,7 @@ def _render_body(base, lcw):
     with t2:
         _tab_mix(frame, value_col, start, end)
     with t3:
-        _tab_movers(frame, value_col, start, end, lcw)
+        _tab_movers(frame, value_col, start, end, m["prior_year_bounds"])
     with t4:
         _tab_heatmap(frame, value_col)
 

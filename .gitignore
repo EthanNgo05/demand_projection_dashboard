@@ -2,7 +2,14 @@
 /raw_inputs
 /outputs
 /logs
-/sql
+
+# sql/ IS tracked. These batches pin the extract's history range and carry its
+# read-only contract (every write targets a #temp table -- enforced by
+# tests/test_sql_read_only.py), so a change to them must produce a reviewable
+# diff. Only the editor scratch dir and the archived pre-rewrite copies are
+# ignored; sql/original/ is referenced nowhere in code and must never be run.
+/sql/.vs/
+/sql/original/
 
 # Docs & exploratory notebooks
 /docs

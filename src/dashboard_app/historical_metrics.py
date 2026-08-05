@@ -80,6 +80,11 @@ WINDOW_3Y = "Last 3 years"
 # A fixed CALENDAR window, not a trailing one -- "how did last year finish", which a
 # trailing 52 weeks cannot answer once the new year is under way.
 WINDOW_LAST_YEAR = "Last full calendar year"
+# Everything on record: the frame's earliest week through the last complete week.
+# Self-adjusting, so it stays correct however far back the snapshot reaches -- which
+# matters because the extract's history anchor is a date someone can move.
+WINDOW_ALL = "All history"
+
 # UI sentinel only. Its bounds come from the date picker via ``snap_window``, so
 # ``window_bounds`` deliberately RAISES on it rather than guessing.
 WINDOW_CUSTOM = "Custom range…"
@@ -87,12 +92,15 @@ WINDOW_CUSTOM = "Custom range…"
 # Everything the selector offers, in display order.
 WINDOW_OPTIONS = (
     WINDOW_YTD, WINDOW_4W, WINDOW_13W, WINDOW_26W, WINDOW_52W,
-    WINDOW_2Y, WINDOW_3Y, WINDOW_LAST_YEAR, WINDOW_CUSTOM,
+    WINDOW_2Y, WINDOW_3Y, WINDOW_LAST_YEAR, WINDOW_ALL, WINDOW_CUSTOM,
 )
-# The subset ``window_bounds`` can resolve on its own -- i.e. everything except the
-# custom sentinel, whose bounds come from the date picker. Exported so callers that
-# iterate windows (notably the tests) can't accidentally include the one that raises.
-NAMED_WINDOWS = tuple(w for w in WINDOW_OPTIONS if w != WINDOW_CUSTOM)
+# The subset ``window_bounds`` can resolve from ``lcw`` ALONE. The two it excludes
+# both depend on something else: WINDOW_CUSTOM on the date picker, WINDOW_ALL on how
+# far back the data itself goes. Exported so callers that iterate windows (notably
+# the tests) can't accidentally include one that raises.
+DATA_DEPENDENT_WINDOWS = (WINDOW_ALL, WINDOW_CUSTOM)
+NAMED_WINDOWS = tuple(w for w in WINDOW_OPTIONS
+                      if w not in DATA_DEPENDENT_WINDOWS)
 
 # Whole weeks spanned by each rolling window, inclusive of lcw itself.
 _ROLLING_WEEKS = {
@@ -315,15 +323,39 @@ def window_bounds(kind, lcw):
         year = lcw.year - 1
         return (pd.Timestamp(year=year, month=1, day=1),
                 pd.Timestamp(year=year, month=12, day=31))
-    if kind == WINDOW_CUSTOM:
+    if kind in DATA_DEPENDENT_WINDOWS:
+        # Neither span is derivable from lcw: WINDOW_CUSTOM comes from the date
+        # picker (snap_window) and WINDOW_ALL from the frame (all_history_bounds).
+        # Raising beats returning a plausible-but-wrong window silently.
+        resolver = ("snap_window()" if kind == WINDOW_CUSTOM
+                    else "all_history_bounds()")
         raise ValueError(
-            f"{WINDOW_CUSTOM!r} is a UI sentinel with no fixed bounds — resolve it "
-            f"through snap_window() and pass the result explicitly."
+            f"{kind!r} has no bounds derivable from lcw alone — resolve it through "
+            f"{resolver} and pass the result explicitly."
         )
     weeks = _ROLLING_WEEKS.get(kind)
     if weeks is None:
         raise ValueError(f"Unknown analysis window: {kind!r}")
     return lcw - pd.Timedelta(weeks=weeks - 1), lcw
+
+
+def all_history_bounds(frame, lcw):
+    """(earliest week on record, ``lcw``) — the full span of the snapshot.
+
+    Reads the floor off the DATA rather than assuming a lookback, so it follows the
+    extract's history anchor wherever that is set. Returns None for an empty frame,
+    matching ``snap_window``'s "nothing to measure" contract.
+    """
+    if frame is None or frame.empty or "WeekDate" not in frame.columns:
+        return None
+    weeks = pd.to_datetime(frame["WeekDate"])
+    # Clip to lcw so a snapshot's forward projection weeks never leak into a
+    # historical window (the frame carries 15 weeks of them).
+    earliest = weeks.min()
+    lcw = pd.Timestamp(lcw)
+    if pd.isna(earliest) or earliest > lcw:
+        return None
+    return pd.Timestamp(earliest), lcw
 
 
 def snap_window(start, end, lcw):
@@ -373,6 +405,38 @@ def prior_year_window(start, end, anchor_to_year_start=False):
     else:
         prior_start = start - pd.Timedelta(days=364)
     return prior_start, prior_end
+
+
+def _anchor_weeks(start, end):
+    """How many Sunday WeekDates fall inside ``[start, end]``.
+
+    The number of weeks a window actually TOTALS, which is not the same as its
+    endpoints' day span: a rolling window runs Sunday-to-Sunday, so its endpoints sit
+    ``(weeks - 1) * 7`` days apart while it covers ``weeks`` of them. A calendar
+    window ("Last full calendar year") has edges that fall mid-week, where the two
+    readings differ again. Uses the same snapping arithmetic as ``snap_window``.
+    """
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    first = start + pd.Timedelta(days=(6 - start.weekday()) % 7)
+    last = end - pd.Timedelta(days=(end.weekday() + 1) % 7)
+    return 0 if first > last else int((last - first).days // 7) + 1
+
+
+def prior_period_window(start, end):
+    """The equal-length stretch of whole weeks immediately BEFORE ``[start, end]``.
+
+    The sequential comparison -- momentum -- as opposed to ``prior_year_window``'s
+    seasonal one. It abuts the window with no gap and no overlap: the prior period
+    ends on the Saturday before ``start`` and reaches back as many WEEKS as the
+    window itself contains, so like-for-like week counts meet. Shifting by the raw
+    day span instead would hand a calendar-year window a 53-week comparable for its
+    52 weeks.
+    """
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    # max(1) so a window too narrow to hold a week still yields a real span rather
+    # than an empty one that would read as "no prior data".
+    weeks = max(_anchor_weeks(start, end), 1)
+    return start - pd.Timedelta(weeks=weeks), start - pd.Timedelta(days=1)
 
 
 def clip(frame, start, end):
@@ -816,13 +880,18 @@ def top_skus(frame, start, end, n=15):
     return grouped.nlargest(n, "revenue")[cols].reset_index(drop=True)
 
 
-def yoy_movers(frame, lcw, n=10):
-    """Biggest year-over-year revenue gainers and decliners over 52 weeks.
+def yoy_movers(frame, start, end, prior=None, n=10):
+    """Biggest year-over-year revenue gainers and decliners across a window.
 
-    Compares the trailing 52 weeks with the 52 before them (both ending on the
-    364-day boundary, so whole weeks meet whole weeks). SKUs absent from one side
-    count as 0 there -- a launch or a discontinuation IS the movement, and dropping
-    them would hide the largest swings.
+    Compares ``[start, end]`` with the same weeks a year earlier. ``prior`` accepts
+    an explicit ``(start, end)`` so a caller can hand over the SAME comparison its
+    KPI tiles used -- notably the year-start anchoring a Year-to-date window needs
+    -- rather than this function deriving a second, subtly different one. Left None
+    it falls back to ``prior_year_window`` (a 364-day shift, so whole weeks meet
+    whole weeks).
+
+    SKUs absent from one side count as 0 there -- a launch or a discontinuation IS
+    the movement, and dropping them would hide the largest swings.
 
     Returns one frame of the top ``n`` gainers and top ``n`` decliners, sorted by
     delta descending.
@@ -830,8 +899,9 @@ def yoy_movers(frame, lcw, n=10):
     cols = ["SKU", "Description", "current", "prior", "delta"]
     if frame is None or frame.empty or "revenue" not in frame.columns:
         return pd.DataFrame(columns=cols)
-    cur_start, cur_end = window_bounds(WINDOW_52W, lcw)
-    pri_start, pri_end = prior_year_window(cur_start, cur_end)
+    cur_start, cur_end = pd.Timestamp(start), pd.Timestamp(end)
+    pri_start, pri_end = (prior if prior is not None
+                          else prior_year_window(cur_start, cur_end))
 
     def _by_sku(a, b):
         win = clip(frame, a, b)

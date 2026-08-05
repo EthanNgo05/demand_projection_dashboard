@@ -145,6 +145,101 @@ INCREMENTAL_MARKER = "-- INCREMENTAL_START_OVERRIDE"
 _TRUTHY = {"yes", "true", "1", "on"}
 
 
+# --------------------------------------------------------------------------- #
+# Read-only guard                                                             #
+# --------------------------------------------------------------------------- #
+# This pipeline must NEVER write to the data warehouse. It only ever reads, and
+# stages its intermediate results in #-prefixed LOCAL TEMP TABLES, which live in
+# tempdb for the life of the connection and are dropped when it closes.
+#
+# That property is easy to state and easy to lose: the batch this ships with is
+# a rewrite of an original that ended with `UPDATE pbi.als_demand_tab` (a
+# permanent table), and sql/ is not even tracked by git, so a future edit could
+# reintroduce a write with no diff to review. Auditing the file once is not
+# enough -- so the audit runs on every read, before any connection is opened.
+#
+# Deliberately strict about WHERE it runs: read_sql_file is the single choke point
+# every code path funnels through (full pull, --incremental, a custom --sql), and
+# it runs before connect(), so a rejected batch never reaches the server at all.
+
+# Statements that modify data or schema, with the group that holds their target.
+# `SELECT ... INTO x` is included because that CREATES x.
+_WRITE_STATEMENTS = [
+    re.compile(r"\binsert\s+(?:into\s+)?(?P<target>[^\s(;]+)", re.I),
+    re.compile(r"\bupdate\s+(?P<target>[^\s(;]+)", re.I),
+    re.compile(r"\bdelete\s+(?:from\s+)?(?P<target>[^\s(;]+)", re.I),
+    re.compile(r"\bmerge\s+(?:into\s+)?(?P<target>[^\s(;]+)", re.I),
+    re.compile(r"\btruncate\s+table\s+(?P<target>[^\s(;]+)", re.I),
+    re.compile(r"\b(?:drop|alter|create)\s+(?:table|view|index|procedure|function)"
+               r"(?:\s+if\s+exists)?\s+(?P<target>[^\s(;]+)", re.I),
+    re.compile(r"\binto\s+(?P<target>[^\s(;]+)", re.I),
+]
+
+# Anything that also needs stripping before the scan, or a comment mentioning
+# "UPDATE pbi.foo" would trip the guard. Order matters: block comments first.
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+_LINE_COMMENT = re.compile(r"--[^\n]*")
+_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+
+def _strip_sql_noise(sql: str) -> str:
+    """Blank out comments and string literals so only real code is scanned."""
+    sql = _BLOCK_COMMENT.sub(" ", sql)
+    sql = _LINE_COMMENT.sub(" ", sql)
+    return _STRING_LITERAL.sub("''", sql)
+
+
+def _temp_aliases(sql: str) -> set:
+    """Aliases bound to a #temp table by a FROM/JOIN/UPDATE clause.
+
+    T-SQL's `UPDATE gp ... FROM #gp_pos gp` names the ALIAS as the update target,
+    so a guard that only looked at the token after UPDATE would wrongly reject the
+    batch this pipeline actually ships. Resolving aliases is what makes the guard
+    both safe and usable.
+    """
+    pattern = re.compile(r"\b(?:from|join|update)\s+(#\w+)\s+(?:as\s+)?(\w+)", re.I)
+    aliases = set()
+    for temp, alias in pattern.findall(sql):
+        if alias.lower() not in {"set", "on", "where", "select", "inner", "left",
+                                 "right", "outer", "join", "group", "order"}:
+            aliases.add(alias.lower())
+    return aliases
+
+
+def assert_sql_is_read_only(sql: str, path: str = "<sql>") -> None:
+    """Raise unless every write in ``sql`` targets a #temp table.
+
+    Permanent-object writes (``pbi.*``, ``als.*``, anything without a leading #)
+    are refused. Raises ``PermissionError`` -- this is a safety refusal, not a
+    malformed-input problem.
+    """
+    code = _strip_sql_noise(sql)
+    aliases = _temp_aliases(code)
+    offenders = []
+    for pattern in _WRITE_STATEMENTS:
+        for match in pattern.finditer(code):
+            target = match.group("target").strip().strip("[]\"'`;,()")
+            if not target:
+                continue
+            # Local (#x) and global (##x) temp tables, and table VARIABLES (@x),
+            # are all session-scoped and safe.
+            if target.startswith(("#", "@")):
+                continue
+            if target.lower() in aliases:
+                continue
+            statement = match.group(0).split()[0].upper()
+            offenders.append(f"{statement} -> {target}")
+
+    if offenders:
+        unique = sorted(set(offenders))
+        raise PermissionError(
+            f"{path} would WRITE to non-temporary objects, which this pipeline "
+            f"must never do: {', '.join(unique)}. This extract is read-only: it "
+            f"may only SELECT from the warehouse and stage into #temp tables. "
+            f"Refusing to connect."
+        )
+
+
 def read_sql_file(path: str = DEFAULT_SQL) -> str:
     """Read a .sql file, decoding by BOM rather than guessing.
 
@@ -153,21 +248,29 @@ def read_sql_file(path: str = DEFAULT_SQL) -> str:
     to strict UTF-8 when there is none. We deliberately do NOT fall back to a
     never-fails codec like latin-1: silently mis-decoding a T-SQL batch would
     ship corrupted SQL to the server, which is far worse than a clear error.
+
+    The decoded batch is then checked by ``assert_sql_is_read_only`` -- every code
+    path reads its SQL through here, and this happens before any connection is
+    opened, so a batch that would write to the warehouse never reaches the server.
     """
     with open(path, "rb") as f:
         raw = f.read()
 
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw.decode("utf-8-sig")
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"{path} is not valid UTF-8/UTF-16 and has no byte-order mark. "
-            "Re-save it as UTF-8 or UTF-16 from your editor."
-        ) from exc
+        sql = raw.decode("utf-16")
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        sql = raw.decode("utf-8-sig")
+    else:
+        try:
+            sql = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"{path} is not valid UTF-8/UTF-16 and has no byte-order mark. "
+                "Re-save it as UTF-8 or UTF-16 from your editor."
+            ) from exc
+
+    assert_sql_is_read_only(sql, path)
+    return sql
 
 
 def _require_env(name: str) -> str:

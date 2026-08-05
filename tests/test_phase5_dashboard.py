@@ -15,6 +15,7 @@ These run the full dashboard against the real raw_inputs workbook, so the
 initial forecast compute can take a few seconds — hence the generous timeout.
 """
 
+import inspect
 import os
 import sys
 
@@ -219,8 +220,13 @@ def test_historical_summary_view_renders():
             "Seasonal Heatmap"} <= tab_labels
 
     metric_labels = {m.label for m in at.metric}
-    assert {"YTD Revenue", "YTD Units", "Active SKUs",
+    assert {"Revenue", "Units", "Revenue / Week", "Active SKUs",
             "Top-10 Revenue Share"} <= metric_labels
+    # No tile may name a period of its own: every one is measured over the analysis
+    # window, whose dates are stated once above the grid. Labels like "YTD Revenue"
+    # or "Trailing 52-Wk Revenue" are exactly what made the selector look broken.
+    assert not [lbl for lbl in metric_labels
+                if "YTD" in lbl or "52" in lbl or "13" in lbl], metric_labels
 
     # The filter bar and the window selector both render. There is deliberately no
     # SKU-type filter — planners never slice by it — but the SKU Type COLUMN must
@@ -233,12 +239,14 @@ def test_historical_summary_view_renders():
 
 
 @needs_data
-def test_historical_summary_tile_grid_is_three_by_four():
-    """Twelve tiles in three sections of four, each with a click target.
+def test_historical_summary_tile_grid_is_two_by_four():
+    """Eight tiles in two sections of four, each with a click target.
 
     The uniform grid is the fix for the tiles reading as a scattered list, so its
-    shape is pinned: a stray 13th tile or a missing button would reintroduce the
-    ragged row this replaced.
+    shape is pinned: a stray 9th tile or a missing button would reintroduce the
+    ragged row this replaced. It was three rows of four while seven tiles carried
+    fixed spans of their own; those spans are window OPTIONS now, so the tiles that
+    existed only to hold them are gone.
     """
     import dashboard
     from dashboard_app import historical_summary as hs
@@ -248,9 +256,9 @@ def test_historical_summary_tile_grid_is_three_by_four():
     at.run()
     assert not at.exception
 
-    assert [len(ids) for _, ids in hs._SECTIONS] == [4, 4, 4]
+    assert [len(ids) for _, ids in hs._SECTIONS] == [4, 4]
     tile_ids = [t for _, ids in hs._SECTIONS for t in ids]
-    assert len(tile_ids) == len(set(tile_ids)) == 12
+    assert len(tile_ids) == len(set(tile_ids)) == 8
     # Every tile in the grid must have a spec, and every spec must be on the grid —
     # otherwise a tile opens the wrong breakdown or a KPI silently disappears.
     assert set(tile_ids) == set(hs._TILES)
@@ -270,12 +278,13 @@ def test_historical_summary_tile_grid_is_three_by_four():
 
 
 @needs_data
-@pytest.mark.parametrize("tile_id", ["dormant_skus", "top10_share", "ytd_revenue",
-                                     "active_customers", "units_4w"])
+@pytest.mark.parametrize("tile_id", ["dormant_skus", "top10_share", "revenue",
+                                     "active_customers", "revenue_per_week"])
 def test_clicking_a_tile_opens_its_breakdown(tile_id):
     """Clicking a tile must open a modal with a table, not raise.
 
-    dormant_skus and top10_share are the two the request named explicitly.
+    dormant_skus and top10_share are the two the request named explicitly;
+    revenue_per_week is the one whose modal is a week-by-week table.
     """
     import dashboard
 
@@ -292,8 +301,151 @@ def test_clicking_a_tile_opens_its_breakdown(tile_id):
 
 
 @needs_data
+def test_historical_summary_shows_the_windows_actual_dates():
+    """The window's real dates must appear above the tiles, and match m['bounds'].
+
+    A named window ("Last 13 weeks") never says WHICH weeks, so this line is the
+    only place a planner can see the period a number covers.
+    """
+    import pandas as pd
+    import dashboard
+    from dashboard_app import historical_metrics as hm
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.run()
+    assert not at.exception
+
+    P = dashboard.load_pipeline(dashboard.pipeline_path())
+    _, lcw, _ = P.week_anchors(pd.Timestamp(at.session_state["hist_base_sig"][0]))
+    start, end = hm.window_bounds(at.session_state["hist_window"], lcw)
+
+    body = " ".join(m.value for m in at.markdown)
+    assert "Analysis window" in body, "the window's dates are not shown"
+    # Both endpoints, formatted as the view formats them.
+    assert f"{end:%b %d, %Y}" in body, f"end date {end:%b %d, %Y} missing"
+    assert f"{start:%b %d}" in body, f"start date {start:%b %d} missing"
+
+    # The tiles' deltas are percentages, and a percentage whose base is unstated is
+    # not a fact -- so both comparison periods are named with their real dates too.
+    captions = " ".join(c.value for c in at.caption)
+    ly_start, ly_end = hm.prior_year_window(
+        start, end,
+        anchor_to_year_start=(at.session_state["hist_window"] == hm.WINDOW_YTD))
+    prior_start, prior_end = hm.prior_period_window(start, end)
+    assert "vs the period before" in captions
+    assert f"{prior_start:%b %d, %Y}" in captions or \
+           f"{prior_start:%b %d}" in captions, "prior period's dates missing"
+    assert "vs the same weeks last year" in captions
+    assert f"{ly_end:%b %d, %Y}" in captions, "prior year's dates missing"
+
+
+@needs_data
+def test_changing_the_analysis_window_changes_every_tile():
+    """The reported complaint, end to end on live data.
+
+    Seven of the twelve original tiles were pinned to fixed spans, so selecting
+    "Last 4 weeks" left most of the grid showing trailing-52-week figures. Every
+    tile now has to move -- except the two assortment COUNTS that can legitimately
+    coincide (a customer list rarely changes between windows), which are checked
+    only for not raising.
+    """
+    import dashboard
+    from dashboard_app import historical_metrics as hm
+
+    def _values(window):
+        at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+        at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+        at.session_state["hist_window"] = window
+        at.run()
+        assert not at.exception, f"{window} raised"
+        return {m.label: m.value for m in at.metric}
+
+    short = _values(hm.WINDOW_4W)
+    long = _values(hm.WINDOW_52W)
+    for label in ("Revenue", "Units", "Revenue / Week"):
+        assert short[label] != long[label], (
+            f"{label!r} reads {short[label]} over 4 weeks and over 52 — it is not "
+            f"measured over the analysis window"
+        )
+
+
+@needs_data
+def test_all_history_window_reports_the_true_earliest_week():
+    """'All history' must follow the data, not a fixed lookback."""
+    import pandas as pd
+    import dashboard
+    from dashboard_app import historical_metrics as hm
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.session_state["hist_window"] = hm.WINDOW_ALL
+    at.run()
+    assert not at.exception
+
+    base = at.session_state["hist_base"]
+    P = dashboard.load_pipeline(dashboard.pipeline_path())
+    _, lcw, _ = P.week_anchors(pd.Timestamp(at.session_state["hist_base_sig"][0]))
+    earliest = hm.all_history_bounds(base, lcw)[0]
+
+    body = " ".join(m.value for m in at.markdown)
+    assert f"{earliest:%b %d, %Y}" in body, (
+        f"expected the snapshot's true floor {earliest:%b %d, %Y} in the window line"
+    )
+
+
+@needs_data
+def test_mix_tab_no_longer_charts_sku_type():
+    """The SKU-type donut is gone; the SKU Type column is deliberately retained."""
+    import dashboard
+    from dashboard_app import historical_summary as hs
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.run()
+    assert not at.exception
+
+    # Strip comments and the docstring: both legitimately DISCUSS SKU Type (they
+    # record that the column is retained on purpose), so only executable lines can
+    # be checked for a chart of it.
+    body = inspect.getsource(hs._tab_mix).split('"""')[-1]
+    code = "\n".join(line.split("#")[0] for line in body.splitlines())
+    assert "SKU Type" not in code, "_tab_mix still charts SKU Type"
+    assert code.count("share_donut") == 1, "expected exactly one donut (Region)"
+
+    # The column stays available for future use even though nothing plots it.
+    assert "SKU Type" in at.session_state["hist_base"].columns
+
+
+@needs_data
+def test_seasonal_heatmap_has_its_own_date_range():
+    """A month x year grid needs several seasons, so it cannot follow a 4-week window.
+
+    It used to silently ignore the analysis window instead, which reads as a broken
+    control. An explicit range control -- the pattern the trend tab already uses --
+    says so on screen, and defaults to All.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    at.session_state["scope"] = dashboard.HISTORICAL_VIEW
+    at.run()
+    assert not at.exception
+
+    # Its own widget key, distinct from the trend tab's, and its own default: All,
+    # because the seasonal question is "which months, across every year we have".
+    assert at.session_state["hist_heatmap_preset"] == "All"
+    assert at.session_state["hist_trend_preset"] == "2 Years"
+
+    # And it renders when narrowed.
+    at.session_state["hist_heatmap_preset"] = "1 Year"
+    at.run()
+    assert not at.exception
+
+
+@needs_data
 @pytest.mark.parametrize("window", ["Last 4 weeks", "Last 26 weeks",
-                                    "Last full calendar year"])
+                                    "Last full calendar year", "All history"])
 def test_historical_summary_renders_every_new_window(window):
     """Each added window must render — a 4-week span is the likeliest to be sparse."""
     import dashboard
@@ -328,9 +480,12 @@ def test_custom_window_renders_and_reports_the_snapped_range():
     )
     at.run()
     assert not at.exception
-    captions = " ".join(c.value for c in at.caption)
-    assert "snapped to whole weeks" in captions, \
-        "the caption must state the range actually measured, not the dates typed"
+    # The snapped range is stated in the window line ABOVE the tiles (st.markdown),
+    # not in the caption below them — you need the period before reading the numbers.
+    body = " ".join(m.value for m in at.markdown)
+    assert "snapped to whole weeks" in body, \
+        "the window line must state the range actually measured, not what was typed"
+    assert "Analysis window" in body
 
 
 @needs_data
