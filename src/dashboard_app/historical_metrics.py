@@ -488,6 +488,49 @@ def prior_period_window(start, end):
     return start - pd.Timedelta(weeks=weeks), start - pd.Timedelta(days=1)
 
 
+def span_weeks(start, end):
+    """Whole weeks the span NAMES, whether or not the snapshot holds any of them.
+
+    The denominator every per-week average wants. Distinct from
+    ``window_totals["weeks"]``, which counts weeks that carry ROWS -- a filtered
+    selection can leave most of a span's weeks empty, and dividing by the weeks
+    that happen to have data turns a quiet customer into a spectacular one.
+    """
+    return _anchor_weeks(start, end)
+
+
+def covered_weeks(start, end, floor, lcw):
+    """Whole weeks of ``[start, end]`` the snapshot actually holds history for.
+
+    ``floor`` is the earliest week ON RECORD -- the extract's history anchor, read
+    off the UNFILTERED frame. Before it there is no data at all, which is a
+    different fact from "sold nothing" and must not be averaged or compared
+    against. Weeks after ``lcw`` are excluded for the same reason.
+
+    Pass ``floor=None`` to mean "no known floor", i.e. trust the span as given. NaT
+    means the same thing -- an empty frame has no floor to read.
+    """
+    end = min(pd.Timestamp(end), pd.Timestamp(lcw))
+    if floor is None or pd.isna(pd.Timestamp(floor)):
+        return span_weeks(start, end)
+    return span_weeks(max(pd.Timestamp(start), pd.Timestamp(floor)), end)
+
+
+def fully_covered(start, end, floor, lcw):
+    """True when EVERY week the span names exists in the snapshot.
+
+    The one predicate that decides whether a comparison is fair. A prior-year span
+    reaching back past the history anchor holds fewer weeks than the window it is
+    compared against, so a total-against-total delta measures the snapshot's depth
+    rather than the business: on the live snapshot "Last 3 years" read Units +11.0%
+    against a base missing 21 of its 156 weeks, where the like-for-like per-week
+    figure was -4.0% -- wrong by 15 points and by its sign. Callers render no delta
+    at all rather than a confident wrong one.
+    """
+    named = span_weeks(start, end)
+    return bool(named) and covered_weeks(start, end, floor, lcw) == named
+
+
 def clip(frame, start, end):
     """Rows whose WeekDate falls in [start, end]."""
     if frame is None or frame.empty:
@@ -517,19 +560,45 @@ def _total(series):
     return 0.0 if pd.isna(total) else float(total)
 
 
-def window_totals(frame, start, end):
-    """Headline totals for one window: units, revenue, weeks, SKUs, customers."""
+def window_totals(frame, start, end, floor=None, lcw=None):
+    """Headline totals for one window, plus how much of it the snapshot covers.
+
+    Keys:
+        units, revenue   -- the sums the headline tiles show. ``revenue`` is None,
+                            not 0.0, whenever NO row in the span carries a list
+                            price -- including a span with no rows at all. That is
+                            "unknown", and a confident $0 beside a "—" Top-10 Share
+                            is the shape a failed price load used to take. ``units``
+                            stays 0.0, which reads as "nothing sold": unlike
+                            revenue it needs no second file to be knowable.
+        weeks            -- weeks carrying ROWS. A data-density reading, not a
+                            denominator; see ``span_weeks``.
+        span_weeks       -- whole weeks the window NAMES. What per-week averages
+                            divide by.
+        covered_weeks    -- of those, how many exist in the snapshot.
+        fully_covered    -- covered_weeks == span_weeks, i.e. is this span a fair
+                            comparison base. False suppresses a delta.
+
+    ``floor``/``lcw`` come from the UNFILTERED frame, so filtering to a customer
+    who only started last year still reads as a true zero rather than as missing
+    data. Omit them and the span is trusted as given.
+    """
+    if lcw is None:
+        lcw = end
+    shape = {
+        "span_weeks": span_weeks(start, end),
+        "covered_weeks": covered_weeks(start, end, floor, lcw),
+        "fully_covered": fully_covered(start, end, floor, lcw),
+    }
     win = clip(frame, start, end)
     if win is None or win.empty:
-        return {"units": 0.0, "revenue": 0.0, "weeks": 0, "skus": 0, "customers": 0}
+        return {"units": 0.0, "revenue": None, "weeks": 0, **shape}
+    priced = ("revenue" in win.columns) and bool(win["revenue"].notna().any())
     return {
         "units": _total(win["demand"]),
-        "revenue": _total(win["revenue"]) if "revenue" in win.columns else 0.0,
+        "revenue": _total(win["revenue"]) if priced else None,
         "weeks": int(win["WeekDate"].nunique()),
-        "skus": int(win.loc[win["demand"].notna(), "SKU"].nunique()),
-        "customers": int(
-            win.loc[win["demand"].notna(), "Customer Grouping"].nunique()
-        ),
+        **shape,
     }
 
 
@@ -559,13 +628,30 @@ def _sold(frame):
 
     The single definition of "sold", so every count and every list agrees. NaN is
     "no data" and 0 is "stocked but sold nothing"; neither makes a SKU active.
+
+    A NEGATIVE week (a return or credit) counts as activity: the SKU moved, and a
+    planner looking at an assortment list wants to see it. It is a small
+    population -- 5 SKUs net-negative over a year on the live snapshot -- but see
+    ``_first_sale_weeks``, where a return must NOT be allowed to masquerade as a
+    launch.
     """
     if frame is None or frame.empty:
         return frame if frame is not None else pd.DataFrame(columns=_FRAME_COLS)
     return frame[frame["demand"].notna() & (frame["demand"] != 0)]
 
 
-def breadth(frame, start, end):
+def _first_sale_weeks(sold):
+    """``{SKU: first week it SOLD}``, ignoring returns-only weeks.
+
+    Dates a launch off POSITIVE demand only. ``_sold`` admits negative weeks as
+    activity, but a credit raised before a product ever shipped is not its first
+    sale -- two SKUs on the live snapshot were dated that way -- and "New SKUs"
+    means launched.
+    """
+    return sold[sold["demand"] > 0].groupby("_k")["WeekDate"].min()
+
+
+def breadth(frame, start, end, floor=None):
     """Assortment health: active / new / dormant counts for a window.
 
     Every count here is ``len()`` of the corresponding breakdown frame, NOT a
@@ -573,12 +659,24 @@ def breadth(frame, start, end):
     tiles a planner clicks to see the underlying list, and a tile reading 47 above a
     list of 45 rows would discredit the whole view. Sharing the implementation makes
     them agree by construction rather than by two pieces of code being kept in step.
+
+    ``new_skus`` and ``dormant_skus`` come back as None -- the tile renders "—" --
+    when the window opens at or before ``floor``, the earliest week on record. Both
+    are defined by what happened BEFORE the window, and at the floor there is no
+    before: every SKU's first sale is necessarily inside the window (All history
+    read "New SKUs 667" against 667 SKUs that ever sold) and the 52-week dormancy
+    lookback lands entirely on absent weeks (it read 0). Neither number is wrong
+    arithmetic; both are answers to a question the snapshot cannot pose.
     """
+    before_exists = (floor is None or pd.isna(pd.Timestamp(floor))
+                     or pd.Timestamp(start) > pd.Timestamp(floor))
     return {
         "active_skus": len(active_skus_breakdown(frame, start, end)),
         "active_customers": len(active_customers_breakdown(frame, start, end)),
-        "new_skus": len(new_skus_breakdown(frame, start, end)),
-        "dormant_skus": len(dormant_skus_breakdown(frame, start, end)),
+        "new_skus": (len(new_skus_breakdown(frame, start, end))
+                     if before_exists else None),
+        "dormant_skus": (len(dormant_skus_breakdown(frame, start, end))
+                         if before_exists else None),
     }
 
 
@@ -607,8 +705,10 @@ def concentration(frame, start, end, n=10):
 def _with_key(frame):
     """Copy of ``frame`` with a normalised string SKU column ``_k`` to group on.
 
-    Grouping by a Series derived from a DIFFERENT (unfiltered) frame raises on the
-    length mismatch, so the key travels with the rows instead.
+    The key travels WITH the rows. Grouping by a Series taken from a differently
+    filtered frame does not raise -- pandas silently aligns it on the index -- so
+    the failure mode is a quietly wrong grouping rather than an error, which is
+    exactly why it is avoided here.
     """
     out = frame.copy()
     out["_k"] = out["SKU"].astype(str)
@@ -672,7 +772,7 @@ def new_skus_breakdown(frame, start, end):
         return pd.DataFrame(columns=cols)
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     sold = _with_key(sold)
-    first = sold.groupby("_k")["WeekDate"].min()
+    first = _first_sale_weeks(sold)
     launched = first[(first >= start) & (first <= end)]
     if launched.empty:
         return pd.DataFrame(columns=cols)
@@ -729,7 +829,15 @@ def top_share_breakdown(frame, start, end, n=10):
 
     Shares are computed against ALL priced window revenue, so "Share %" answers
     "how much of the business is this SKU" rather than "how much of this table".
-    Built on ``pareto`` so the cumulative maths exists in exactly one place.
+    Built on ``pareto`` so the cumulative maths exists in exactly one place -- which
+    also means "Share %" and "Cumulative %" share one denominator, and the last
+    row's cumulative equals the running sum of the shares above it.
+
+    That denominator is ``pareto``'s, i.e. SKUs with NET-POSITIVE window revenue,
+    so it differs from the Revenue tile by whatever the net-negative SKUs (returns)
+    come to -- $250 on $219.5M year-to-date on the live snapshot, 0.0001%. Matching
+    the tile instead would break the internal consistency above, which is the
+    property a planner reading this table actually checks.
     """
     cols = ["SKU", "Description", "Units", "Revenue", "Share %", "Cumulative %"]
     ranked = pareto(frame, start, end)

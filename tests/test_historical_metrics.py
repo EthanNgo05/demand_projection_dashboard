@@ -1062,14 +1062,24 @@ def test_fmt_compact_blanks_match_fmt_dollar(blank):
     assert config.fmt_compact(blank) == "—" == config.fmt_dollar(blank)
 
 
-def _metrics_for(frame, lcw, window):
+# Sentinel so _metrics_for can tell "no floor" (floor=None) from "work it out".
+_UNSET = object()
+
+
+def _metrics_for(frame, lcw, window, bounds=None, floor=_UNSET):
     """The metrics dict historical_summary._render_kpis consumes.
 
     Mirrors historical_summary._metrics without Streamlit's session cache, so the
     tile specs can be exercised as pure functions. Three spans, all derived from the
     selected window — see test_metrics_hold_no_span_the_window_did_not_set.
+
+    ``floor`` defaults to the frame's own earliest week, which is what the view
+    passes (off the UNFILTERED frame). Every span carries its coverage against it so
+    the tiles can withhold a delta whose base the snapshot does not fully hold.
     """
-    start, end = hm.window_bounds(window, lcw)
+    start, end = bounds if bounds is not None else hm.window_bounds(window, lcw)
+    if floor is _UNSET:
+        floor = (pd.to_datetime(frame["WeekDate"]).min() if len(frame) else None)
     prior_period = hm.prior_period_window(start, end)
     prior_year = hm.prior_year_window(
         start, end, anchor_to_year_start=(window == hm.WINDOW_YTD))
@@ -1077,12 +1087,13 @@ def _metrics_for(frame, lcw, window):
         "bounds": (start, end), "window_kind": window,
         "prior_period_bounds": prior_period,
         "prior_year_bounds": prior_year,
-        "window": hm.window_totals(frame, start, end),
-        "prior_period": hm.window_totals(frame, *prior_period),
-        "prior_year": hm.window_totals(frame, *prior_year),
-        "breadth": hm.breadth(frame, start, end),
+        "window": hm.window_totals(frame, start, end, floor, lcw),
+        "prior_period": hm.window_totals(frame, *prior_period, floor, lcw),
+        "prior_year": hm.window_totals(frame, *prior_year, floor, lcw),
+        "breadth": hm.breadth(frame, start, end, floor),
         "concentration": hm.concentration(frame, start, end),
         "coverage": hm.price_coverage(frame, start, end),
+        "floor": floor,
     }
 
 
@@ -1219,7 +1230,10 @@ def test_headline_deltas_compare_against_a_stated_window(three_year_frame, windo
     for tile_id in ("revenue", "units", "revenue_per_week"):
         # Not asserting a value -- asserting the delta is computable from the two
         # comparison windows in `m` and nothing else, by removing them.
-        blank = {"revenue": None, "units": None, "weeks": 0}
+        # fully_covered=True so the coverage gate can't be what makes the delta
+        # vanish -- this test is about the delta having no OTHER span to read.
+        blank = {"revenue": None, "units": None, "weeks": 0,
+                 "span_weeks": 0, "covered_weeks": 0, "fully_covered": True}
         stripped = dict(m, prior_period=blank, prior_year=blank)
         assert hs._TILES[tile_id]["delta"](stripped) is None, (
             f"{tile_id}'s delta survives with both comparison windows blanked, so "
@@ -1235,6 +1249,273 @@ def test_percent_tile_tooltip_is_more_precise_than_the_tile(three_year_frame):
     m = _metrics_for(frame, LCW, hm.WINDOW_3Y)
     assert hs._tile_value("top10_share", m).endswith("%")
     assert "." in hs._tile_value("top10_share", m, compact=False)
+
+
+# --------------------------------------------------------------------------- #
+# Comparison coverage: a delta whose base the snapshot does not fully hold      #
+# --------------------------------------------------------------------------- #
+# Every test below pins a number that was WRONG on the live snapshot, measured on
+# all_demand_projections_2026-08-04 (history anchored at 2023-01-01, lcw
+# 2026-07-26). The shared cause: prior_year_window / prior_period_window shift a
+# span back by a fixed amount without asking whether the extract reaches that far,
+# window_totals summed whatever rows existed, and pct_change divided two spans
+# holding different numbers of weeks. The delta then measured the depth of the
+# snapshot rather than the business.
+
+
+def test_span_weeks_counts_weeks_named_not_weeks_with_rows(three_year_frame):
+    """The per-week denominator must not shrink with the data."""
+    frame, _ = three_year_frame
+    start, end = hm.window_bounds(hm.WINDOW_52W, LCW)
+    # One SKU that sold in exactly one of the 52 weeks.
+    sparse = frame[(frame["SKU"] == "AAA") & (frame["WeekDate"] == end)]
+    t = hm.window_totals(sparse, start, end, floor=frame["WeekDate"].min(), lcw=LCW)
+    assert t["weeks"] == 1, "one week carries rows"
+    assert t["span_weeks"] == 52, "but the window still names 52"
+    assert t["covered_weeks"] == 52, "and the snapshot holds all 52"
+
+
+def test_revenue_per_week_divides_by_the_window_not_by_weeks_with_sales(
+        three_year_frame):
+    """The 52x overstatement: MAKRO read $63,360/wk against a true $1,218/wk.
+
+    Dividing by weeks-with-rows turned a customer group that sold in 1 of 52 weeks
+    into the best performer on the screen. 21 of the live snapshot's customer groups
+    have a short denominator at 52 weeks.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    start, end = hm.window_bounds(hm.WINDOW_52W, LCW)
+    sparse = frame[(frame["SKU"] == "AAA") & (frame["WeekDate"] == end)]
+    m = _metrics_for(sparse, LCW, hm.WINDOW_52W, floor=frame["WeekDate"].min())
+    shown = hs._TILES["revenue_per_week"]["value"](m)
+    assert shown == pytest.approx(m["window"]["revenue"] / 52)
+    assert shown == pytest.approx(100.0 / 52), "10 units x $10, spread over 52 weeks"
+
+
+def test_no_yoy_delta_when_the_prior_year_reaches_past_the_snapshot(
+        three_year_frame):
+    """Last 3 years read Units +11.0% where the per-week truth was -4.0%.
+
+    The prior-year span held 135 of its 156 weeks, so the missing 21 weeks read as
+    growth -- wrong by 15 points and by its sign. No delta is the honest answer.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_3Y)
+    assert not m["prior_year"]["fully_covered"], (
+        "the fixture's 160 weeks cannot cover a 3-year window's prior year"
+    )
+    assert m["prior_year"]["covered_weeks"] < m["prior_year"]["span_weeks"]
+    for tile_id in ("revenue", "units"):
+        assert hs._TILES[tile_id]["delta"](m) is None, (
+            f"{tile_id} shows a delta against a truncated prior year"
+        )
+
+
+def test_yoy_delta_survives_when_the_prior_year_is_fully_held(three_year_frame):
+    """The gate must not swallow the deltas that were always correct.
+
+    Six of the eight named windows compared equal week counts before this change and
+    must be untouched by it.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_13W)
+    assert m["prior_year"]["fully_covered"]
+    assert hs._TILES["units"]["delta"](m) == pytest.approx(
+        hm.pct_change(m["window"]["units"], m["prior_year"]["units"]))
+
+
+def test_no_momentum_delta_when_the_prior_period_is_mostly_absent(
+        three_year_frame):
+    """Last 3 years' momentum base held 31 real weeks in a 156-week slot.
+
+    Per-week division alone does not rescue it: a seven-month sliver of the oldest
+    data standing in for three years is not "the equal-length period immediately
+    before".
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_3Y)
+    assert not m["prior_period"]["fully_covered"]
+    assert hs._TILES["revenue_per_week"]["delta"](m) is None
+
+
+def test_all_history_reports_no_year_over_year_delta(three_year_frame):
+    """All history read Revenue +36.7% against an overlapping subset of itself.
+
+    A 364-day shift of a window that starts at the floor of the snapshot still lands
+    INSIDE that window, so the tile compared all history against its own first
+    three-and-a-half years. The in-code comment claimed both comparison spans came
+    back empty; only the momentum one does.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    bounds = hm.all_history_bounds(frame, LCW)
+    m = _metrics_for(frame, LCW, hm.WINDOW_ALL, bounds=bounds)
+    ly_start, ly_end = m["prior_year_bounds"]
+    assert ly_end > bounds[0], "the prior-year span overlaps the window itself"
+    assert m["prior_year"]["units"] > 0, "and is not empty, so a delta was computed"
+    for tile_id in ("revenue", "units", "revenue_per_week"):
+        assert hs._TILES[tile_id]["delta"](m) is None
+
+
+def test_all_history_blanks_new_and_dormant_skus(three_year_frame):
+    """Both read a period that does not exist: 667 of 667 "new", 0 dormant.
+
+    Every SKU's first sale is necessarily inside a window that opens at the earliest
+    week on record, and the 52-week dormancy lookback lands entirely on weeks the
+    extract does not reach. Neither is wrong arithmetic; both answer a question the
+    snapshot cannot pose.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    bounds = hm.all_history_bounds(frame, LCW)
+    m = _metrics_for(frame, LCW, hm.WINDOW_ALL, bounds=bounds)
+    assert m["breadth"]["new_skus"] is None
+    assert m["breadth"]["dormant_skus"] is None
+    assert hs._tile_value("new_skus", m) == "—"
+    assert hs._tile_value("dormant_skus", m) == "—"
+    # And the modal must agree with the blank tile rather than listing every SKU.
+    for tile_id in ("new_skus", "dormant_skus"):
+        table, note = hs._breakdown_frame(tile_id, frame, m)
+        assert table.empty and note, f"{tile_id} modal contradicts its blank tile"
+    # Active counts are unaffected -- they read only inside the window.
+    assert m["breadth"]["active_skus"] > 0
+
+
+def test_a_withheld_delta_states_the_per_week_movement_instead(three_year_frame):
+    """The trend must not be lost with the bad percentage.
+
+    "Last 3 years" cannot carry Units +11.0%, but the 135 weeks its prior year DOES
+    hold are whole, real weeks -- so per-week against per-week over exactly those
+    weeks is a fact worth stating, and the only honest trend the long windows have.
+    """
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_3Y)
+    for tile_id in ("revenue", "units", "revenue_per_week"):
+        assert hs._TILES[tile_id]["delta"](m) is None, tile_id
+        note = hs._coverage_note(tile_id, m)
+        assert note, f"{tile_id} withholds its delta and says nothing instead"
+        # Must name the per-week basis and how much of the base is real, or the
+        # reader cannot tell what it is a percentage OF.
+        assert "per week" in note, note
+        span = m[hs._TILES[tile_id]["base"]]
+        assert f"{span['covered_weeks']} of {span['span_weeks']}" in note, note
+
+
+def test_the_per_week_note_matches_a_hand_computed_rate(three_year_frame):
+    """The note's number must be the coverage-corrected rate, nothing else."""
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_3Y)
+    win, prior = m["window"], m["prior_year"]
+    expected = hm.pct_change(win["units"] / win["covered_weeks"],
+                             prior["units"] / prior["covered_weeks"])
+    assert f"{expected:+.1f}%" in hs._coverage_note("units", m)
+
+
+def test_no_per_week_note_when_the_delta_rendered_normally(three_year_frame):
+    """The note is what a MISSING delta leaves behind, not a second delta."""
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    m = _metrics_for(frame, LCW, hm.WINDOW_13W)
+    for tile_id in ("revenue", "units", "revenue_per_week"):
+        assert hs._TILES[tile_id]["delta"](m) is not None, tile_id
+        assert hs._coverage_note(tile_id, m) is None, tile_id
+    # And never on a tile that has no comparison at all.
+    for tile_id in ("top10_share", "active_skus", "new_skus", "dormant_skus"):
+        assert hs._coverage_note(tile_id, m) is None, tile_id
+
+
+def test_no_per_week_note_when_the_base_holds_no_weeks(three_year_frame):
+    """All history's momentum span is entirely absent -- there is no rate to state."""
+    from dashboard_app import historical_summary as hs
+
+    frame, _ = three_year_frame
+    bounds = hm.all_history_bounds(frame, LCW)
+    m = _metrics_for(frame, LCW, hm.WINDOW_ALL, bounds=bounds)
+    assert m["prior_period"]["covered_weeks"] == 0
+    assert hs._coverage_note("revenue_per_week", m) is None
+    # The year-earlier span DOES overlap, so that one still has a rate to report.
+    assert hs._coverage_note("units", m)
+
+
+def test_every_tile_with_a_delta_declares_the_span_it_divides_by():
+    """The structural guard: one declaration of `base` per tile, or the delta and
+    the note could measure against different periods.
+    """
+    from dashboard_app import historical_summary as hs
+
+    for tile_id, spec in hs._TILES.items():
+        if spec.get("base") is None:
+            continue
+        assert spec["base"] in ("prior_period", "prior_year"), tile_id
+        assert callable(spec.get("total")) and callable(spec.get("rate")), tile_id
+
+
+def test_named_windows_keep_new_and_dormant_counts(three_year_frame):
+    """The blanking rule must only fire at the floor, not on ordinary windows."""
+    frame, _ = three_year_frame
+    for window in (hm.WINDOW_4W, hm.WINDOW_13W, hm.WINDOW_52W):
+        b = _metrics_for(frame, LCW, window)["breadth"]
+        assert b["new_skus"] is not None and b["dormant_skus"] is not None, window
+
+
+def test_a_returns_only_week_does_not_date_a_launch(P):
+    """Two live SKUs had a credit as their "First sale week"."""
+    weeks = _weeks(LCW, 60)
+    raw = pd.concat([
+        raw_rows("REF", "Cust1", "US Retail", weeks[:1], pos=[-4.0]),
+        raw_rows("REF", "Cust1", "US Retail", weeks[50:], pos=[8.0] * 10),
+    ], ignore_index=True)
+    frame = hm.build_frame(raw, P, {"REF": 5.0}, plytix_df=None)
+    # A window covering only the real launch must still find it.
+    start, end = weeks[50], LCW
+    out = hm.new_skus_breakdown(frame, start, end)
+    assert list(out["SKU"]) == ["REF"]
+    assert out["First sale week"].iloc[0] == weeks[50]
+    # And the returns-only week must not have claimed the launch earlier.
+    assert hm.new_skus_breakdown(frame, weeks[0], weeks[10]).empty
+
+
+def test_revenue_is_unknown_not_zero_when_nothing_is_priced(P):
+    """A failed price load must read "—", the way Top-10 Share already did."""
+    from dashboard_app import historical_summary as hs
+
+    weeks = _weeks(LCW, 20)
+    raw = raw_rows("AAA", "Cust1", "US Retail", weeks, pos=[10.0] * len(weeks))
+    frame = hm.build_frame(raw, P, prices=None, plytix_df=None)
+    m = _metrics_for(frame, LCW, hm.WINDOW_13W)
+    assert m["window"]["revenue"] is None
+    assert m["window"]["units"] == pytest.approx(130.0), "units are still knowable"
+    assert hs._tile_value("revenue", m) == "—"
+    assert hs._tile_value("revenue_per_week", m) == "—"
+    assert hs._tile_value("top10_share", m) == "—"
+    assert hs._tile_value("units", m) != "—"
+
+
+def test_window_totals_carries_no_unread_sku_or_customer_counts(three_year_frame):
+    """They used a different "active" definition than the tiles, off by 3-11.
+
+    ``demand.notna()`` counts a stocked-but-unsold zero week as activity; ``_sold``
+    (which every tile and list uses) does not. Nothing read them, which is what made
+    them a trap rather than a bug.
+    """
+    frame, _ = three_year_frame
+    t = hm.window_totals(frame, *hm.window_bounds(hm.WINDOW_52W, LCW))
+    assert "skus" not in t and "customers" not in t
 
 
 def test_fmt_compact_keeps_a_near_constant_width_across_magnitudes():

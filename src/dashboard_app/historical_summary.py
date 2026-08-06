@@ -155,7 +155,7 @@ def _apply_filters(base, regions, groups):
     return out
 
 
-def _metrics(frame, window, lcw, cache_key, bounds=None):
+def _metrics(frame, window, lcw, cache_key, bounds=None, floor=None):
     """Every figure the tiles need, all measured over the SELECTED window.
 
     ``bounds`` overrides the named window's own span — that is how a custom range
@@ -167,6 +167,14 @@ def _metrics(frame, window, lcw, cache_key, bounds=None):
     52-week windows, which is why changing the selector left most of the grid
     sitting still. Those periods are still reachable: they are window OPTIONS, and
     Year to date is the default.
+
+    ``floor`` is the earliest week the SNAPSHOT holds, read off the unfiltered
+    frame. Every span carries its own coverage against it (see
+    ``hm.window_totals``) so a tile can tell "there is no data back there" apart
+    from "nothing sold back there" and withhold a delta for the first. It must come
+    from the unfiltered frame: measured on the filtered one, narrowing to a customer
+    who started trading last year would look like a snapshot that starts last year,
+    and their genuine growth would be suppressed as uncomparable.
     """
     store = st.session_state.setdefault("hist_metrics", {})
     if cache_key in store:
@@ -187,16 +195,24 @@ def _metrics(frame, window, lcw, cache_key, bounds=None):
         "window_kind": window,
         "prior_period_bounds": (prior_start, prior_end),
         "prior_year_bounds": (ly_start, ly_end),
-        "window": hm.window_totals(frame, start, end),
-        "prior_period": hm.window_totals(frame, prior_start, prior_end),
-        # For "All history" both comparison spans fall entirely before the earliest
-        # week on record, so these come back at zero and pct_change returns None for
-        # a zero base -- the tiles then render with no delta at all, which is the
-        # honest reading of "there is nothing earlier to compare against".
-        "prior_year": hm.window_totals(frame, ly_start, ly_end),
-        "breadth": hm.breadth(frame, start, end),
+        "window": hm.window_totals(frame, start, end, floor, lcw),
+        # Both comparison spans can reach past the floor of the snapshot, and when
+        # they do they hold FEWER weeks than the window they are compared against --
+        # so a total-against-total delta reads the snapshot's depth as growth. "All
+        # history" was the worst case (Revenue +36.7% against an overlapping subset
+        # of itself); "Last 3 years" was the most believable, and so the more
+        # dangerous, at Units +11.0% where the per-week truth was -4.0%. Each dict
+        # carries `fully_covered`; `_total_delta` and `_per_week_delta` refuse to
+        # divide without it.
+        "prior_period": hm.window_totals(frame, prior_start, prior_end, floor, lcw),
+        "prior_year": hm.window_totals(frame, ly_start, ly_end, floor, lcw),
+        "breadth": hm.breadth(frame, start, end, floor),
         "concentration": hm.concentration(frame, start, end, n=10),
         "coverage": hm.price_coverage(frame, start, end),
+        # Named by _render_window_dates when a comparison span falls short of it, so
+        # a withheld delta reads as a known limit of the snapshot rather than as a
+        # broken tile.
+        "floor": floor,
     }
     bounded_put(store, cache_key, result, _CACHE_CAP)
     return result
@@ -252,51 +268,138 @@ _SECTIONS = [
 ]
 
 
-def _per_week(total, weeks):
-    """A per-week average, or None when the window holds no complete week.
+def _rate(span, key):
+    """A span's ``key`` per week, or None when there is no week to divide by.
 
-    None (not 0) so the tile renders "—": an empty window has no average, and a
+    Divides by ``covered_weeks`` -- the weeks the span NAMES that the snapshot holds
+    -- not by the weeks that happen to carry rows. The two agree on the unfiltered
+    frame, which is why this read correctly for so long, and diverge hard under a
+    filter: 21 of the customer groups have sales in fewer than 52 of the last 52
+    weeks, and dividing by weeks-with-rows made MAKRO's $1,218/week read as
+    $63,360/week -- a 52x overstatement, on the one tile whose whole job is to stay
+    comparable across windows.
+
+    None (not 0) so the tile renders "—": an empty span has no average, and a
     confident "$0 / week" would be a different claim.
     """
+    weeks = span["covered_weeks"]
+    total = span[key]
     if not weeks or total is None or pd.isna(total):
         return None
     return total / weeks
 
 
+def _per_week(span):
+    """Revenue per week -- the Revenue / Week tile's own value."""
+    return _rate(span, "revenue")
+
+
+def _tile_delta(tile_id, m):
+    """A tile's delta, or None when its comparison base is not comparable.
+
+    Reads ``base`` and ``total`` off the tile's own spec, so the span a delta
+    divides by is declared in exactly one place -- the same rule the grid and the
+    modals already share.
+
+    Refuses to divide by a span the snapshot does not fully hold. A truncated base
+    understates itself, so the delta reports the extract's history anchor as growth:
+    "Last 3 years" showed Units +11.0% against a prior year missing 21 of its 156
+    weeks, when the like-for-like per-week movement was -4.0% -- wrong by 15 points
+    and by its sign. ``_coverage_note`` then states that per-week movement under the
+    tile, so the trend is not lost with the bad percentage.
+    """
+    spec = _TILES[tile_id]
+    base = spec.get("base")
+    if not base or not m[base]["fully_covered"]:
+        return None
+    return hm.pct_change(spec["total"](m["window"]), spec["total"](m[base]))
+
+
+def _coverage_note(tile_id, m):
+    """The per-week comparison a withheld delta leaves on the table, or None.
+
+    A truncated base cannot carry a total-against-total delta, but the weeks it DOES
+    hold are whole, real weeks -- so per-week against per-week over exactly those
+    weeks is a fact, and the only honest trend available for the long windows. It
+    goes under the tile as text rather than into the delta arrow because it measures
+    something different from the total above it, and says so: the label names the
+    per-week basis and how much of the base period is actually on record.
+
+    On the live snapshot this is what "Last 3 years" has instead of its old
+    "Units +11.0%": "per week: -4.0% vs the 135 of 156 weeks on record".
+    """
+    spec = _TILES[tile_id]
+    base = spec.get("base")
+    if not base:
+        return None
+    span = m[base]
+    # Nothing to add when the delta rendered normally, and nothing to compute when
+    # the base holds no weeks at all (All history's momentum span).
+    if span["fully_covered"] or not span["covered_weeks"]:
+        return None
+    pct = hm.pct_change(spec["rate"](m["window"]), spec["rate"](span))
+    if pct is None:
+        return None
+    return (f"per week: {pct:+.1f}% vs the {span['covered_weeks']} of "
+            f"{span['span_weeks']} weeks on record")
+
+
 _TILES = {
+    # `base` names the comparison span, `total` the figure compared when the snapshot
+    # holds that span in full, and `rate` its per-week form -- the fallback stated
+    # under the tile when it does not. Declared here rather than inside the delta
+    # lambda so _tile_delta and _coverage_note cannot disagree about which period a
+    # tile is measured against.
     "revenue": dict(
         label="Revenue", kind="money",
         value=lambda m: m["window"]["revenue"],
-        delta=lambda m: hm.pct_change(m["window"]["revenue"],
-                                      m["prior_year"]["revenue"]),
+        base="prior_year",
+        total=lambda s: s["revenue"],
+        rate=lambda s: _rate(s, "revenue"),
+        delta=lambda m: _tile_delta("revenue", m),
         help="Units × Plytix list price over the analysis window — a retail-value "
              "proxy, not invoiced revenue. Compared against the same weeks a year "
              "earlier (a 364-day shift, so whole weeks meet whole weeks; a "
-             "Year-to-date window anchors to the prior January 1 instead).",
+             "Year-to-date window anchors to the prior January 1 instead). When that "
+             "year-earlier span reaches back past the start of the snapshot it holds "
+             "fewer weeks than the window, so the arrow is withheld and a per-week "
+             "comparison over the weeks that ARE on record is shown instead.",
     ),
     "units": dict(
         label="Units", kind="units",
         value=lambda m: m["window"]["units"],
-        delta=lambda m: hm.pct_change(m["window"]["units"],
-                                      m["prior_year"]["units"]),
+        base="prior_year",
+        total=lambda s: s["units"],
+        rate=lambda s: _rate(s, "units"),
+        delta=lambda m: _tile_delta("units", m),
         help="Actual sell-through units over the analysis window (POS, falling back "
              "to Orders for customers who report no POS), against the same weeks a "
-             "year earlier.",
+             "year earlier. When that span reaches past the start of the snapshot "
+             "the arrow gives way to a per-week comparison over the weeks on record.",
     ),
     # Delta is per-week against per-week, not total against total. The two agree
     # whenever both periods are dense, and when they aren't, an average tile whose
     # delta came from totals would be comparing a different pair of numbers than the
     # one it displays.
+    # Already a rate, so `total` and `rate` are the same function -- its delta was
+    # always per-week against per-week. The coverage gate still applies: the prior
+    # period for "Last 3 years" holds 31 real weeks in a 156-week slot, and a
+    # seven-month sliver of early 2023 is not "the equal-length period immediately
+    # before". The note under the tile says how many weeks it really is.
     "revenue_per_week": dict(
         label="Revenue / Week", kind="money",
-        value=lambda m: _per_week(m["window"]["revenue"], m["window"]["weeks"]),
-        delta=lambda m: hm.pct_change(
-            _per_week(m["window"]["revenue"], m["window"]["weeks"]),
-            _per_week(m["prior_period"]["revenue"], m["prior_period"]["weeks"])),
+        value=lambda m: _per_week(m["window"]),
+        base="prior_period",
+        total=_per_week,
+        rate=_per_week,
+        delta=lambda m: _tile_delta("revenue_per_week", m),
         help="Average revenue per complete week in the window — the figure that "
-             "stays comparable when you change the window's length. Its delta is "
-             "MOMENTUM: this window against the equal-length period immediately "
-             "before it, not against last year.",
+             "stays comparable when you change the window's length. Divided by every "
+             "week the window covers, including weeks with no sales, so filtering to "
+             "a quiet customer group lowers the average instead of raising it. Its "
+             "delta is MOMENTUM: this window against the equal-length period "
+             "immediately before it, not against last year, and only when the "
+             "snapshot covers that period in full.",
     ),
     "top10_share": dict(
         label="Top-10 Revenue Share", kind="percent",
@@ -322,14 +425,18 @@ _TILES = {
         value=lambda m: m["breadth"]["new_skus"], delta=lambda m: None,
         help="SKUs whose FIRST EVER week of sell-through in this snapshot falls "
              "inside the window. \"First ever\" is measured across all history — "
-             "that is what makes a SKU new.",
+             "that is what makes a SKU new. A returns-only week does not date a "
+             "launch. Shows '—' for a window that opens at the start of the "
+             "snapshot, where every SKU would count as new.",
     ),
     "dormant_skus": dict(
         label="Dormant SKUs", kind="count",
         value=lambda m: m["breadth"]["dormant_skus"], delta=lambda m: None,
         help="Sold in the 52 weeks before the window opened, but nothing inside it "
              "— assortment drifting away. The 52-week lookback is fixed whatever "
-             "the window: over four weeks, \"dormant\" would mean nothing.",
+             "the window: over four weeks, \"dormant\" would mean nothing. Shows "
+             "'—' for a window that opens at the start of the snapshot, where that "
+             "lookback lands on weeks the data does not reach.",
     ),
 }
 
@@ -378,9 +485,12 @@ def _render_window_dates(m):
 
     The two comparison spans are named on the same line, because the tiles' deltas
     are percentages against them and a percentage whose base is unstated is not a
-    fact. They are omitted when the comparison period holds nothing (All history
-    reaches the floor of the snapshot, so there is no earlier stretch) -- exactly
-    the case where those tiles render without a delta.
+    fact. A span the snapshot does not fully hold is named and marked as such rather
+    than dropped: those are exactly the cases where the tiles now render without a
+    delta, and an unexplained missing delta reads as a broken tile. (This used to
+    claim both spans came back empty for All history. Only the momentum one does --
+    the year-earlier span overlaps the window, and the tiles were quietly reporting
+    Revenue +36.7% against a subset of themselves.)
 
     Every span is read straight off ``m`` — the same pairs every tile and breakdown is
     computed from — so the dates displayed are by construction the dates used, not a
@@ -390,7 +500,10 @@ def _render_window_dates(m):
     view.
     """
     start, end = m["bounds"]
-    weeks = m["window"]["weeks"]
+    # The weeks the window COVERS, which is what every per-week figure divides by.
+    # `["weeks"]` counts weeks carrying rows and would under-report a filtered
+    # selection's span -- the mismatch that used to inflate Revenue / Week.
+    weeks = m["window"]["covered_weeks"]
 
     label = m["window_kind"]
     note = ""
@@ -408,14 +521,25 @@ def _render_window_dates(m):
                            "is always excluded.")
 
     comparisons = []
-    if m["prior_period"]["weeks"]:
-        # "the period before" rather than a week count: `weeks` above counts weeks
-        # that carry DATA, which a sparse window can make smaller than its span.
-        comparisons.append(
-            f"vs the period before ({_span(*m['prior_period_bounds'])})")
-    if m["prior_year"]["weeks"]:
-        comparisons.append(
-            f"vs the same weeks last year ({_span(*m['prior_year_bounds'])})")
+    for key, bounds_key, name in (
+        ("prior_period", "prior_period_bounds", "the period before"),
+        ("prior_year", "prior_year_bounds", "the same weeks last year"),
+    ):
+        span = m[key]
+        if not span["weeks"] and not span["fully_covered"]:
+            continue                      # nothing there at all; say nothing
+        text = f"vs {name} ({_span(*m[bounds_key])})"
+        if not span["fully_covered"]:
+            # Name the span AND why no delta came from it, with the date that decided
+            # it. Silence here is what makes a withheld delta look like a bug instead
+            # of a limit of the data.
+            short = span["span_weeks"] - span["covered_weeks"]
+            since = (f" (history starts {pd.Timestamp(m['floor']):%b %d, %Y})"
+                     if m.get("floor") is not None
+                     and not pd.isna(pd.Timestamp(m["floor"])) else "")
+            text += (f" — **no delta**: {short} of its {span['span_weeks']} weeks "
+                     f"are before the snapshot starts{since}")
+        comparisons.append(text)
     if comparisons:
         st.caption("Deltas: " + " &nbsp;·&nbsp; ".join(comparisons))
 
@@ -454,6 +578,13 @@ def _render_kpis(m, window, frame):
                     st.metric(_tile_label(tile_id, window),
                               _tile_value(tile_id, m),
                               delta=_delta(spec["delta"](m)))
+                    # The trend a withheld delta would otherwise take with it, as
+                    # text rather than an arrow because it measures per-week movement
+                    # while the figure above it is a total. Sits above the button so
+                    # the click target stays the last element in the card.
+                    note = _coverage_note(tile_id, m)
+                    if note:
+                        st.caption(note)
                     if st.button("Breakdown", key=f"histkpi-go-{tile_id}",
                                  width="stretch"):
                         _breakdown_dialog(tile_id, frame, m, window)
@@ -530,11 +661,24 @@ def _breakdown_frame(tile_id, frame, m):
     if tile_id == "active_customers":
         return (hm.active_customers_breakdown(frame, start, end),
                 "Every customer group that sold inside the window.")
+    # Both of these are defined by what happened BEFORE the window, so when the
+    # window opens at the start of the snapshot the tile reads "—" (see hm.breadth).
+    # The modal has to agree with it: showing the raw list under a blank tile is the
+    # discrepancy the shared-implementation rule exists to prevent. `breadth` is the
+    # single place that decision is made, so read it rather than re-testing the floor.
     if tile_id == "new_skus":
+        if m["breadth"]["new_skus"] is None:
+            return (pd.DataFrame(), "This window opens at the earliest week on "
+                    "record, so every SKU's first sale falls inside it by "
+                    "definition. Pick a shorter window to see genuine launches.")
         return (hm.new_skus_breakdown(frame, start, end),
                 "SKUs whose first ever recorded sale falls inside the window, "
                 "oldest launch first.")
     if tile_id == "dormant_skus":
+        if m["breadth"]["dormant_skus"] is None:
+            return (pd.DataFrame(), "Dormancy looks back 52 weeks before the window "
+                    "opened, and this window opens at the earliest week on record — "
+                    "there is no earlier stretch to have sold in.")
         return (hm.dormant_skus_breakdown(frame, start, end),
                 "SKUs that sold in the 52 weeks before the window but nothing "
                 "inside it. Units and revenue describe that earlier stretch.")
@@ -864,6 +1008,12 @@ def _render_body(base, lcw):
     the same isolation tables.render_filtered_table already uses for filter chips.
     """
     regions, groups, window, bounds = _filter_bar(base, lcw)
+    # The earliest week the SNAPSHOT holds, off `base` -- before any filter. This is
+    # the line between "no data" and "sold nothing", and every withheld delta is
+    # decided against it. Read from the filtered frame it would move with the
+    # selection, and a customer who started trading last year would look like a
+    # snapshot that starts last year, suppressing their real growth.
+    floor = pd.to_datetime(base["WeekDate"]).min()
     frame = _apply_filters(base, regions, groups)
     # Drop the snapshot's forward projection weeks ONCE, here, so nothing downstream
     # can see them: not a chart, and not either range control's data maximum (which
@@ -895,7 +1045,7 @@ def _render_body(base, lcw):
     # filters would be served last load's numbers.
     cache_key = (st.session_state.get("hist_base_sig"),
                  tuple(regions), tuple(groups), window, bounds, len(frame))
-    m = _metrics(frame, window, lcw, cache_key, bounds=bounds)
+    m = _metrics(frame, window, lcw, cache_key, bounds=bounds, floor=floor)
 
     _render_kpis(m, window, frame)
     _render_caption(m, frame, lcw, len(base), len(frame))
