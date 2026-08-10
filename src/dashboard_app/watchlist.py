@@ -23,6 +23,10 @@ WATCHLIST_PATH = os.path.join(REPO_ROOT, "outputs", "watchlist.json")
 # used in lookups). Replaces the old separate ★ column.
 STAR_PREFIX = "★ "
 
+# Export column carrying what the ★ encodes, since the prefix itself can't survive
+# into a workbook (see with_watchlist_column).
+WATCHLIST_COL = "Watchlist"
+
 # Name used when migrating a legacy single-list file, and the default first list.
 DEFAULT_NAME = "My Watchlist"
 
@@ -266,6 +270,58 @@ def starred_mask(df, pairs=None):
          for s, c in zip(df["SKU"].astype(str), df[cust].astype(str))],
         index=df.index,
     )
+
+
+def watchlist_names_for(df):
+    """Series of comma-joined watchlist names containing each row's (SKU, customer).
+
+    EVERY list, not just the active one: on screen a row carries a single ★ meaning
+    "on the list you are looking at", but an export outlives that session choice, so
+    naming every list it belongs to is the only self-describing answer.
+
+    Empty string where a row is on no list, and for every row when ``df`` lacks a SKU
+    or customer column (watchlist entries are keyed by the pair, so neither alone can
+    resolve one).
+    """
+    cust = customer_col(df)
+    if df is None or "SKU" not in getattr(df, "columns", []) or cust is None:
+        return pd.Series("", index=getattr(df, "index", None), dtype="object")
+    lists = load_all()
+    if not lists:
+        return pd.Series("", index=df.index, dtype="object")
+    # One pair -> names lookup, so a wide watchlist costs one pass rather than one
+    # membership test per (row, list).
+    names_by_pair = {}
+    for name in sorted(lists):
+        for pair in lists[name]:
+            names_by_pair.setdefault(pair, []).append(name)
+    return pd.Series(
+        [", ".join(names_by_pair.get((str(s), str(c)), ()))
+         for s, c in zip(df["SKU"].astype(str), df[cust].astype(str))],
+        index=df.index, dtype="object",
+    )
+
+
+def with_watchlist_column(df):
+    """Copy of ``df`` with ``Watchlist`` inserted after the SKU block — for exports.
+
+    The ★ prefix is display-only and never reaches a workbook, so the membership it
+    encodes has to travel as its own column. Placed after ``Key SKU`` when that column
+    is present, keeping the flags grouped beside the SKU they describe. A no-op
+    returning ``df`` unchanged when there is no ``SKU`` column or it already carries
+    the column, so export call sites can wrap unconditionally.
+    """
+    if df is None or "SKU" not in getattr(df, "columns", []):
+        return df
+    if WATCHLIST_COL in df.columns:
+        return df
+    out = df.copy()
+    # keyskus.KEY_SKU_COL by value, not by import: keyskus imports this module for
+    # STAR_PREFIX, so importing it back would cycle. Landing before Key SKU (when a
+    # caller adds the columns in the other order) would only reorder them, not break.
+    after = "Key SKU" if "Key SKU" in out.columns else "SKU"
+    out.insert(out.columns.get_loc(after) + 1, WATCHLIST_COL, watchlist_names_for(df))
+    return out
 
 
 def mark_starred_sku(df, pairs=None):

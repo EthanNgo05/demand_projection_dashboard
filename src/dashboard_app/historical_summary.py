@@ -26,6 +26,8 @@ from dashboard_app import historical_charts as hc
 from dashboard_app import historical_metrics as hm
 from dashboard_app.charts import _as_price_map
 from dashboard_app.config import bounded_put, fmt_compact, fmt_dollar
+from dashboard_app.compute import with_export_flags
+from dashboard_app.keyskus import mark_key_sku, sku_chip_column_config
 from dashboard_app.tables import render_filtered_table
 
 # Cap on the per-filter derived-metric cache (same bounded_put semantics the
@@ -707,14 +709,18 @@ def _breakdown_dialog(tile_id, frame, m, window):
     if note:
         st.caption(note)
 
+    # The SKU-grained breakdowns get the blue "Key" chip beside the SKU like every
+    # other table; the month/week ones have no SKU column and mark_key_sku no-ops.
+    display, sku_values = mark_key_sku(table)
     st.dataframe(
-        table, width="stretch", hide_index=True,
-        column_config={c: cfg for c, cfg in _COL_CONFIG.items()
-                       if c in table.columns},
+        display, width="stretch", hide_index=True,
+        column_config={**{c: cfg for c, cfg in _COL_CONFIG.items()
+                          if c in display.columns},
+                       **(sku_chip_column_config(sku_values) if sku_values else {})},
     )
     st.download_button(
         "⬇️ Download this breakdown (CSV)",
-        table.to_csv(index=False).encode("utf-8"),
+        with_export_flags(table).to_csv(index=False).encode("utf-8"),
         file_name=f"historical_{tile_id}.csv",
         mime="text/csv",
         key=f"histkpi-dl-{tile_id}",

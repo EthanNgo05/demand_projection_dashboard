@@ -126,6 +126,10 @@ from dashboard_app.charts import (  # noqa: F401
 from dashboard_app.tables import (  # noqa: F401
     render_filtered_table, render_selectable_table, style_summary,
 )
+from dashboard_app.keyskus import (  # noqa: F401
+    current_key_skus, key_sku_mask, mark_key_sku, with_key_sku_column,
+    sku_chip_column_config,
+)
 from dashboard_app.datasources import (  # noqa: F401
     DISCONTINUED_COLS, INACTIVE_COLS, MISSING_COLS, MISSING_POS_COLS, WAREHOUSE_REGIONS,
     _active_in_list, _clean, _date_from_name, _raw_dir, _region_code, _this_week_start,
@@ -146,7 +150,7 @@ from dashboard_app.compute import (  # noqa: F401
     attach_descriptive_averages, attach_supply_columns,
     compute_by_customer, compute_by_customer_best,
     compute_by_customer_frames, compute_view, list_views, run_autofit,
-    single_group_frames, summary_to_excel, view_to_excel,
+    single_group_frames, summary_to_excel, view_to_excel, with_export_flags,
 )
 from dashboard_app.refresh import (  # noqa: F401
     BATCH_STALE_SECONDS, EXTRACT_SCRIPT, REFRESH_STALE_SECONDS, WAREHOUSE_EXTRACT_SCRIPT,
@@ -1843,7 +1847,8 @@ def main():
         )
         st.download_button(
             "⬇️ Download the summary table by SKU and Customer",
-            data=view_to_excel(by_cust_table, weekly),
+            data=view_to_excel(with_export_flags(by_cust_table),
+                               with_export_flags(weekly)),
             file_name=(
                 f"{view.replace('/', '-').replace(' ', '_')}"
                 f"_demand_projections_{today_str}.xlsx"
@@ -1898,7 +1903,8 @@ def main():
             render_filtered_table(summary_table, "filter_by_sku", P)
             st.download_button(
                 "⬇️ Download the summary table by SKU",
-                data=view_to_excel(summary_table, weekly),
+                data=view_to_excel(with_export_flags(summary_table),
+                                   with_export_flags(weekly)),
                 file_name=f"{view.replace('/', '-').replace(' ', '_')}"
                           f"_by_sku_demand_projections_{today_str}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

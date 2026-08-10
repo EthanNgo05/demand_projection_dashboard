@@ -527,7 +527,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     )
     st.download_button(
         "⬇️ Download the combined best-model table",
-        data=summary_to_excel(table),
+        data=summary_to_excel(with_export_flags(table)),
         file_name=f"Combined_best_model_demand_projections_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="dl_best_mix",

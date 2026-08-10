@@ -179,8 +179,12 @@ def test_smoothing_params_survive_model_round_trip():
 @needs_data
 def test_exceptions_view_renders():
     """Selecting the Exceptions scope renders its own (model-agnostic) view
-    without error — the routing branch and render_exceptions wiring both work,
-    including the All Exceptions / Key SKUs tabs."""
+    without error — the routing branch and render_exceptions wiring both work.
+
+    Key SKUs used to be a second tab; they are now an attribute (a blue "Key" chip
+    plus a per-table filter), so the view is a single page. Pins that: no tabs, and
+    exactly one of each control that used to be duplicated per tab.
+    """
     import dashboard
 
     at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
@@ -190,12 +194,11 @@ def test_exceptions_view_renders():
     at.session_state["scope"] = dashboard.EXCEPTIONS_VIEW
     at.run()
     assert not at.exception
-    # It draws its own subheader and both tabs.
     assert any("Exceptions" == s.value for s in at.subheader)
-    tab_labels = {t.label for t in at.tabs}
-    assert {"All Exceptions", "Key SKUs"} <= tab_labels
-    # The severity-threshold inputs live in the All Exceptions tab.
+    assert not at.tabs, "the Key SKUs / All Exceptions tabs should be gone"
+    # One Group-by control and one spikes threshold, not one per (former) tab.
     assert {ni.label for ni in at.number_input} >= {"Min % deviation", "Min revenue risk / wk"}
+    assert sum(ni.label == "Minimum container impact" for ni in at.number_input) == 1
 
 
 @needs_data

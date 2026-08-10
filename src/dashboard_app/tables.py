@@ -8,6 +8,9 @@ from dashboard_app.config import (
     MODEL_USED_COL, PRICE_COL, RISK_COL, fmt_dollar,
     KPI_HELP, KPI_TEXT_FIELDS, ONHAND_COL, TREND_COL, WOS_COL, kpi_sort,
 )
+from dashboard_app.keyskus import (
+    key_sku_mask, mark_key_sku, sku_chip_column_config,
+)
 from dashboard_app.watchlist import (
     STAR_PREFIX, active_pairs, mark_starred_sku, starred_mask,
 )
@@ -76,6 +79,9 @@ def style_summary(summary_df):
 # Only these fields are ever offered as filters — no continuous-number columns
 # (e.g. Revenue Risk) that would make a useless hundreds-long value list.
 _ADD_PLACEHOLDER = "➕ Add filter…"
+# Label of the key-SKU filter chip. Public so page-level sections can ask whether a
+# table has been narrowed to key items (see ``key_only_active``).
+KEY_FILTER_LABEL = "Key SKU"
 # Recognised week/date columns across the summary and data-quality tables.
 _DATE_COLS = ["First_WeekDate", "Last_WeekDate",
               "First Projected Week", "Last Projected Week",
@@ -90,10 +96,11 @@ def _ms_key(wkey):
 def _build_fields(df, key, P):
     """Whitelist of filterable fields for ``df``, in a fixed order.
 
-    Only SKU / Customer / Data Source / Model Used / Region / Date range /
-    Active In are ever offered, and only when the underlying column exists (and,
-    for checklists, varies). Each field is a dict describing how to read options
-    and build a mask; ``kind`` is ``checklist``, ``active_in`` or ``date``.
+    Only Starred / Key SKU / SKU / Customer / Data Source / Model Used / Region /
+    Date range / Active In are ever offered, and only when the underlying column
+    exists (and, for checklists, varies). Each field is a dict describing how to read
+    options and build a mask; ``kind`` is ``checklist``, ``active_in``, ``date``,
+    ``starred`` or ``key_sku``.
     """
     fields = []
 
@@ -113,6 +120,17 @@ def _build_fields(df, key, P):
         fields.append({
             "label": "Starred", "wkey": f"{key}::Starred",
             "kind": "starred", "values": starred,
+        })
+
+    # Key SKU filter — the toggle counterpart to the blue "Key" chip. Same shape as
+    # Starred (a live mask, no column), and offered on the same terms: only when some
+    # but not all rows are key SKUs, so it would narrow. Rolled-up Exceptions grains
+    # put "12 SKUs" in the SKU cell and so match nothing — the field drops out there.
+    key_mask = key_sku_mask(df)
+    if key_mask.any() and not key_mask.all():
+        fields.append({
+            "label": KEY_FILTER_LABEL, "wkey": f"{key}::{KEY_FILTER_LABEL}",
+            "kind": "key_sku", "values": key_mask,
         })
 
     if "SKU" in df.columns:
@@ -177,7 +195,7 @@ def _selection(field):
         if isinstance(cur, (tuple, list)) and len(cur) == 2:
             return (cur[0], cur[1])
         return None
-    if field["kind"] == "starred":
+    if field["kind"] in ("starred", "key_sku"):
         return bool(st.session_state.get(f"{wkey}__on", False))
     # checklist / active_in: the multiselect stores its picked values as a list.
     return set(st.session_state.get(_ms_key(wkey), []))
@@ -186,7 +204,7 @@ def _selection(field):
 def _field_mask(df, field, selection):
     """Boolean row mask for one field's selection (empty selection → all True)."""
     kind = field["kind"]
-    if kind == "starred":
+    if kind in ("starred", "key_sku"):
         if not selection:
             return pd.Series(True, index=df.index)
         return field["values"]
@@ -250,6 +268,28 @@ def _popover_starred(label, field):
     return bool(st.session_state.get(onkey, False))
 
 
+def _popover_key_sku(label, field):
+    """A key-SKU filter chip: one checkbox that narrows to key items.
+
+    Flipping it also forces a FULL app rerun. The chips live inside an
+    ``@st.fragment`` (render_filtered_table / render_selectable_table), so by default
+    a click reruns only that table — but page-level sections keyed off this filter
+    (the Exceptions view's on-plan and not-in-demand-data lists, via
+    ``key_only_active``) sit outside the fragment and would otherwise lag one
+    interaction behind the table they describe.
+    """
+    onkey = f"{field['wkey']}__on"
+    appliedkey = f"{field['wkey']}__applied"
+    on = bool(st.session_state.get(onkey, False))
+    with st.popover(f"{label} ✓" if on else label, use_container_width=True):
+        st.checkbox("Key items only", key=onkey)
+    on = bool(st.session_state.get(onkey, False))
+    if st.session_state.get(appliedkey) != on:
+        st.session_state[appliedkey] = on
+        st.rerun(scope="app")
+    return on
+
+
 def _add_filter(key, active_key):
     """Callback: activate the field chosen in the "Add filter" selectbox."""
     choice = st.session_state.get(f"{key}__add")
@@ -268,8 +308,9 @@ def _remove_filter(active_key, label, wkey, kind):
     ]
     if kind == "date":
         st.session_state.pop(f"{wkey}__di", None)
-    elif kind == "starred":
+    elif kind in ("starred", "key_sku"):
         st.session_state.pop(f"{wkey}__on", None)
+        st.session_state.pop(f"{wkey}__applied", None)
     else:  # checklist / active_in
         st.session_state.pop(_ms_key(wkey), None)
 
@@ -278,11 +319,11 @@ def filter_table(df, key, P=None):
     """Add-filter-chip filtering: start clean, add only the fields you want.
 
     An "Add filter" picker activates a field; each active filter shows as a row
-    — a multiselect (or a date-range / starred popover) plus a ✕ to remove it.
-    Excel semantics (OR within a field, AND across fields) with cross-filtering,
+    — a multiselect (or a date-range / starred / key-SKU popover) plus a ✕ to remove
+    it. Excel semantics (OR within a field, AND across fields) with cross-filtering,
     so the active multiselects only offer values that still yield rows. Only the
-    whitelist SKU / Customer / Data Source / Model Used / Region / Date range /
-    Active In is offered. ``key`` namespaces the widgets.
+    whitelist Starred / Key SKU / SKU / Customer / Data Source / Model Used / Region /
+    Date range / Active In is offered. ``key`` namespaces the widgets.
     """
     fields = _build_fields(df, key, P)
     if not fields:
@@ -334,7 +375,7 @@ def filter_table(df, key, P=None):
     # and keeps the value ⊆ its options (which Streamlit requires).
     reachable_by = {}
     for f in active_fields:
-        if f["kind"] in ("date", "starred"):
+        if f["kind"] in ("date", "starred", "key_sku"):
             continue
         reachable = available(f)
         reachable_by[f["label"]] = reachable
@@ -353,6 +394,8 @@ def filter_table(df, key, P=None):
                 selections[f["label"]] = _popover_daterange(f["label"], f)
             elif f["kind"] == "starred":
                 selections[f["label"]] = _popover_starred(f["label"], f)
+            elif f["kind"] == "key_sku":
+                selections[f["label"]] = _popover_key_sku(f["label"], f)
             else:
                 selections[f["label"]] = _multiselect_field(
                     f["label"], sorted(reachable_by[f["label"]], key=str), f["wkey"]
@@ -373,6 +416,18 @@ def filter_table(df, key, P=None):
     return out
 
 
+def key_only_active(*keys):
+    """True when the Key-SKU filter chip is switched on for any of ``keys``.
+
+    Lets a view render key-SKU-specific sections (the Exceptions view's on-plan and
+    not-in-demand-data lists) in step with a table's filter, rather than adding a
+    second page-level control that could disagree with the chip.
+    """
+    return any(
+        bool(st.session_state.get(f"{k}::{KEY_FILTER_LABEL}__on", False)) for k in keys
+    )
+
+
 @st.fragment
 def render_filtered_table(df, key, P=None, *, style=True, column_config=None):
     """Render the add-filter chips + the table in an isolated fragment.
@@ -384,14 +439,19 @@ def render_filtered_table(df, key, P=None, *, style=True, column_config=None):
     (the unfiltered frame) is captured as a fragment arg and reused each rerun.
     ``column_config`` is forwarded to ``st.dataframe`` so callers can pin
     per-column widths (e.g. widen a free-text column so its text isn't clipped).
-    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
-    (display only — filtering runs on the un-prefixed frame).
+    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell, and
+    key SKUs by a blue "Key" chip to its right (both display only — filtering runs on
+    the undecorated frame).
     """
     filtered = filter_table(df, key, P)
+    # ★ first: the prefix is part of the SKU string the chip config lists as an option.
     display = mark_starred_sku(filtered)
+    display, sku_values = mark_key_sku(display)
+    cfg = {**(column_config or {}),
+           **(sku_chip_column_config(sku_values) if sku_values else {})}
     st.dataframe(
         style_summary(display) if style else display,
-        width="stretch", hide_index=True, column_config=column_config,
+        width="stretch", hide_index=True, column_config=cfg or None,
     )
 
 
@@ -623,8 +683,9 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     the full frame, mapping each selected positional index back to ``filtered``.
     Wrapped in a fragment so a row click reruns only this block. ``detail_chart``,
     if given, is a ``(row, key_base)`` callback that draws a chart inside each card.
-    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell
-    (display only — filtering and the detail lookup use the un-prefixed frame).
+    Rows on the active watchlist are marked by a ``★`` prefix on their SKU cell, and
+    key SKUs by a blue "Key" chip to its right (both display only — filtering and the
+    detail lookup use the undecorated frame, so the decorated SKU never reaches either).
     ``row_action`` is forwarded to each detail card (see ``_render_row_detail``) so
     callers can add a per-row button (e.g. the watchlist's "Remove" affordance), and
     ``extra_kpis`` / ``kpi_deltas`` likewise for KPI tiles a view derives rather than
@@ -633,9 +694,12 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     filtered = filter_table(df, key, P)
     display_cols = [c for c in condensed_cols if c in filtered.columns]
     display_df = mark_starred_sku(filtered[display_cols])
+    display_df, sku_values = mark_key_sku(display_df)
+    cfg = {**(column_config or {}),
+           **(sku_chip_column_config(sku_values) if sku_values else {})}
     event = st.dataframe(
         style_summary(display_df) if style else display_df,
-        width="stretch", hide_index=True, column_config=column_config,
+        width="stretch", hide_index=True, column_config=cfg or None,
         on_select="rerun", selection_mode="multi-row", key=f"{key}__sel",
     )
     # Positional indices persist across reruns, so drop any that a filter has since

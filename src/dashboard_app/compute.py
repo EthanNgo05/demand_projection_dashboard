@@ -23,6 +23,8 @@ from dashboard_app.pipeline import (
     _supports_prices, _supports_smoothing, _supports_min_weeks, _supports_autofit,
 )
 from dashboard_app import forecast_cache
+from dashboard_app.keyskus import with_key_sku_column
+from dashboard_app.watchlist import with_watchlist_column
 
 
 def _region_frame(df, P, region):
@@ -133,6 +135,18 @@ def compute_view(df, view, today_ts, model_path, prices=None, alpha=None,
             {"view": view, "model": os.path.basename(str(model_path)), "kind": "view"},
         )
     return summary, weekly, agg
+
+
+def with_export_flags(df):
+    """Turn the tables' display-only markers into real columns, for exports.
+
+    On screen a row's SKU cell carries a ``★`` prefix (watchlist) and a blue "Key"
+    chip — decoration that cannot survive a spreadsheet. Every export therefore runs
+    through here and comes out with a plain ``SKU`` followed by the two flags it
+    encodes: ``Key SKU`` (true/false) and ``Watchlist`` (the lists the row is starred
+    on). A no-op on frames without a ``SKU`` column, so callers wrap unconditionally.
+    """
+    return with_watchlist_column(with_key_sku_column(df))
 
 
 def _format_sheet(ws, df, max_width=60, padding=2):

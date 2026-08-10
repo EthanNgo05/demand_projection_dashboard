@@ -15,7 +15,6 @@ Recent run-rate and the forward window come from the same helpers the models use
 (`_descriptive_averages`, the pipeline's `week_anchors`/`aggregate_to_sku_week`),
 so the numbers agree with what the other views show.
 """
-import os
 import re
 from functools import partial
 
@@ -25,6 +24,7 @@ import streamlit as st
 
 from dashboard_app.compute import (
     EIGHT_WK_AVG_COL, _descriptive_averages, optimal_projection_for, summary_to_excel,
+    with_export_flags,
 )
 from dashboard_app.config import (
     ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, bounded_put, fmt_dollar,
@@ -41,17 +41,16 @@ from dashboard_app.datasources import (
     compute_missing_pos_orders,
     compute_missing_projections,
     container_load_from_plytix,
-    discover_key_skus_file,
-    load_key_skus,
     _region_code,
 )
+from dashboard_app.keyskus import current_key_skus, key_sku_mask
 from dashboard_app.refresh import (
     key_skus_refresh_in_progress,
     start_key_skus_refresh,
 )
 from dashboard_app.charts import actuals_vs_plan_chart, chart_range_control
 from dashboard_app.summaries import customer_source_map
-from dashboard_app.tables import render_selectable_table
+from dashboard_app.tables import key_only_active, render_selectable_table
 
 # Display column names for the exceptions table. These deliberately reuse the
 # names style_summary already formats/colours so the table matches the other
@@ -87,16 +86,7 @@ _DISPLAY_COLS = [
     IMPACT_COL, ONHAND_COL, WOS_COL, FLAG_COL,
 ]
 
-# The Key SKUs watchlist table: the same columns as the All-Exceptions table
-# (so names stay consistent across tabs) plus a Status column for the direction,
-# minus the Flag column.
-KEY_DISPLAY_COLS = [
-    "SKU", "Description", "Customer Grouping", "Region", STATUS_COL, "Data Source",
-    RECENT_COL, TREND_COL, PROJ_COL, WEEKS_COL, PRICE_COL, IMPACT_COL, PCT_COL,
-    GAP_COL, ONHAND_COL, WOS_COL, FLAG_COL,
-]
-
-# The detail-card KPI tiles (both Exceptions tabs), decoupled from the frame's full
+# The detail-card KPI tiles, decoupled from the frame's full
 # column set above. A SET, not a sequence: config.kpi_sort orders it, so these land
 # in the same positions as on every other view's card. "Note" is peeled to a
 # full-width bottom row by the card renderer.
@@ -117,7 +107,7 @@ EXCEPTION_CARD_COLS = [
 # auto-sizes columns and the long free-text Description hogs width, squeezing
 # the trailing Note column so its text clips with no way to expand it (Streamlit
 # TextColumn can't wrap). Bounding Description and widening Note keeps both
-# readable. Reused for both the All-Exceptions and Key SKUs tables.
+# readable.
 _COLUMN_CONFIG = {
     "Description": st.column_config.TextColumn(width="medium"),
     FLAG_COL: st.column_config.TextColumn(width="medium"),
@@ -1006,10 +996,13 @@ def _download_button(table, slug, label, today_str):
     """Excel download of an exceptions table, matching the data-quality tables'
     download design. ``label`` is the button text (names which table it is);
     ``slug`` names both the file and the widget key (unique per section); the
-    full section is exported (unfiltered, like the other views)."""
+    full section is exported (unfiltered, like the other views).
+
+    The on-screen blue "Key" chip is display-only, so the workbook gets a real
+    ``Key SKU`` true/false column beside the SKU instead."""
     st.download_button(
         f"⬇️ Download {label}",
-        data=summary_to_excel(table, sheet_name=slug[:31]),
+        data=summary_to_excel(with_export_flags(table), sheet_name=slug[:31]),
         file_name=f"{slug}_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"dl_{slug}",
@@ -1020,7 +1013,7 @@ def _section(frame, direction, key, P, today_str, slug, label, cols=None,
              empty_msg=None, chart_cb=None, condensed_cols=None, column_config=None,
              title_col="SKU"):
     """Render one direction's ranked, filterable table (worst first). ``cols``
-    selects the full column set (All-Exceptions vs Key SKUs); ``empty_msg`` overrides
+    selects the full column set; ``empty_msg`` overrides
     the placeholder caption when the section has no rows; ``slug``/``label`` name
     the download file and button; ``chart_cb`` draws the per-row detail chart.
     ``condensed_cols``/``column_config``/``title_col`` adapt the on-screen row to the
@@ -1043,9 +1036,9 @@ def _section(frame, direction, key, P, today_str, slug, label, cols=None,
     _download_button(sub[cols], slug, label, today_str)
 
 
-# Distinct container-impact thresholds held at once (the two tabs have their own
-# widget, and a planner nudging the stepper walks through values). Each entry is
-# one spikes frame — a few thousand rows — so a small cap keeps memory flat.
+# Distinct container-impact thresholds held at once (a planner nudging the stepper
+# walks through values). Each entry is one spikes frame — a few thousand rows — so a
+# small cap keeps memory flat.
 SPIKE_CACHE_MAX = 6
 
 
@@ -1053,20 +1046,16 @@ def _spikes_cached(agg, today_ts, prices, P, sku_active_in, container_load,
                    onhand_by_sku, min_container_impact):
     """``compute_spikes`` memoised per (structural signature, threshold).
 
-    Streamlit executes the body of EVERY ``st.tabs`` branch on every rerun, and
-    both Exceptions tabs render the spikes table — so an ungated call meant two
-    full scans (~8s each on the live snapshot) for every widget interaction, even
-    a threshold nudge that changes nothing about the scan.
-
-    The tabs differ only in the key-SKU filter and the group-by rollup, and both
-    are applied to the RESULT of the scan (see ``_render_spikes_section``), so one
-    shared frame is exactly equivalent to computing it per tab.
+    The scan takes ~8s on the live snapshot, so an ungated call would repeat it for
+    every widget interaction on the page — even a threshold nudge that changes
+    nothing about the scan itself (the group-by rollup is applied to the RESULT, see
+    ``_render_spikes_section``).
 
     Keyed on ``exceptions_structural`` — the same signature guarding the
     exceptions frame, which already covers today / prices / data / warehouse /
     allocation and now on-hand — plus the threshold, which is the only other live
     input ``compute_spikes`` reads. Cached per threshold rather than as a single
-    slot so two tabs sitting at different thresholds don't thrash the cache.
+    slot so stepping the threshold up and back doesn't rescan.
     """
     store = st.session_state.setdefault("exceptions_spikes", {})
     sig = st.session_state.get("exceptions_structural")
@@ -1082,25 +1071,23 @@ def _spikes_cached(agg, today_ts, prices, P, sku_active_in, container_load,
             min_container_impact=min_container_impact,
         )
         bounded_put(store, key, frame, SPIKE_CACHE_MAX)
-    # Hand out a copy, so the two tabs keep the independent frames they had when
-    # each called compute_spikes itself. aggregate_spikes returns its input
-    # unchanged at the default grain, so without this both tabs would share one
-    # object and any future in-place edit in one would leak into the other.
+    # Hand out a copy rather than the cached object: aggregate_spikes returns its
+    # input unchanged at the default grain, so a future in-place edit downstream
+    # would otherwise corrupt the cache entry every later rerun reads.
     return store[key].copy()
 
 
 def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
-                           key_skus=None, key_suffix="", chart_cb=None,
+                           chart_cb=None,
                            container_load=None, onhand_by_sku=None,
                            group_by=GROUP_DETAIL, anchors=None):
-    """The "Recent spikes in POS/Orders with no projections" table for one tab.
+    """The "Recent spikes in POS/Orders with no projections" table.
 
     Flags SKUs we project 0 for that have started selling in the last 8 weeks, with
     the onset week and the SKU-level Container Impact / WOS. A "Minimum container
-    impact" threshold (keyed by ``key_suffix`` so the two tabs' widgets stay
-    independent) focuses the table on the largest unplanned demand. ``key_skus`` (or
-    None) restricts the table to the watchlist. ``container_load``/``onhand_by_sku``
-    drive the SKU-level Container Impact / WOS columns."""
+    impact" threshold focuses the table on the largest unplanned demand.
+    ``container_load``/``onhand_by_sku`` drive the SKU-level Container Impact / WOS
+    columns."""
     st.markdown("#### Recent spikes in POS/Orders with no projections")
     st.caption(
         "SKUs we currently project **0** for that have **started selling** in the "
@@ -1121,7 +1108,7 @@ def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
     c1, _ = st.columns([1, 3])
     min_container_impact = c1.number_input(
         "Minimum container impact", min_value=0.0, max_value=100_000.0, value=0.2,
-        step=0.5, key=f"spike_ci{key_suffix}",
+        step=0.5, key="spike_ci",
         help="Hide SKUs whose total unplanned demand is below this many containers "
              "(units sold since the spike ÷ Container Load). SKUs without a Container "
              "Load are always shown.",
@@ -1129,8 +1116,6 @@ def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
 
     frame = _spikes_cached(agg, today_ts, prices, P, sku_active_in,
                            container_load, onhand_by_sku, min_container_impact)
-    if key_skus is not None:
-        frame = frame[frame["SKU"].isin(key_skus)]
     if frame.empty:
         st.caption("No SKUs projected 0 with a recent spike at the current minimum "
                    "container impact.")
@@ -1148,23 +1133,28 @@ def _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
     # the optimized projection; they're excluded from the shown/condensed sets.
     show_cols = SPIKE_DISPLAY_COLS + [PROJ_COL, PRICE_COL]
     render_selectable_table(
-        frame[show_cols], f"exc_spikes{key_suffix}", P,
+        frame[show_cols], "exc_spikes", P,
         condensed_cols=condensed, style=True,
         column_config=col_cfg,
         detail_chart=section_chart, detail_cols=SPIKE_CARD_COLS,
         title_col=title_col,
     )
-    _download_button(frame[SPIKE_DISPLAY_COLS], f"spikes_no_projection{key_suffix}",
+    _download_button(frame[SPIKE_DISPLAY_COLS], "spikes_no_projection",
                      "Recent Spikes table", today_str)
 
 
-def _render_all_exceptions_tab(frame, P, today_str, chart_cb=None,
-                               agg=None, prices=None, sku_active_in=None, today_ts=None,
-                               container_load=None, onhand_by_sku=None, anchors=None):
-    """The All-Exceptions tab: a Group-by selector, severity thresholds, and
-    Under/Over sections over the diverging rows (on-plan rows are excluded here)."""
+def _render_exceptions_body(frame, P, today_str, chart_cb=None,
+                            agg=None, prices=None, sku_active_in=None, today_ts=None,
+                            container_load=None, onhand_by_sku=None, anchors=None):
+    """The exceptions tables: a Group-by selector, severity thresholds, and
+    Under/Over/Spikes sections over the diverging rows (on-plan rows are excluded).
+
+    Key SKUs are not a separate view — they carry a blue "Key" chip beside the SKU
+    and each table's ``Key SKU`` filter chip narrows to them. Thresholds apply
+    uniformly; to get the old threshold-free key watchlist, switch the Key SKU
+    filter on and set Min % deviation to 0."""
     group_by = st.segmented_control(
-        "Group by", GROUP_BY_OPTIONS, default=GROUP_DETAIL, key="grp_all",
+        "Group by", GROUP_BY_OPTIONS, default=GROUP_DETAIL, key="grp_exc",
         help="Roll every table up to one row per Customer, SKU, or Region "
              "(summing the metrics), or keep the SKU × Customer detail.",
     ) or GROUP_DETAIL
@@ -1176,55 +1166,115 @@ def _render_all_exceptions_tab(frame, P, today_str, chart_cb=None,
     # group's net gap nets its under- and over-projected SKUs.
     agg_frame = aggregate_exceptions(frame, group_by)
     diverging = agg_frame[agg_frame[DIRECTION_COL] != ON_PLAN]
+
     if diverging.empty:
         st.info("No exceptions found — every SKU's recent sell-through tracks its projection.")
-        return
+    else:
+        # Severity thresholds (both filters; defaults hide sub-50% moves, $ off).
+        c1, c2, _ = st.columns([1, 1, 2])
+        min_pct = c1.number_input(
+            "Min % deviation", min_value=0, max_value=1000, value=50, step=10,
+            help="Hide rows whose recent run-rate is within this % of the projection. "
+                 "Set to 0 with the Key SKU filter on for a threshold-free key watchlist.",
+        ) / 100.0
+        min_dollar = c2.number_input(
+            "Min revenue risk / wk", min_value=0, max_value=1_000_000, value=0, step=100,
+            help="Hide rows whose weekly revenue risk is below this (0 = off). "
+                 "Rows with no list price are always kept.",
+        )
 
-    # Severity thresholds (both filters; defaults hide sub-50% moves, $ off).
-    c1, c2, _ = st.columns([1, 1, 2])
-    min_pct = c1.number_input(
-        "Min % deviation", min_value=0, max_value=1000, value=50, step=10,
-        help="Hide rows whose recent run-rate is within this % of the projection.",
-    ) / 100.0
-    min_dollar = c2.number_input(
-        "Min revenue risk / wk", min_value=0, max_value=1_000_000, value=0, step=100,
-        help="Hide rows whose weekly revenue risk is below this (0 = off). "
-             "Rows with no list price are always kept.",
-    )
+        flagged = _apply_thresholds(diverging, min_pct, min_dollar)
+        st.caption(
+            f"{len(flagged):,} rows flagged of {len(agg_frame):,} scanned "
+            f"(≥{int(min_pct * 100)}% deviation"
+            + (f" and ≥${min_dollar:,}/wk revenue risk" if min_dollar else "") + ")."
+        )
 
-    flagged = _apply_thresholds(diverging, min_pct, min_dollar)
-    st.caption(
-        f"{len(flagged):,} rows flagged of {len(agg_frame):,} scanned "
-        f"(≥{int(min_pct * 100)}% deviation"
-        + (f" and ≥${min_dollar:,}/wk revenue risk" if min_dollar else "") + ")."
-    )
+        if flagged.empty:
+            st.info("No exceptions at the current thresholds — try lowering them.")
+        else:
+            _section(flagged, UNDER, "exc_under", P, today_str,
+                     slug="exceptions_under-projected",
+                     label="Understocked Exceptions table", chart_cb=section_chart,
+                     condensed_cols=condensed, column_config=col_cfg, title_col=title_col)
+            st.divider()
+            _section(flagged, OVER, "exc_over", P, today_str,
+                     slug="exceptions_over-projected",
+                     label="Overstocked Exceptions table", chart_cb=section_chart,
+                     condensed_cols=condensed, column_config=col_cfg, title_col=title_col)
+        st.divider()
 
-    if flagged.empty:
-        st.info("No exceptions at the current thresholds — try lowering them.")
-        return
-
-    _section(flagged, UNDER, "exc_under", P, today_str,
-             slug="exceptions_under-projected",
-             label="Understocked Exceptions table", chart_cb=section_chart,
-             condensed_cols=condensed, column_config=col_cfg, title_col=title_col)
-    st.divider()
-    _section(flagged, OVER, "exc_over", P, today_str,
-             slug="exceptions_over-projected",
-             label="Overstocked Exceptions table", chart_cb=section_chart,
-             condensed_cols=condensed, column_config=col_cfg, title_col=title_col)
-    st.divider()
+    # The spikes table and the key-only sections render regardless of the thresholds
+    # above: neither is threshold-filtered, and a planner who has narrowed the
+    # Under/Over tables to nothing still needs them.
     _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
-                           key_skus=None, key_suffix="_all", chart_cb=chart_cb,
+                           chart_cb=chart_cb,
                            container_load=container_load, onhand_by_sku=onhand_by_sku,
                            group_by=group_by, anchors=anchors)
+    _render_key_only_sections(agg_frame, P, today_str, group_by, chart_cb=section_chart,
+                              condensed=condensed, col_cfg=col_cfg, title_col=title_col)
+
+
+def _render_key_only_sections(agg_frame, P, today_str, group_by, chart_cb=None,
+                              condensed=None, col_cfg=None, title_col="SKU"):
+    """Key-SKU accountability, shown only while the Key SKU filter chip is on.
+
+    The Under/Over tables above cover diverging rows; these two sections account for
+    the rest of the key-SKU list, so a planner filtering to key items still sees
+    every one of them:
+
+    - **On-plan key SKUs** — key rows tracking their projection, which the
+      direction split excludes from both tables.
+    - **Key SKUs not in current demand data** — on the list, absent from the snapshot.
+
+    Gated on the Under/Over tables' filter chips rather than a control of their own,
+    so there is a single Key-SKU switch on the page and it cannot disagree with the
+    tables it describes (``_popover_key_sku`` forces a full rerun so this keeps step).
+    """
+    # Only the SKU-grained views can answer "which key SKUs?". Rolling up by Customer
+    # or Region replaces the SKU cell with a count label ("12 SKUs"), so every key SKU
+    # would read as absent and the not-found list would be the entire key-SKU list.
+    if group_by not in (GROUP_DETAIL, GROUP_SKU):
+        return
+    if not key_only_active("exc_under", "exc_over"):
+        return
+    key_skus = current_key_skus()
+    if not key_skus:
+        return
+
+    key_frame = agg_frame[key_sku_mask(agg_frame, key_skus)]
+    present = set(key_frame["SKU"])
+    missing = sorted(key_skus - present)
+    st.divider()
+    st.caption(
+        f"Key SKU filter on: {len(present):,} of {len(key_skus):,} key SKUs are in the "
+        f"current demand data" + (f" ({len(missing):,} not found)" if missing else "") + "."
+    )
+
+    on_plan = key_frame[key_frame[DIRECTION_COL] == ON_PLAN].sort_values(
+        "_sort", ascending=False
+    )
+    if not on_plan.empty:
+        with st.expander(f"On-plan key SKUs ({len(on_plan):,})"):
+            render_selectable_table(on_plan[_DISPLAY_COLS], "exc_key_onplan", P,
+                                    condensed_cols=condensed,
+                                    style=True, column_config=col_cfg,
+                                    detail_chart=chart_cb, detail_cols=EXCEPTION_CARD_COLS,
+                                    title_col=title_col)
+            _download_button(on_plan[_DISPLAY_COLS], "key_skus_on-plan",
+                             "On-plan Key SKUs table", today_str)
+
+    if missing:
+        with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):
+            st.markdown("\n".join(f"- {s}" for s in missing))
 
 
 def _render_key_skus_fetch_prompt():
-    """Empty-state prompt for the Key SKUs tab: a button that pulls the key-SKU
-    list from the data warehouse in the background (extract_key_skus.py), so
-    planners never have to run a terminal command. Mirrors the demand refresh
-    button's running/idle states — once the pull's file lands, the tab
-    re-discovers it and renders the watchlist on the next run."""
+    """Notice shown when no key-SKU list has been extracted yet: a button that pulls
+    it from the data warehouse in the background (extract_key_skus.py), so planners
+    never have to run a terminal command. Mirrors the demand refresh button's
+    running/idle states — once the pull's file lands, the view re-discovers it and
+    the "Key" chips and Key SKU filter appear on the next run."""
     running, started = key_skus_refresh_in_progress()
     if running:
         st.info(
@@ -1248,115 +1298,35 @@ def _render_key_skus_fetch_prompt():
             st.warning(msg)
 
 
-def _render_key_skus_tab(frame, P, today_str, chart_cb=None,
-                         agg=None, prices=None, sku_active_in=None, today_ts=None,
-                         container_load=None, onhand_by_sku=None, anchors=None):
-    """The Key SKUs watchlist tab: every key SKU (from extract_key_skus.py) with
-    its status, no threshold filtering — a always-on watchlist of important items."""
-    path = discover_key_skus_file()
-    if not path:
-        _render_key_skus_fetch_prompt()
-        return
-    key_skus = load_key_skus(path, os.path.getmtime(path))
-    if not key_skus:
-        st.info("The key-SKU list is empty.")
-        return
-
-    key_frame = frame[frame["SKU"].isin(key_skus)].copy()
-    present = set(key_frame["SKU"])
-    missing = sorted(key_skus - present)
-    st.caption(
-        f"Showing all {len(present):,} of {len(key_skus):,} key SKUs present in the "
-        f"current demand data"
-        + (f" ({len(missing):,} not found)" if missing else "") + "."
-    )
-    if key_frame.empty:
-        st.info("None of the key SKUs appear in the current demand data.")
-        return
-
-    group_by = st.segmented_control(
-        "Group by", GROUP_BY_OPTIONS, default=GROUP_DETAIL, key="grp_key",
-        help="Roll every table up to one row per Customer, SKU, or Region "
-             "(summing the metrics), or keep the SKU × Customer detail.",
-    ) or GROUP_DETAIL
-    condensed, col_cfg, title_col = _exc_cols_for(group_by)
-    section_chart = chart_cb if group_by == GROUP_DETAIL else \
-        partial(_render_aggregate_chart, agg, anchors, P, group_by)
-    # Status is set centrally in compute_exceptions; roll the key-SKU frame up to
-    # the chosen grain (identity for the default) before splitting by direction.
-    key_frame = aggregate_exceptions(key_frame, group_by)
-
-    # Split into the two planning actions, same layout as the All-Exceptions tab.
-    _section(key_frame, UNDER, "exc_key_under", P, today_str,
-             slug="key_skus_under-projected", label="Understocked Key SKUs table",
-             cols=KEY_DISPLAY_COLS, empty_msg="No under-projected key SKUs.",
-             chart_cb=section_chart, condensed_cols=condensed, column_config=col_cfg,
-             title_col=title_col)
-    st.divider()
-    _section(key_frame, OVER, "exc_key_over", P, today_str,
-             slug="key_skus_over-projected", label="Overstocked Key SKUs table",
-             cols=KEY_DISPLAY_COLS, empty_msg="No over-projected key SKUs.",
-             chart_cb=section_chart, condensed_cols=condensed, column_config=col_cfg,
-             title_col=title_col)
-
-    # On-plan key SKUs belong to neither table; keep them in a collapsed section
-    # so the watchlist still accounts for every key SKU.
-    on_plan = key_frame[key_frame[DIRECTION_COL] == ON_PLAN].sort_values(
-        "_sort", ascending=False
-    )
-    if not on_plan.empty:
-        with st.expander(f"On-plan key SKUs ({len(on_plan):,})"):
-            render_selectable_table(on_plan[KEY_DISPLAY_COLS], "exc_key_onplan", P,
-                                    condensed_cols=condensed,
-                                    style=True, column_config=col_cfg,
-                                    detail_chart=section_chart, detail_cols=EXCEPTION_CARD_COLS,
-                                    title_col=title_col)
-            _download_button(on_plan[KEY_DISPLAY_COLS], "key_skus_on-plan",
-                             "On-plan Key SKUs table", today_str)
-
-    if missing:
-        with st.expander(f"Key SKUs not in current demand data ({len(missing)})"):
-            st.markdown("\n".join(f"- {s}" for s in missing))
-
-    st.divider()
-    _render_spikes_section(agg, prices, sku_active_in, today_ts, P, today_str,
-                           key_skus=key_skus, key_suffix="_key", chart_cb=chart_cb,
-                           container_load=container_load, onhand_by_sku=onhand_by_sku,
-                           group_by=group_by, anchors=anchors)
-
-
 def _render_data_quality_expanders(
     *, view, region, today_str, P,
     warehouse_df, check_ran, inactive_df, excluded_counts_by_key, n_excluded_rows,
     disc_check_ran, discontinued_df, missing_df, missing_pos_df, cust_source,
-    key_skus, key_suffix,
 ):
-    """Render the four data-quality sections, each in a collapsed expander, for one
-    Exceptions tab. ``key_skus`` (or None) filters every section to key SKUs;
-    ``key_suffix`` keeps each tab's widget keys unique. The section renderers draw
-    their own titles inside via ``show_header=False`` being unset — here we suppress
-    the ``###`` header since the expander label carries the title."""
+    """Render the four data-quality sections, each in a collapsed expander.
+
+    Each section's own Key SKU filter chip narrows it to key items, so no key-SKU
+    argument is threaded in here. The section renderers draw their own titles inside
+    via ``show_header=False`` being unset — here we suppress the ``###`` header since
+    the expander label carries the title."""
     with st.expander("SKUs with forecasts in locations they are not active in"):
         render_inactive_section(
             view, region, check_ran, inactive_df,
-            excluded_counts_by_key, n_excluded_rows, today_str,
-            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+            excluded_counts_by_key, n_excluded_rows, today_str, show_header=False,
         )
     with st.expander("SKUs missing forecasts in locations they are active in"):
         render_missing_section(
             view, region, warehouse_df, check_ran, missing_df, today_str,
-            cust_source, P,
-            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+            cust_source, P, show_header=False,
         )
     with st.expander("SKUs missing POS/Orders data in locations they are active in"):
         render_missing_pos_section(
-            view, region, missing_pos_df, today_str,
-            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+            view, region, missing_pos_df, today_str, show_header=False,
         )
     with st.expander("Inactive/discontinued SKUs with forecasts"):
         render_discontinued_section(
             view, region, disc_check_ran, discontinued_df, today_str,
-            key_skus=key_skus, key_suffix=key_suffix, show_header=False,
+            show_header=False,
         )
 
 
@@ -1371,8 +1341,8 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     drawn by main(), so we start at the subheader.
 
     The keyword-only args carry the inputs for the four data-quality sections
-    (moved here from Quick Projections): they render below each tab's Under/Over
-    tables — all rows in All Exceptions, key SKUs only in the Key SKUs tab."""
+    (moved here from Quick Projections): they render once, below the Under/Over
+    tables."""
     st.subheader("Exceptions")
     st.caption(
         "SKUs where recent sales no longer match the plan. We compare each SKU's "
@@ -1452,9 +1422,12 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
         missing_df=missing_df, missing_pos_df=missing_pos_df, cust_source=cust_source,
     )
 
-    # Key SKUs to filter the Key-SKUs-tab sections by (None → sections skipped).
-    path = discover_key_skus_file()
-    key_skus = load_key_skus(path, os.path.getmtime(path)) if path else None
+    # Without a key-SKU list there are no chips and no Key SKU filter anywhere in the
+    # dashboard, which reads as "nothing is a key SKU" rather than "the list is
+    # missing" — so say so here, where the fetch button lives. Everything below still
+    # renders; this is a notice, not an empty state.
+    if not current_key_skus():
+        _render_key_skus_fetch_prompt()
 
     # Per-row detail-card chart + "Calculate Optimal Projection". Binds the stashed
     # per-SKU-week frame, anchors, and the cleaned df / prices / today (needed for the
@@ -1465,13 +1438,6 @@ def render_exceptions(df, today_ts, today_str, prices, n_excluded_rows, anchors,
     spike_kw = dict(agg=agg, prices=prices, sku_active_in=sku_active_in, today_ts=today_ts,
                     container_load=container_load, onhand_by_sku=onhand_by_sku,
                     anchors=anchors)
-    tab_key, tab_all = st.tabs(["Key SKUs", "All Exceptions"])
-    with tab_key:
-        _render_key_skus_tab(frame, P, today_str, chart_cb=chart_cb, **spike_kw)
-        if key_skus:
-            st.divider()
-            _render_data_quality_expanders(**dq_common, key_skus=key_skus, key_suffix="_key")
-    with tab_all:
-        _render_all_exceptions_tab(frame, P, today_str, chart_cb=chart_cb, **spike_kw)
-        st.divider()
-        _render_data_quality_expanders(**dq_common, key_skus=None, key_suffix="_all")
+    _render_exceptions_body(frame, P, today_str, chart_cb=chart_cb, **spike_kw)
+    st.divider()
+    _render_data_quality_expanders(**dq_common)
