@@ -57,6 +57,7 @@ from datetime import date
 # ``from agent import data_io``).
 from extract_demand_details import (  # noqa: E402
     KEEP_SNAPSHOTS,
+    LOG_FORMAT,
     REPO_ROOT,
     connect,
     ping,
@@ -240,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
+        format=LOG_FORMAT,
     )
 
     try:

@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import time
+import socket
 import logging
 import subprocess
 
@@ -61,12 +62,95 @@ def _child_env(**overrides):
 # task from overlapping into two concurrent 10-minute queries.
 EXTRACT_SCRIPT = os.path.join(HERE, "extract_demand_details.py")
 
+# Live child handles keyed by lock path, so this session can tell a pull that
+# died instantly (a bad connection string fails in ~2s) from one still running,
+# instead of waiting out the stale timeout. Sessions that don't hold a handle
+# fall back to reading the pull's log — see _refresh_state.
+_CHILDREN = {}
 
-def _refresh_log_path():
-    """Today's refresh log: ``logs/<date>/logs_refresh.txt``. Computed per call
+
+# One log file PER PULL. The demand, warehouse and key-SKU children are launched
+# within the same second and each inherits its own append handle; pointing all
+# three at a single logs_refresh.txt made their output interleave and clobber
+# each other mid-line — during the 2026-08 outage the "Connecting:" line was cut
+# off mid-token and two of the three children's output vanished entirely, which
+# is a large part of why a hard connection failure went undiagnosed for six days.
+# The repo also lives on a network path shared by more than one host, so several
+# writers are the norm, not the exception.
+DEMAND_LOG = "logs_refresh_demand.txt"
+WAREHOUSE_LOG = "logs_refresh_warehouse.txt"
+KEY_SKUS_LOG = "logs_refresh_key_skus.txt"
+
+
+def _refresh_log_path(filename=DEMAND_LOG):
+    """Today's log for one pull: ``logs/<date>/<filename>``. Computed per call
     (not at import) so a long-running dashboard files each refresh under the day
     it ran, and shares the exact file the scheduled task writes."""
-    return dated_log_path("logs_refresh.txt")
+    return dated_log_path(filename)
+
+
+# Lines that mean the pull failed. The extracts log "Database error: (...)" for
+# any pyodbc failure and "ERROR" for config problems; a traceback covers the
+# crashes neither path catches.
+_ERROR_LINE_RE = re.compile(r"ERROR|Traceback \(most recent call last\)")
+# Header written by _launch_refresh before each run, used to scope the error
+# scan to the CURRENT run rather than an earlier one in the same day's file.
+_RUN_HEADER_PREFIX = "====="
+
+
+def _last_error_line(log_name):
+    """The last error line from this pull's CURRENT run, or None.
+
+    Only lines after the newest run header are considered, so an earlier failure
+    in the same day's file can't be misreported as the running pull's outcome.
+    Best-effort: any read problem simply yields None.
+    """
+    try:
+        with open(_refresh_log_path(log_name), encoding="utf-8",
+                  errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip().startswith(_RUN_HEADER_PREFIX):
+            lines = lines[i + 1:]
+            break
+
+    hits = [ln.strip() for ln in lines if _ERROR_LINE_RE.search(ln)]
+    return hits[-1][:500] if hits else None
+
+
+def _failure_path(lock_path):
+    """Sibling of the lock recording the last failed pull.
+
+    Persisted next to the lock (not in session_state) so the error survives a
+    browser reload, reaches a second browser session, and is visible from the
+    other host that shares this folder. Not matched by any snapshot glob.
+    """
+    return lock_path + ".failed"
+
+
+def _record_failure(lock_path, label, log_name, reason):
+    """Log the failure and persist it for the UI banner.
+
+    Before this, a failed pull was indistinguishable from an idle one: the lock
+    was cleared, the button re-enabled, and nothing was written anywhere the
+    user would look. Six days of failed syncs went unnoticed that way.
+    """
+    detail = _last_error_line(log_name) or reason
+    logger.error("%s failed on host %s: %s", label, socket.gethostname(), detail)
+    try:
+        with open(_failure_path(lock_path), "w", encoding="utf-8") as f:
+            f.write("\t".join([
+                pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                socket.gethostname(),
+                detail,
+            ]))
+    except OSError:  # never let a diagnostics write break the pull's state
+        pass
+
+
 # A pull older than this with no new file is treated as crashed, so the button
 # re-enables instead of wedging the UI forever. Comfortably above the ~10-minute
 # typical runtime and the extract's own 900s SQL_QUERY_TIMEOUT default.
@@ -91,15 +175,19 @@ def _clear_lock(lock_path):
         pass
 
 
-def _refresh_state(lock_path, completed_since, label,
+def _refresh_state(lock_path, completed_since, label, log_name=DEMAND_LOG,
                    stale_seconds=REFRESH_STALE_SECONDS):
     """Shared lock state-machine: (running, started_str) for a background pull.
 
     Self-healing, so no process has to clean up after itself:
       * ``completed_since(lock_mtime)`` says whether the pull's output has
-        landed since the lock appeared — if so, clear the lock and report idle.
-      * If the lock is older than ``stale_seconds`` with no output, the
-        pull crashed/was killed — clear the lock so the button re-enables.
+        landed since the lock appeared — if so, clear the lock, clear any
+        recorded failure, and report idle.
+      * If the child we launched has exited without producing output, or its log
+        shows an error, the pull FAILED: record it (so the UI can say so) and
+        clear the lock.
+      * If the lock is older than ``stale_seconds`` with no output, the pull
+        crashed or was killed — record that too and clear the lock.
 
     What "output has landed" means differs per pull (the demand snapshot is one
     atomic workbook; a warehouse snapshot is a five-file set), which is exactly
@@ -113,11 +201,43 @@ def _refresh_state(lock_path, completed_since, label,
 
     if completed_since(lock_mtime):
         _clear_lock(lock_path)
+        _clear_lock(_failure_path(lock_path))  # a good run clears the banner
+        return False, None
+
+    # Same-session: we still hold the child's handle, so a fast failure (the
+    # IM002 connection error died in ~2 seconds) is reported immediately instead
+    # of leaving the UI on "syncing…" until the 30-minute stale timeout.
+    proc = _CHILDREN.get(lock_path)
+    if proc is not None and proc.poll() is not None:
+        _CHILDREN.pop(lock_path, None)
+        # Only a NON-ZERO exit is a definite failure. A clean exit whose output
+        # isn't visible yet is normal on this network share (mtime lag), so let
+        # the completion check pick it up on the next render rather than
+        # flagging a successful pull as broken.
+        if proc.returncode:
+            _record_failure(
+                lock_path, label, log_name,
+                f"exited with code {proc.returncode} without writing new data",
+            )
+            _clear_lock(lock_path)
+            return False, None
+
+    # Cross-session / cross-host: no handle here (browser reload, second viewer,
+    # or the pull was started by the other machine), so fall back to the pull's
+    # own log for this run.
+    error = _last_error_line(log_name)
+    if error:
+        _record_failure(lock_path, label, log_name, error)
+        _clear_lock(lock_path)
         return False, None
 
     if time.time() - lock_mtime > stale_seconds:
         logger.warning("%s refresh lock is stale (>%ds); clearing it.",
                        label, stale_seconds)
+        _record_failure(
+            lock_path, label, log_name,
+            f"produced no new data within {stale_seconds // 60} minutes",
+        )
         _clear_lock(lock_path)
         return False, None
 
@@ -141,7 +261,7 @@ def refresh_in_progress():
             os.path.getmtime(p) for _, p in files
         ) >= lock_mtime
 
-    return _refresh_state(_refresh_lock_path(), _completed, "DW")
+    return _refresh_state(_refresh_lock_path(), _completed, "DW", DEMAND_LOG)
 
 
 def start_refresh(incremental: bool = True):
@@ -171,10 +291,12 @@ def start_refresh(incremental: bool = True):
         ["--incremental"] if incremental else [],
         {"DEMAND_RAW_DIR": raw_dir},
         f"DW refresh ({mode})",
+        DEMAND_LOG,
     )
 
 
-def _launch_refresh(lock_path, script, extra_args, env_overrides, header):
+def _launch_refresh(lock_path, script, extra_args, env_overrides, header,
+                    log_name=DEMAND_LOG):
     """Write ``lock_path``, then launch ``script`` detached. Returns (ok, msg).
 
     The lock is written BEFORE launching so a double-click can't spawn two
@@ -182,22 +304,29 @@ def _launch_refresh(lock_path, script, extra_args, env_overrides, header):
     the same venv the dashboard was started with and inherits the environment
     (the SQL_* connection vars) plus ``env_overrides`` (the raw-dir pin, so the
     child writes exactly where the dashboard looks, regardless of CWD). Output
-    is appended to logs/<date>/logs_refresh.txt for diagnosis.
+    is appended to this pull's own logs/<date>/<log_name> for diagnosis, and the
+    handle is kept in ``_CHILDREN`` so ``_refresh_state`` notices a fast failure
+    without waiting for the stale timeout.
     """
     now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(lock_path, "w", encoding="utf-8") as f:
         f.write(now)
+    # A new attempt supersedes the previous outcome, so drop the stale banner.
+    _clear_lock(_failure_path(lock_path))
 
     try:
         env = _child_env(**env_overrides)
         # Run hidden on Windows so the pull outlives this Streamlit run/rerun
         # without flashing a console window (see _bg_creationflags).
         creationflags = _bg_creationflags()
-        logf = open(_refresh_log_path(), "a", encoding="utf-8")
+        logf = open(_refresh_log_path(log_name), "a", encoding="utf-8")
         try:
-            logf.write(f"\n===== {header} started {now} =====\n")
+            logf.write(
+                f"\n===== {header} started {now} "
+                f"on {socket.gethostname()} =====\n"
+            )
             logf.flush()
-            subprocess.Popen(
+            _CHILDREN[lock_path] = subprocess.Popen(
                 [sys.executable, script] + extra_args,
                 cwd=HERE,
                 env=env,
@@ -216,8 +345,47 @@ def _launch_refresh(lock_path, script, extra_args, env_overrides, header):
         logger.exception("Failed to launch %s", header)
         return False, f"Could not start refresh: {exc}"
 
-    logger.info("%s launched (%s)", header, now)
+    logger.info("%s launched (%s) on host %s", header, now, socket.gethostname())
     return True, now
+
+
+# --------------------------------------------------------------------------- #
+# Failure reporting                                                           #
+# --------------------------------------------------------------------------- #
+def _read_failure(lock_path):
+    """``(when, host, detail)`` for a pull's last failure, or None."""
+    try:
+        with open(_failure_path(lock_path), encoding="utf-8") as f:
+            when, host, detail = f.read().split("\t", 2)
+    except (OSError, ValueError):
+        return None
+    return when, host, detail
+
+
+def sync_failures():
+    """``[(label, when, host, detail)]`` for every pull whose last run failed.
+
+    Drives the dashboard's error banner. Persisted on disk beside each lock, so
+    it survives a rerun and is visible to every session and both hosts.
+    """
+    pulls = (
+        ("Demand snapshot", _refresh_lock_path()),
+        ("Warehouse projections", _wh_refresh_lock_path()),
+        ("Key-SKU list", _key_skus_lock_path()),
+    )
+    out = []
+    for label, lock_path in pulls:
+        record = _read_failure(lock_path)
+        if record:
+            out.append((label, *record))
+    return out
+
+
+def clear_sync_failures():
+    """Dismiss the recorded failures (the banner's "Dismiss" button)."""
+    for lock_path in (_refresh_lock_path(), _wh_refresh_lock_path(),
+                      _key_skus_lock_path()):
+        _clear_lock(_failure_path(lock_path))
 
 
 # --------------------------------------------------------------------------- #
@@ -255,7 +423,8 @@ def _wh_snapshot_complete_since(lock_mtime):
 def warehouse_refresh_in_progress():
     """(running, started_str): is a background warehouse pull active."""
     return _refresh_state(
-        _wh_refresh_lock_path(), _wh_snapshot_complete_since, "Warehouse"
+        _wh_refresh_lock_path(), _wh_snapshot_complete_since, "Warehouse",
+        WAREHOUSE_LOG,
     )
 
 
@@ -273,6 +442,7 @@ def start_warehouse_refresh():
         [],
         {"WAREHOUSE_RAW_DIR": wh_dir},
         "Warehouse refresh",
+        WAREHOUSE_LOG,
     )
 
 
@@ -311,6 +481,7 @@ def key_skus_refresh_in_progress():
         return bool(path) and os.path.getmtime(path) >= lock_mtime
 
     return _refresh_state(_key_skus_lock_path(), _completed, "Key SKUs",
+                          KEY_SKUS_LOG,
                           stale_seconds=KEY_SKUS_STALE_SECONDS)
 
 
@@ -332,6 +503,7 @@ def start_key_skus_refresh():
         [],
         {},
         "Key-SKU refresh",
+        KEY_SKUS_LOG,
     )
 
 

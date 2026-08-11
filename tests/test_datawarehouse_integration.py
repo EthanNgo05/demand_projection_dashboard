@@ -160,10 +160,21 @@ def dash(monkeypatch, tmp_path):
     # modules that actually define/consume them (the dashboard facade only
     # re-exports copies, which the refresh code no longer reads).
     from dashboard_app import datasources as _ds, refresh as _rf
+    from agent import data_io
     monkeypatch.setattr(_ds, "_raw_dir", lambda: folder)
     monkeypatch.setattr(_ds, "discover_raw_files", _discover)
     monkeypatch.setattr(_rf, "_refresh_log_path",
-                        lambda: os.path.join(folder, "logs_refresh.txt"))
+                        lambda name=_rf.DEMAND_LOG: os.path.join(folder, name))
+    # sync_failures() reads all three pulls' markers, so pin the warehouse and
+    # key-SKU folders here too — otherwise a real failure file in the repo would
+    # leak into these assertions. Separate subfolders, because each pull's lock
+    # is ".refresh.lock" inside its own folder.
+    for name in ("wh", "ks"):
+        os.makedirs(os.path.join(folder, name), exist_ok=True)
+    monkeypatch.setattr(data_io, "_warehouse_dir",
+                        lambda warehouse_dir=None: os.path.join(folder, "wh"))
+    monkeypatch.setattr(_rf, "_key_skus_dir",
+                        lambda: os.path.join(folder, "ks"))
     return dashboard, folder
 
 
@@ -301,7 +312,7 @@ def wh_dash(monkeypatch, tmp_path):
                         lambda warehouse_dir=None: folder)
     from dashboard_app import refresh as _rf
     monkeypatch.setattr(_rf, "_refresh_log_path",
-                        lambda: os.path.join(folder, "logs_refresh.txt"))
+                        lambda name=_rf.DEMAND_LOG: os.path.join(folder, name))
     return dashboard, folder
 
 
@@ -397,3 +408,294 @@ def test_start_warehouse_refresh_blocks_when_already_running(wh_dash):
     ok, msg = dashboard.start_warehouse_refresh()
     assert ok is False
     assert "already running" in msg
+
+
+# --------------------------------------------------------------------------- #
+# 5. ODBC driver resolution                                                   #
+# --------------------------------------------------------------------------- #
+# Regression cover for the 2026-08-04..08-10 outage: the connection string
+# hardcoded "ODBC Driver 18 for SQL Server", which is installed on some hosts
+# and not others (the sh-sw-dev dev server that serves the shared dashboard has
+# only 13/17). Every pull launched there died with an opaque
+#   IM002 ... Data source name not found and no default driver specified
+# and, because .env lives on the shared network path, no single pinned driver
+# name works for every host. The driver is therefore resolved at runtime.
+
+
+@pytest.fixture
+def drivers(monkeypatch):
+    """Control what ``pyodbc.drivers()`` reports, and clear SQL_DRIVER."""
+    monkeypatch.delenv("SQL_DRIVER", raising=False)
+    monkeypatch.delenv("SQL_SERVER_CERT", raising=False)
+
+    def _set(*names):
+        monkeypatch.setattr(extract.pyodbc, "drivers", lambda: list(names))
+    return _set
+
+
+def test_resolve_driver_prefers_newest_installed(drivers):
+    drivers("SQL Server", "ODBC Driver 13 for SQL Server",
+            "ODBC Driver 17 for SQL Server", "ODBC Driver 18 for SQL Server")
+    assert extract._resolve_driver() == "ODBC Driver 18 for SQL Server"
+
+
+def test_resolve_driver_falls_back_to_17_when_18_absent(drivers):
+    # Exactly the sh-sw-dev case that caused the outage.
+    drivers("SQL Server", "ODBC Driver 13 for SQL Server",
+            "SQL Server Native Client 11.0", "ODBC Driver 17 for SQL Server")
+    assert extract._resolve_driver() == "ODBC Driver 17 for SQL Server"
+
+
+def test_resolve_driver_ignores_non_sql_server_drivers(drivers):
+    drivers("MySQL ODBC 9.4 Unicode Driver",
+            "Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)",
+            "ODBC Driver 17 for SQL Server")
+    assert extract._resolve_driver() == "ODBC Driver 17 for SQL Server"
+
+
+def test_resolve_driver_falls_back_to_native_client_then_legacy(drivers):
+    drivers("SQL Server", "SQL Server Native Client 11.0")
+    assert extract._resolve_driver() == "SQL Server Native Client 11.0"
+
+    drivers("SQL Server")
+    assert extract._resolve_driver() == "SQL Server"
+
+
+def test_resolve_driver_honours_explicit_sql_driver(drivers, monkeypatch):
+    drivers("ODBC Driver 17 for SQL Server", "ODBC Driver 18 for SQL Server")
+    monkeypatch.setenv("SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+    assert extract._resolve_driver() == "ODBC Driver 17 for SQL Server"
+
+
+def test_resolve_driver_rejects_explicit_driver_that_is_not_installed(
+    drivers, monkeypatch
+):
+    # The failure must name what was asked for AND what is available, instead of
+    # the driver manager's opaque IM002.
+    drivers("ODBC Driver 17 for SQL Server", "ODBC Driver 13 for SQL Server")
+    monkeypatch.setenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
+
+    with pytest.raises(ValueError) as exc:
+        extract._resolve_driver()
+
+    msg = str(exc.value)
+    assert "ODBC Driver 18 for SQL Server" in msg   # what was requested
+    assert "ODBC Driver 17 for SQL Server" in msg   # what is installed
+    assert "SQL_DRIVER" in msg
+
+
+def test_resolve_driver_errors_clearly_when_none_installed(drivers):
+    drivers("Microsoft Access Driver (*.mdb, *.accdb)")
+
+    with pytest.raises(ValueError) as exc:
+        extract._resolve_driver()
+
+    msg = str(exc.value)
+    assert "No SQL Server ODBC driver" in msg
+    assert os.environ.get("COMPUTERNAME", "").lower() in msg.lower() or "host" in msg.lower()
+
+
+def test_connection_string_uses_resolved_driver(drivers, monkeypatch):
+    drivers("ODBC Driver 17 for SQL Server")
+    monkeypatch.setenv("SQL_SERVER", "datawarehouse")
+    monkeypatch.setenv("SQL_DATABASE", "SHSTGDB")
+    monkeypatch.delenv("SQL_USER", raising=False)
+
+    assert "DRIVER={ODBC Driver 17 for SQL Server};" in extract.connection_string()
+
+
+def test_server_cert_pinning_rejected_on_pre_18_driver(drivers, monkeypatch, tmp_path):
+    # ServerCertificate is a Driver 18+ keyword; older drivers ignore it, which
+    # would silently downgrade certificate validation. Fail loudly instead.
+    cert = tmp_path / "dw.cer"
+    cert.write_text("x", encoding="utf-8")
+    drivers("ODBC Driver 17 for SQL Server")
+    monkeypatch.setenv("SQL_SERVER", "datawarehouse")
+    monkeypatch.setenv("SQL_DATABASE", "SHSTGDB")
+    monkeypatch.setenv("SQL_SERVER_CERT", str(cert))
+
+    with pytest.raises(ValueError) as exc:
+        extract.connection_string()
+
+    assert "SQL_SERVER_CERT" in str(exc.value)
+    assert "18" in str(exc.value)
+
+
+def test_security_warning_is_logged_once_per_process(drivers, monkeypatch, caplog):
+    # Every pull builds the connection string twice — once via
+    # redacted_connection_string() for the "Connecting:" log line, once inside
+    # connect() — so the SQL_TRUST_CERT security warning appeared twice per run
+    # in logs_refresh.txt. Warn once per process instead.
+    drivers("ODBC Driver 18 for SQL Server")
+    monkeypatch.setenv("SQL_SERVER", "datawarehouse")
+    monkeypatch.setenv("SQL_DATABASE", "SHSTGDB")
+    monkeypatch.setenv("SQL_TRUST_CERT", "yes")
+    monkeypatch.setattr(extract, "_WARNED_ONCE", set())
+
+    with caplog.at_level("WARNING", logger="extract_demand_details"):
+        extract.redacted_connection_string()
+        extract.connection_string()
+
+    warnings = [r for r in caplog.records if "SQL_TRUST_CERT" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 6. Failed pulls are reported, not silently swallowed                        #
+# --------------------------------------------------------------------------- #
+# The other half of the 2026-08 outage: _launch_refresh returned ok=True as soon
+# as Popen succeeded and nobody ever looked at the child's exit code, so a pull
+# that died on an ODBC error looked exactly like an idle button. Six days of
+# failures went unnoticed. A failed pull must now leave a durable, visible trace.
+
+
+def _write_run_log(folder, log_name, *lines):
+    """A pull log shaped like a real one: run header, then the child's output."""
+    path = os.path.join(folder, log_name)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n===== DW refresh (incremental) started 2026-08-10 09:41:26 "
+                "on SOMEHOST =====\n")
+        for line in lines:
+            f.write(line + "\n")
+    return path
+
+
+def test_each_pull_writes_its_own_log(dash, monkeypatch):
+    # Three children sharing one append handle is what corrupted the evidence.
+    dashboard, _ = dash
+    from dashboard_app import refresh as _rf
+
+    names = {_rf.DEMAND_LOG, _rf.WAREHOUSE_LOG, _rf.KEY_SKUS_LOG}
+    assert len(names) == 3
+
+
+def test_failed_pull_is_recorded_and_reported(dash, monkeypatch):
+    dashboard, folder = dash
+    from dashboard_app import refresh as _rf
+
+    lock = dashboard._refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-08-10 09:41:26")
+    _write_run_log(
+        folder, _rf.DEMAND_LOG,
+        "2026-08-10 09:41:28,735 ERROR   Database error: ('IM002', "
+        "'[IM002] [Microsoft][ODBC Driver Manager] Data source name not found "
+        "and no default driver specified (0) (SQLDriverConnect)')",
+    )
+
+    running, _ = dashboard.refresh_in_progress()
+
+    assert running is False           # not left spinning until the stale timeout
+    assert not os.path.exists(lock)   # lock released
+    failures = _rf.sync_failures()
+    assert len(failures) == 1
+    label, _when, _host, detail = failures[0]
+    assert label == "Demand snapshot"
+    assert "IM002" in detail          # the real cause reaches the user
+
+
+def test_dead_child_reports_failure_without_waiting_for_stale_timeout(dash):
+    dashboard, folder = dash
+    from dashboard_app import refresh as _rf
+
+    lock = dashboard._refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-08-10 09:41:26")
+
+    class _DeadChild:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    _rf._CHILDREN[lock] = _DeadChild()
+    try:
+        running, _ = dashboard.refresh_in_progress()
+    finally:
+        _rf._CHILDREN.pop(lock, None)
+
+    assert running is False
+    failures = _rf.sync_failures()
+    assert failures and "exited with code 1" in failures[0][3]
+
+
+def test_successful_pull_clears_a_previous_failure(dash):
+    dashboard, folder = dash
+    from dashboard_app import refresh as _rf
+
+    lock = dashboard._refresh_lock_path()
+    with open(_rf._failure_path(lock), "w", encoding="utf-8") as f:
+        f.write("2026-08-10 09:41:26\tSOMEHOST\told IM002 failure")
+    assert _rf.sync_failures()
+
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-08-10 10:00:00")
+    t0 = 1_000_000.0
+    os.utime(lock, (t0, t0))
+    _make_snapshot(folder, "2026-08-10", mtime=t0 + 100)
+
+    running, _ = dashboard.refresh_in_progress()
+
+    assert running is False
+    assert _rf.sync_failures() == []   # banner goes away on a good run
+
+
+def test_error_from_an_earlier_run_does_not_fail_the_current_one(dash):
+    # Two runs land in the same day's file; only the current run's block counts.
+    dashboard, folder = dash
+    from dashboard_app import refresh as _rf
+
+    _write_run_log(folder, _rf.DEMAND_LOG,
+                   "2026-08-10 09:41:28 ERROR   Database error: IM002 boom")
+    _write_run_log(folder, _rf.DEMAND_LOG,
+                   "2026-08-10 10:05:00 INFO    Pulled 713,627 rows")
+
+    lock = dashboard._refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-08-10 10:05:00")
+
+    running, started = dashboard.refresh_in_progress()
+
+    assert running is True             # still going, not falsely failed
+    assert started == "2026-08-10 10:05:00"
+    assert _rf.sync_failures() == []
+
+
+def test_clear_sync_failures_dismisses_the_banner(dash):
+    dashboard, _ = dash
+    from dashboard_app import refresh as _rf
+
+    with open(_rf._failure_path(dashboard._refresh_lock_path()), "w",
+              encoding="utf-8") as f:
+        f.write("2026-08-10 09:41:26\tSOMEHOST\tIM002")
+    assert _rf.sync_failures()
+
+    _rf.clear_sync_failures()
+
+    assert _rf.sync_failures() == []
+
+
+def test_clean_exit_with_lagging_output_is_not_reported_as_failure(dash):
+    # The snapshot folder is a network share: a child can exit 0 a moment before
+    # its file is visible. That must not be reported as a failed sync.
+    dashboard, folder = dash
+    from dashboard_app import refresh as _rf
+
+    lock = dashboard._refresh_lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("2026-08-10 10:00:00")
+
+    class _CleanChild:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    _rf._CHILDREN[lock] = _CleanChild()
+    try:
+        running, _ = dashboard.refresh_in_progress()
+    finally:
+        _rf._CHILDREN.pop(lock, None)
+
+    assert running is True          # still pending, not failed
+    assert _rf.sync_failures() == []

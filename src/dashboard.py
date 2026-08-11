@@ -158,9 +158,9 @@ from dashboard_app.refresh import (  # noqa: F401
     _refresh_lock_path, _refresh_log_path, _refresh_state, _wh_refresh_lock_path,
     _wh_snapshot_complete_since, batch_elapsed_suffix, batch_failures,
     batch_in_progress, batch_progress,
-    batch_result_message, refresh_in_progress, start_agent_batch,
-    start_key_skus_refresh, start_refresh, start_warehouse_refresh,
-    warehouse_refresh_in_progress,
+    batch_result_message, clear_sync_failures, refresh_in_progress,
+    start_agent_batch, start_key_skus_refresh, start_refresh,
+    start_warehouse_refresh, sync_failures, warehouse_refresh_in_progress,
 )
 from dashboard_app.agent_summary import (  # noqa: F401
     LLM_PROVIDERS, _AGENT_NODE_PROGRESS, _agent_progress_fragment, _agent_scores,
@@ -792,6 +792,22 @@ def main():
                 "switches to the fresh data automatically when it finishes "
                 "(usually a few minutes)."
             )
+
+        # A pull that FAILS must say so. It used to just release its lock and
+        # re-enable the button, so six days of failed syncs looked identical to
+        # "nobody clicked sync" and the dashboard quietly served stale data. The
+        # marker is written next to each lock, so this banner survives a rerun
+        # and is visible from every session and both hosts.
+        for _label, _when, _host, _detail in sync_failures():
+            st.error(
+                f"❌ **{_label} sync failed** — last attempt {_when} on "
+                f"`{_host}`.\n\n```\n{_detail}\n```\n"
+                "The dashboard is still serving the previous snapshot. Full "
+                "detail is in `logs/<date>/logs_refresh_*.txt`."
+            )
+        if sync_failures() and st.button("Dismiss sync errors", key="clear_sync_err"):
+            clear_sync_failures()
+            st.rerun()
 
         # The refresh button, the "manually override" toggle, and the reasoning-
         # LLM selector sit side by side at the top. When the toggle is off

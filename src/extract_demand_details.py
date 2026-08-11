@@ -49,6 +49,7 @@ import argparse
 import glob
 import logging
 import os
+import platform
 import re
 import sys
 import tempfile
@@ -63,6 +64,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 log = logging.getLogger("extract_demand_details")
+
+# Log-line format shared by all three extracts. Host and pid are baked in (they
+# are constant per process) because the repo lives on a network path that more
+# than one machine runs the dashboard from — without them, two hosts' lines in
+# the same day's log are indistinguishable, which is precisely what made the
+# 2026-08 driver outage so hard to attribute.
+LOG_FORMAT = (
+    f"%(asctime)s {platform.node() or 'unknown-host'}/{os.getpid()} "
+    "%(levelname)-7s %(message)s"
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Repo root (parent of src/) — sql/, raw_inputs/ etc. live there, not under src/.
@@ -297,13 +308,113 @@ def _odbc_quote(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
+# "ODBC Driver <N> for SQL Server" — the modern, versioned driver family. The
+# number is what we rank on, so a host gets the newest driver it actually has.
+_VERSIONED_DRIVER_RE = re.compile(r"^ODBC Driver (\d+) for SQL Server$", re.I)
+# Older drivers, best first, used only when no versioned driver is present.
+_LEGACY_DRIVERS = ("SQL Server Native Client 11.0", "SQL Server")
+
+# Keys for warnings that should fire once per process rather than once per
+# connection-string build (it is built twice per pull: once for the redacted
+# "Connecting:" log line, once inside connect()).
+_WARNED_ONCE: set[str] = set()
+
+
+def _log_once(key: str, level: int, msg: str, *args) -> None:
+    """Log ``msg`` the first time ``key`` is seen in this process."""
+    if key not in _WARNED_ONCE:
+        _WARNED_ONCE.add(key)
+        log.log(level, msg, *args)
+
+
+def _warn_once(key: str, msg: str, *args) -> None:
+    """Log a warning the first time ``key`` is seen in this process."""
+    _log_once(key, logging.WARNING, msg, *args)
+
+
+def _host() -> str:
+    """Best-effort hostname, for error messages that span several machines."""
+    return platform.node() or os.environ.get("COMPUTERNAME", "unknown-host")
+
+
+def _driver_major(driver: str) -> int | None:
+    """The N in "ODBC Driver N for SQL Server", or None for legacy drivers."""
+    match = _VERSIONED_DRIVER_RE.match(driver.strip())
+    return int(match.group(1)) if match else None
+
+
+def _sql_server_drivers() -> tuple[list[str], list[str]]:
+    """``(usable SQL Server drivers best-first, every installed ODBC driver)``."""
+    installed = [d.strip() for d in pyodbc.drivers()]
+    versioned = sorted(
+        (
+            (major, name)
+            for name in installed
+            if (major := _driver_major(name)) is not None
+        ),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    usable = [name for _, name in versioned]
+    usable += [
+        name for legacy in _LEGACY_DRIVERS
+        for name in installed if name.lower() == legacy.lower()
+    ]
+    return usable, installed
+
+
+def _resolve_driver() -> str:
+    """Pick the ODBC driver to connect with, newest installed one first.
+
+    The driver name used to be hardcoded to "ODBC Driver 18 for SQL Server".
+    That is installed on some hosts and not others -- the dev server that serves
+    the shared dashboard has only 13/17 -- so every pull launched there died
+    with the driver manager's opaque ``IM002 ... Data source name not found and
+    no default driver specified``, silently, for six days. Because ``.env`` is
+    shared over the network path, no single pinned name works everywhere, so we
+    resolve against what is actually installed on THIS host.
+
+    ``SQL_DRIVER`` still forces a specific driver, but is validated up front so
+    a typo or a missing install fails with a message that names the alternatives
+    instead of IM002.
+    """
+    usable, installed = _sql_server_drivers()
+
+    requested = os.environ.get("SQL_DRIVER", "").strip()
+    if requested:
+        if requested.lower() not in {d.lower() for d in installed}:
+            raise ValueError(
+                f"SQL_DRIVER={requested!r} is not installed on host {_host()!r}. "
+                f"Installed SQL Server drivers: {usable or 'none'}. "
+                f"All installed ODBC drivers: {installed or 'none'}. "
+                "Unset SQL_DRIVER to auto-select the newest installed driver, "
+                "or install the requested one."
+            )
+        return requested
+
+    if not usable:
+        raise ValueError(
+            f"No SQL Server ODBC driver is installed on host {_host()!r}. "
+            f"Installed ODBC drivers: {installed or 'none'}. "
+            "Install the Microsoft ODBC Driver 18 for SQL Server (msodbcsql18), "
+            "or set SQL_DRIVER to a driver that is present on this host."
+        )
+
+    _log_once(
+        f"driver:{usable[0]}", logging.INFO,
+        "Using ODBC driver %r on host %s (pid %d). Installed: %s",
+        usable[0], _host(), os.getpid(), usable,
+    )
+    return usable[0]
+
+
 def connection_string() -> str:
     """Build the pyodbc connection string from environment variables.
 
     NEVER log the return value: it contains the password. Use
     ``redacted_connection_string`` for diagnostics instead.
     """
-    driver = os.environ.get("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
+    driver = _resolve_driver()
     server = _require_env("SQL_SERVER")
     database = _require_env("SQL_DATABASE")
 
@@ -344,16 +455,29 @@ def connection_string() -> str:
             raise ValueError(
                 f"SQL_SERVER_CERT points to a missing file: {server_cert}"
             )
+        # ServerCertificate arrived in ODBC Driver 18. Older drivers ignore
+        # unknown keywords, so sending it to 17 or 13 would silently drop the
+        # pinning and leave validation weaker than the operator asked for.
+        major = _driver_major(driver)
+        if major is None or major < 18:
+            raise ValueError(
+                f"SQL_SERVER_CERT is set, but certificate pinning requires ODBC "
+                f"Driver 18 or newer; this host resolved to {driver!r}. Install "
+                "msodbcsql18, or clear SQL_SERVER_CERT (and rely on the "
+                "server CA) to connect with this driver."
+            )
         parts.append(f"ServerCertificate={_odbc_quote(server_cert)}")
 
     if encrypt.strip().lower() not in _TRUTHY:
-        log.warning(
+        _warn_once(
+            "encrypt",
             "SQL_ENCRYPT=%s: data-warehouse traffic (including query results) "
             "will NOT be encrypted in transit.",
             encrypt,
         )
     if trust_cert.strip().lower() in _TRUTHY:
-        log.warning(
+        _warn_once(
+            "trust_cert",
             "SQL_TRUST_CERT=yes: the server certificate is NOT validated, which "
             "defeats MITM protection. Prefer installing the server CA and "
             "setting SQL_TRUST_CERT=no.",
@@ -947,7 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
+        format=LOG_FORMAT,
     )
 
     try:

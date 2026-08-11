@@ -863,12 +863,21 @@ def _tab_trend(frame, value_col, years, colors):
     # "no years chosen" instead of "no data", which is a far more useful panel to read;
     # and `colors` is keyed on every year, so the filtering has to happen where the
     # colour lookup does or the two could disagree about which years exist.
+    #
+    # The explicit keys are load-bearing, not decoration. Streamlit derives a
+    # chart's element ID from its parameters, and with NO years selected both
+    # builders return the same "No years selected" placeholder figure -- byte for
+    # byte identical, so the two auto-generated IDs collided and the whole tab
+    # raised DuplicateElementId (surfacing as FragmentHandledException, since this
+    # renders inside _render_body's fragment). Keep the keys.
     st.plotly_chart(
         hc.weekly_year_overlay(hm.weekly_by_year(frame, value_col), value_col,
-                               colors=colors, years=picked), width="stretch")
+                               colors=colors, years=picked), width="stretch",
+        key="hist_trend_weekly_overlay")
     st.plotly_chart(
         hc.monthly_year_overlay(hm.monthly_totals(frame, value_col), value_col,
-                                colors=colors, years=picked), width="stretch")
+                                colors=colors, years=picked), width="stretch",
+        key="hist_trend_monthly_overlay")
 
 
 def _tab_mix(frame, value_col, years, lcw):
@@ -891,21 +900,23 @@ def _tab_mix(frame, value_col, years, lcw):
     # pre-clipping here would filter the same rows twice.
     st.plotly_chart(
         hc.share_donut(hm.by_dimension(frame, "Region", start, end, value_col),
-                       "Region", value_col), width="stretch")
+                       "Region", value_col), width="stretch",
+        key="hist_mix_region_donut")
     st.plotly_chart(
         hc.ranked_bars(
             hm.by_dimension(frame, "Customer Grouping", start, end, value_col,
                             top_n=10),
             "Customer Grouping", value_col,
             title=f"Top customer groups by {_measure_word(value_col)}"),
-        width="stretch")
+        width="stretch", key="hist_mix_customer_bars")
     # Clipped explicitly, because weekly_by_dimension takes a frame rather than
     # bounds. Handing it the whole frame put one tab's three charts on two different
     # periods -- the donut and the bars on the year, the lines on all history.
     st.plotly_chart(
         hc.dimension_lines(hm.weekly_by_dimension(hm.clip(frame, start, end),
                                                   "Region", value_col),
-                           "Region", value_col), width="stretch")
+                           "Region", value_col), width="stretch",
+        key="hist_mix_region_lines")
 
 
 def _tab_movers(frame, value_col, years, lcw):
@@ -930,7 +941,7 @@ def _tab_movers(frame, value_col, years, lcw):
     st.plotly_chart(
         hc.ranked_bars(chart_frame, "SKU", value_col,
                        title=f"Top 15 SKUs by {_measure_word(value_col)}"),
-        width="stretch")
+        width="stretch", key="hist_movers_top_skus")
     if not top.empty:
         render_filtered_table(
             top.rename(columns={"units": "Units", "revenue": "Revenue"}),
@@ -967,9 +978,10 @@ def _tab_movers(frame, value_col, years, lcw):
         st.caption(f"Compared against {_span(*prior)}.")
         st.plotly_chart(
             hc.movers_chart(hm.yoy_movers(frame, start, end, prior=prior, n=10)),
-            width="stretch")
+            width="stretch", key="hist_movers_yoy")
 
-    st.plotly_chart(hc.pareto_chart(hm.pareto(frame, start, end)), width="stretch")
+    st.plotly_chart(hc.pareto_chart(hm.pareto(frame, start, end)),
+                    width="stretch", key="hist_movers_pareto")
     with st.expander("How to read the concentration chart"):
         st.markdown(
             "Each point is one SKU, ranked highest-revenue first, and the line is "
@@ -999,7 +1011,8 @@ def _tab_heatmap(frame, value_col):
     weeks = pd.to_datetime(frame["WeekDate"])
     _range_note(frame, weeks.min(), weeks.max())
     st.plotly_chart(hc.month_year_heatmap(hm.month_year_matrix(frame, value_col),
-                                          value_col), width="stretch")
+                                          value_col), width="stretch",
+                    key="hist_heatmap_grid")
 
 
 # --------------------------------------------------------------------------- #
