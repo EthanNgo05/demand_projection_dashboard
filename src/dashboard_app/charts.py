@@ -4,7 +4,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dashboard_app.config import (
-    C_ACTUAL, C_UPDATED, C_ORIGINAL, C_GRID, MIXED_SOURCE, fmt_dollar,
+    C_ACTUAL, C_UPDATED, C_ORIGINAL, C_GRID, C_OTHER, C_SEPARATOR,
+    EIGHT_WK_AVG_COL, MIXED_SOURCE, RISK_COL, categorical_color_map, fmt_dollar,
 )
 from dashboard_app.summaries import historical_window
 
@@ -443,3 +444,139 @@ def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
         fig.add_trace(rr)
     title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
     return _base_layout(fig, title, ffw, y_title=f"Units ({source})")
+
+
+# --------------------------------------------------------------------------- #
+# Customer-group share of one SKU's updated forecast                          #
+# --------------------------------------------------------------------------- #
+# The SKU-detail section's "where does this SKU's volume come from?" figure. It
+# replaced a wide table whose real question was a share — a comparison a donut
+# answers at a glance and a table makes the reader compute. A donut is legitimate
+# here for the same reason it is on the Historical Summary: the parts genuinely
+# sum to a meaningful whole (the SKU's updated forecast, which IS the sum of its
+# per-customer fits — see CLAUDE.md's "One grain") and there are few of them.
+#
+# Every column the table used to carry moves into the hover, one row each, named
+# EXACTLY as the column is named everywhere else on the page. Values are formatted
+# in Python rather than by a Plotly format spec, so a missing figure reads "—"
+# instead of "nan" and money goes through the app's own fmt_dollar (same approach
+# as _revenue_risk_trace above).
+_BREAKDOWN_HOVER_FIELDS = (
+    ("Current Projection Average", "units"),
+    ("Projection Difference", "signed"),
+    (EIGHT_WK_AVG_COL, "units"),
+    (RISK_COL, "money"),
+    ("Data Source", "text"),
+)
+
+
+def _fmt_breakdown(value, kind):
+    """One hover cell, preformatted. Blank/NaN is always an em dash — a hover row
+    reading "nan" looks like a bug, and a zero would be a lie."""
+    if kind == "text":
+        return str(value) if isinstance(value, str) and value else "—"
+    v = pd.to_numeric(value, errors="coerce")
+    if pd.isna(v):
+        return "—"
+    if kind == "money":
+        return fmt_dollar(v, signed=True)
+    return f"{v:+,.0f}" if kind == "signed" else f"{v:,.0f}"
+
+
+def _fold_breakdown(rows, col, kind):
+    """The folded-tail bucket's value for one column. Numbers add up (every one of
+    these is additive across customer groups — that is the one-grain invariant);
+    ``Data Source`` collapses to the shared label, or MIXED_SOURCE where the folded
+    groups disagree, matching compute.roll_up_summary's rule at SKU grain."""
+    if kind == "text":
+        vals = {str(v) for v in rows[col].dropna()} if col in rows.columns else set()
+        if not vals:
+            return None
+        return vals.pop() if len(vals) == 1 else MIXED_SOURCE
+    return pd.to_numeric(rows[col], errors="coerce").sum(min_count=1)
+
+
+def customer_share_donut(bd, upd_col="Updated Projection Average", top_n=8):
+    """Each customer group's share of ONE SKU's updated forecast.
+
+    ``bd`` is the by-customer frame already sliced to the SKU. Returns ``None``
+    when there is nothing positive to draw (no rows, or every group forecast at
+    zero), so the caller can say so in words rather than show an empty circle.
+
+    Groups past ``top_n`` fold into a single grey tail slice: the categorical
+    palette is eight slots and is never cycled (see ``config.C_CATEGORICAL``). A
+    tail of exactly one group keeps its own name — folding a single group into
+    "Other" would hide an identity to no purpose — but still takes the tail grey,
+    since there is no ninth slot for it.
+
+    Slice colours come from ``categorical_color_map`` over the DRAWN groups, so a
+    colour keys on the group's name rather than on its rank — reordering the frame
+    repaints nothing. It is built from the drawn groups only, not from all of the
+    SKU's: a late-sorting group past slot 8 would hit that helper's backstop, which
+    pins every remaining key to the last colour, and two slices would come out
+    identical. Across SKUs the assignment is not stable, and cannot be — a
+    different SKU sells to a different set of groups.
+    """
+    group_col = "Customer Grouping"
+    if bd is None or bd.empty or upd_col not in bd.columns \
+            or group_col not in bd.columns:
+        return None
+    d = bd.copy()
+    d[upd_col] = pd.to_numeric(d[upd_col], errors="coerce")
+    # A pie cannot draw a negative or absent value, and a 0% slice is only clutter.
+    d = d[d[upd_col] > 0].sort_values(upd_col, ascending=False)
+    if d.empty:
+        return None
+
+    fields = [(c, k) for c, k in _BREAKDOWN_HOVER_FIELDS if c in d.columns]
+    head, tail = d.head(top_n), d.iloc[top_n:]
+    cmap = categorical_color_map(head[group_col].astype(str))
+
+    labels, values, custom, colors = [], [], [], []
+    for _, r in head.iterrows():
+        group = str(r[group_col])
+        labels.append(group)
+        values.append(float(r[upd_col]))
+        custom.append([_fmt_breakdown(r[c], k) for c, k in fields])
+        colors.append(cmap[group])
+    if not tail.empty:
+        labels.append(str(tail[group_col].iloc[0]) if len(tail) == 1
+                      else f"Other ({len(tail)} groups)")
+        values.append(float(tail[upd_col].sum()))
+        custom.append([_fmt_breakdown(_fold_breakdown(tail, c, k), k)
+                       for c, k in fields])
+        colors.append(C_OTHER)
+
+    rows = "".join(f"<br>{col}: %{{customdata[{i}]}}"
+                   for i, (col, _) in enumerate(fields))
+    fig = go.Figure(go.Pie(
+        labels=labels, values=values, hole=0.55, sort=False,
+        marker=dict(colors=colors, line=dict(color=C_SEPARATOR, width=2)),
+        textinfo="label+percent", textposition="outside",
+        # Outside labels sit beyond the pie's own box; without automargin the
+        # topmost one is clipped off the figure (see share_donut).
+        automargin=True,
+        customdata=custom,
+        # %{percent} is computed over the drawn slices, which after folding is the
+        # true share — it replaces the "Share of Updated Forecast" column exactly.
+        hovertemplate=(f"<b>%{{label}}</b><br>Share of updated forecast: "
+                       f"%{{percent}}<br>{upd_col}: %{{value:,.0f}} / wk"
+                       f"{rows}<extra></extra>"),
+    ))
+    # The hole carries the SKU total — the same number as the section's "Updated
+    # Forecast (avg/wk)" tile, so the tie the caption claims is visible in one look.
+    fig.add_annotation(
+        text=(f"<b>{sum(values):,.0f}</b>"
+              "<br><span style='font-size:12px'>units / wk</span>"),
+        showarrow=False, xref="paper", yref="paper", x=0.5, y=0.5,
+    )
+    fig.update_layout(
+        font=dict(family=_CHART_FONT, size=13),
+        # No title: the section's "#### Customer group breakdown" heading names it.
+        # Real side/top room all the same — automargin can only spend margin that
+        # exists, and the outside labels need somewhere to go.
+        height=460, margin=dict(l=40, r=40, t=60, b=30),
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig

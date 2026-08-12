@@ -45,7 +45,8 @@ BEST_MIX_CARD_COLS = [
 ]
 
 
-def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
+def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None,
+                 show_sku_count=True):
     """Render the 7-metric KPI row shared by every view.
 
     Uses only ``summary`` + the SKU-week ``agg`` + the week ``anchors``. SKU
@@ -57,6 +58,11 @@ def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
     across a 7-column row, so they fit a narrow side column like the SKU/Customer
     detail charts. The trailing informational captions are shown only in the wide
     row layout.
+
+    ``show_sku_count`` drops the leading "SKUs Forecasted" tile, for a caller whose
+    ``summary`` is a SINGLE SKU — the count can only ever read 1 there, and a tile
+    with one possible value is noise. Meant for ``stacked=True`` callers: in the
+    wide seven-column layout it would leave an empty column.
 
     ``avg_col`` names the descriptive-average column whose window label describes
     ``anchors``, for the total-weekly-demand metric's label and help text. It has to
@@ -104,10 +110,11 @@ def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None):
     else:
         with st.container(key="kpi_bubble_row"):
             k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-    k1.metric(
-        "SKUs Forecasted", f"{n_skus:,}",
-        help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
-    )
+    if show_sku_count:
+        k1.metric(
+            "SKUs Forecasted", f"{n_skus:,}",
+            help=f"{n_orders} forecast from Orders (no POS)" if n_orders else None,
+        )
     # "Total Weekly Demand", not "Historical Demand": this is a VIEW TOTAL and is
     # deliberately not the sum of the per-SKU average column (see the note above on
     # why summing that column would overstate the total). Naming it after the total

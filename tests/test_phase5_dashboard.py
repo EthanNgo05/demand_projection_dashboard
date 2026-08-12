@@ -636,6 +636,39 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
 
 
 @needs_data
+def test_sku_detail_is_a_chart_a_kpi_stack_and_a_share_donut():
+    """What the section carries after the three things that didn't earn their space.
+
+    The section is scoped to ONE SKU, which is what makes each removal safe:
+    "SKUs Forecasted" could only ever read 1; the weekly-forecast table restated
+    the chart beside it row by row; and the customer-group breakdown asked a share
+    question a table made the reader compute. The breakdown's columns are not gone
+    — they moved into the donut's per-slice hover (see test_sku_breakdown_pie.py).
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+
+    headings = _headings(at)
+    assert "### SKU detail" in headings
+    assert "#### Customer group breakdown" in headings
+    assert "#### Weekly forecast" not in headings
+    # AppTest does not surface download buttons as elements, so the export that sat
+    # under the table is checked at the source (as test_mix_tab does for its donut).
+    body = inspect.getsource(dashboard.main)
+    assert "dl_sku_weekly" not in body, (
+        "the weekly-forecast export went with its table"
+    )
+    assert "customer_share_donut" in body
+    # Twice, not three times: the page-top row and Customer detail (one group, many
+    # SKUs) both still count SKUs. SKU detail no longer does.
+    assert sum(m.label == "SKUs Forecasted" for m in at.metric) == 2
+    # The other stacked tiles stay — only the count was dropped.
+    assert any(m.label == "Updated Forecast (avg/wk)" for m in at.metric)
+
+
+@needs_data
 def test_quick_region_change_resets_the_customer_group():
     """Switching Region must re-option the Customer-group selectbox cleanly.
 

@@ -535,6 +535,15 @@ C_CATEGORICAL = (
     "#e66767",  # 8 red
 )
 
+# Translucent neutral: lightens against a dark surface and darkens against a light
+# one, so one value separates adjacent fills (stacked areas, pie slices) in both
+# themes (the app's trace colours are deliberately theme-invariant -- see charts.py).
+C_SEPARATOR = "rgba(128,128,128,0.45)"
+
+# Grey used for a fold-to-tail bucket, so "Other" never impersonates a real
+# category by borrowing a categorical slot.
+C_OTHER = C_ORIGINAL
+
 # Sequential blue ramp for continuous magnitude (the month x year heatmap).
 # One hue, light -> dark, per the sequential rule. Heatmap cells tile the whole
 # plot area so the surface never shows through, which is what lets a single ramp

@@ -121,7 +121,8 @@ from dashboard_app.summaries import (  # noqa: F401
     historical_window_label, resolve_avg_col, resolve_demand, source_map,
 )
 from dashboard_app.charts import (  # noqa: F401
-    _base_layout, _clip_to_range, aggregate_chart, chart_range_control, sku_chart,
+    _base_layout, _clip_to_range, aggregate_chart, chart_range_control,
+    customer_share_donut, sku_chart,
 )
 from dashboard_app.tables import (  # noqa: F401
     render_filtered_table, render_selectable_table, style_summary,
@@ -2027,12 +2028,18 @@ def main():
                     width="stretch",
                 )
             with scR:
-                # Same seven metrics as the top of the view, scoped to this SKU and
+                # The same metrics as the top of the view, scoped to this SKU and
                 # stacked to fit the side column. Section anchors (not the widened
                 # chart range) so the historical-demand window lines up with the KPI
                 # row above.
+                #
+                # Minus "SKUs Forecasted", which is 1 by construction here. Its help
+                # text carried the "forecast from Orders (no POS)" flag; for a single
+                # SKU that fact is still on screen twice — sku_chart names the source
+                # in its title and axis, and the breakdown hover carries Data Source
+                # per customer group.
                 _render_kpis(summary_s, agg_s, (lb, lcw, ffw), stacked=True,
-                             avg_col=anchors_avg_col)
+                             avg_col=anchors_avg_col, show_sku_count=False)
                 # On Hand / Weeks of Supply — the two figures that turn a weekly
                 # forecast into an order quantity. Both are SKU-level constants across
                 # a SKU's customer rows (see attach_supply_columns), so this is a
@@ -2051,102 +2058,42 @@ def main():
                         st.metric(col, fmt.format(vals.iloc[0]),
                                   help=KPI_HELP.get(col))
 
-            # --- Weekly forecast numbers ---------------------------------------
-            # The chart's forecast line as a table: the point of the section is to read
-            # an order quantity off a row instead of hovering a trace. Cumulative Units
-            # answers "how much to cover the next N weeks" without any arithmetic.
-            st.markdown("#### Weekly forecast")
-            wk_tbl = (
-                weekly_s[["WeekDate", "projected_pos"]]
-                .sort_values("WeekDate")
-                .rename(columns={"WeekDate": "Week of",
-                                 "projected_pos": "Forecast Units"})
-                .reset_index(drop=True)
-            )
-            wk_tbl["Week of"] = pd.to_datetime(wk_tbl["Week of"])
-            wk_tbl["Cumulative Units"] = wk_tbl["Forecast Units"].cumsum()
-            # The original projection over the same weeks, straight from the snapshot's
-            # Projection column — no recomputation, blank where it has none.
-            wk_tbl = wk_tbl.merge(
-                agg_s[["WeekDate", "Projection"]]
-                .assign(WeekDate=lambda d: pd.to_datetime(d["WeekDate"]))
-                .rename(columns={"WeekDate": "Week of",
-                                 "Projection": "Original Projection"}),
-                on="Week of", how="left",
-            )
-            wk_tbl["Difference"] = (
-                wk_tbl["Forecast Units"] - wk_tbl["Original Projection"]
-            )
-            st.dataframe(
-                wk_tbl, width="stretch", hide_index=True,
-                # Formatted through column_config and NOT style_summary: column_config
-                # formatting SILENTLY overrides a Styler on the same column, so a table
-                # gets one or the other, never both.
-                column_config={
-                    "Week of": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
-                    **{c: st.column_config.NumberColumn(format="%,.0f")
-                       for c in ["Forecast Units", "Cumulative Units",
-                                 "Original Projection", "Difference"]},
-                },
-            )
-            # The sheet outlives the filename, so the export repeats the SKU on every
-            # row; single-sheet because there is no second frame to pair here.
-            wk_export = wk_tbl.copy()
-            wk_export.insert(0, "SKU", str(sku))
-            # Same filename convention as the two summary downloads below.
-            view_slug = (
-                "ALL_CUSTOMERS" if view == ALL_CUSTOMERS_VIEW
-                else view.replace("/", "-").replace(" ", "_")
-            )
-            st.download_button(
-                "⬇️ Download this SKU's weekly forecast",
-                data=summary_to_excel(with_export_flags(wk_export),
-                                      sheet_name="weekly_forecast"),
-                file_name=(
-                    f"{view_slug}_{str(sku).replace('/', '-')}"
-                    f"_weekly_forecast_{today_str}.xlsx"
-                ),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_sku_weekly",
-            )
-
             # --- Customer group breakdown --------------------------------------
             # Where this SKU's volume comes from. These are the PER-GROUP fits, so they
             # sum to the SKU's rows in the by-customer table below — not to the
             # combined figures above.
+            #
+            # A donut rather than the table this used to be: the question here is a
+            # SHARE ("where does this SKU's volume come from?"), which a table makes
+            # the reader compute. Every column that table carried is a row of the
+            # slice's hover instead, so nothing was lost with it — see
+            # charts.customer_share_donut.
             st.markdown("#### Customer group breakdown")
             bd = by_cust[by_cust["SKU"].astype(str) == sku] if has_by_cust else None
+            share_fig = (customer_share_donut(bd)
+                         if bd is not None and not bd.empty else None)
             if bd is None or bd.empty:
                 st.caption("No per-customer forecasts for this SKU in this snapshot.")
+            elif share_fig is None:
+                st.caption(
+                    "Every customer group's updated forecast for this SKU is zero, "
+                    "so there is no share to chart."
+                )
             else:
-                upd_col = "Updated Projection Average"
-                share_col = "Share of Updated Forecast"
-                if upd_col in bd.columns:
-                    bd = bd.sort_values(upd_col, ascending=False, na_position="last")
-                    upd = pd.to_numeric(bd[upd_col], errors="coerce")
-                    total_upd = upd.sum()
-                    # Share as a PREFORMATTED STRING so the frame can still go through
-                    # style_summary (which colours Projection Difference / Revenue Risk
-                    # the same as every other table on the page) — a column_config for
-                    # a percent format would clobber that Styler.
-                    bd = bd.assign(**{share_col: (
-                        (upd / total_upd * 100).map(
-                            lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
-                        if total_upd else "—"
-                    )})
-                cols = [c for c in [
-                    "Customer Grouping", "Data Source", EIGHT_WK_AVG_COL,
-                    "Current Projection Average", upd_col, share_col,
-                    "Projection Difference", RISK_COL,
-                ] if c in bd.columns]
-                st.dataframe(
-                    style_summary(bd[cols].reset_index(drop=True)),
-                    width="stretch", hide_index=True,
+                st.plotly_chart(share_fig, width="stretch")
+                n_groups = int(
+                    (pd.to_numeric(bd["Updated Projection Average"],
+                                   errors="coerce") > 0).sum()
                 )
                 st.caption(
-                    "Each customer group's own forecast for this SKU, largest updated "
-                    "forecast first. These are the parts the tiles above are the sum "
-                    "of — the two tie exactly."
+                    "Each customer group's share of this SKU's updated forecast. "
+                    "Hover a slice for that group's full figures — current and "
+                    "updated forecast, 8-week run rate, projection difference, "
+                    "revenue risk and data source. These are the parts the tiles "
+                    "above are the sum of; the two tie exactly."
+                    + (f" Groups past the largest 8 (of {n_groups}) are folded into "
+                       "one grey slice, whose hover totals them."
+                       if n_groups > 9 else "")
                 )
 
     # ----- Summary table by SKU and customer --------------------------------

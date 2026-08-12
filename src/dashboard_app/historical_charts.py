@@ -35,7 +35,7 @@ import plotly.graph_objects as go
 
 from dashboard_app.charts import _base_layout
 from dashboard_app.config import (
-    C_ACTUAL, C_DECLINE, C_GRID, C_GROWTH, C_ORIGINAL,
+    C_ACTUAL, C_DECLINE, C_GRID, C_GROWTH, C_OTHER, C_SEPARATOR,
     C_SEQUENTIAL_BLUE, categorical_color_map, fmt_dollar,
 )
 from dashboard_app.historical_metrics import OTHER_LABEL
@@ -43,14 +43,11 @@ from dashboard_app.historical_metrics import OTHER_LABEL
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-# Translucent neutral: lightens against a dark surface and darkens against a light
-# one, so one value separates stacked fills in both themes (the app's trace colours
-# are deliberately theme-invariant -- see charts.py).
-_SEPARATOR = "rgba(128,128,128,0.45)"
-
-# Grey used for a fold-to-tail bucket, so "Other" never impersonates a real
-# category by borrowing a categorical slot.
-_OTHER_COLOR = C_ORIGINAL
+# Both live in config.py beside the categorical palette: the SKU-detail donut in
+# charts.py needs the same two values, and charts.py cannot import from here (the
+# dependency runs the other way -- this module imports _base_layout from it).
+_SEPARATOR = C_SEPARATOR
+_OTHER_COLOR = C_OTHER
 
 
 def _money(v):
