@@ -230,6 +230,18 @@ TREND_COL = "Recent Trend"
 ONHAND_COL = "On Hand"
 WOS_COL = "WOS Impact"
 
+# ``Data Source`` at SKU level, when the SKU's customer groups don't agree.
+#
+# Which signal a forecast uses is decided PER SERIES: POS where that series has
+# any, else Orders (the models' fallback). Customers who report no sell-through
+# are therefore forecast from Orders while their neighbours are forecast from POS,
+# so a SKU's total genuinely sums two measurement bases — on the live snapshot that
+# is 363 of 566 SKUs. The alternative is worse: resolving one source per SKU is
+# what made the old combined fit drop every Orders-only customer's demand outright.
+# So the total keeps every customer and says so here. Per-customer rows keep their
+# own single source; only the SKU-level roll-up can read MIXED_SOURCE.
+MIXED_SOURCE = "Mixed (POS + Orders)"
+
 
 # --------------------------------------------------------------------------- #
 # Detail-card KPI tiles: one canonical order, one set of tooltips              #
@@ -331,7 +343,9 @@ KPI_HELP = {
     ),
     "Data Source": (
         "Which signal the forecast used: POS (sell-through) where the SKU has "
-        "any, else Orders."
+        f"any, else Orders. “{MIXED_SOURCE}” on a SKU total means its customer "
+        "groups differ — the ones reporting sell-through are forecast from POS "
+        "and the rest from their Orders, so the total covers every customer."
     ),
     MODEL_USED_COL: "The model that won this customer group's 5-model backtest.",
     "Status": "Whether the recent run-rate sits above, below, or on the plan.",

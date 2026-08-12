@@ -50,10 +50,59 @@ def historical_window_label(avg_col):
 
 
 def source_map(summary):
-    """SKU -> 'POS' or 'Orders' (whichever the forecast used)."""
+    """SKU -> 'POS' or 'Orders' (whichever the forecast used).
+
+    Only meaningful on a frame with ONE row per SKU. On a per-(SKU, customer)
+    frame the dict comprehension silently lets the LAST group win, which for a
+    mixed-source SKU is an arbitrary answer — use ``customer_source_map`` (and
+    ``resolve_demand``) for those. ``historical_window`` prefers a precomputed
+    ``demand`` column over this for exactly that reason.
+    """
     if "Data Source" not in summary.columns:
         return {}
     return dict(zip(summary["SKU"].astype(str), summary["Data Source"]))
+
+
+def resolve_demand(agg_by_group, by_cust):
+    """Copy of a per-group SKU-week frame carrying a single ``demand`` column.
+
+    Each (SKU, Customer Grouping) contributes the signal ITS OWN forecast was fit
+    on — POS for the groups reporting sell-through, Orders for the ones that don't
+    — so summing ``demand`` across customers is a total that covers every customer
+    and is comparable to the summed forecast. Resolving one source per SKU instead
+    is what made the old combined fit silently drop Orders-only customers.
+
+    Falls back to POS for a pair ``by_cust`` has no row for (nothing was forecast
+    there, so nothing sums into a forecast total either), and to POS wholesale when
+    the frames don't carry what's needed — the pre-existing behaviour.
+    """
+    out = agg_by_group.copy()
+    pos = out["POS"] if "POS" in out.columns else np.nan
+    orders = out["Orders"] if "Orders" in out.columns else np.nan
+    needed = {"Customer Grouping", "SKU", "Data Source"}
+    if (by_cust is None or by_cust.empty or not needed <= set(by_cust.columns)
+            or "Customer Grouping" not in out.columns):
+        out["demand"] = pos
+        return out
+
+    # Vectorised on purpose: this frame is the per-group SKU-week aggregate — ~500k
+    # rows for the all-customers view — so a dict lookup per row (which is what
+    # customer_source_map + a comprehension would be) costs about a second of every
+    # cold render. Reindexing a (group, SKU) Series does the same join in C.
+    src = by_cust[["Customer Grouping", "SKU", "Data Source"]].copy()
+    src["Customer Grouping"] = src["Customer Grouping"].astype(str)
+    src["SKU"] = src["SKU"].astype(str).str.rstrip("*")
+    lookup = (
+        src.drop_duplicates(["Customer Grouping", "SKU"])
+        .set_index(["Customer Grouping", "SKU"])["Data Source"]
+    )
+    idx = pd.MultiIndex.from_arrays([
+        out["Customer Grouping"].astype(str),
+        out["SKU"].astype(str).str.rstrip("*"),
+    ])
+    use_orders = lookup.reindex(idx).to_numpy() == "Orders"
+    out["demand"] = np.where(use_orders, orders, pos)
+    return out
 
 
 def customer_source_map(summary):
@@ -100,11 +149,18 @@ def historical_window(agg, summary, anchors):
 
     Adds a single 'demand' column = POS for POS-based SKUs, Orders for
     Orders-based SKUs, so totals line up with the (mixed-source) forecast.
+
+    An ``agg`` that ALREADY carries ``demand`` is taken at its word and only
+    windowed. That is how the summed views stay additive: ``resolve_demand``
+    resolves the source per (SKU, customer) before the roll-up, which a per-SKU
+    ``source_map`` cannot reproduce once the customers have been added together.
     """
     lb, lcw, _ = anchors
-    src = source_map(summary)
     h = agg[(agg["WeekDate"] >= lb) & (agg["WeekDate"] <= lcw)].copy()
     h["SKU"] = h["SKU"].astype(str)
+    if "demand" in h.columns:
+        return h
+    src = source_map(summary)
     use_orders = h["SKU"].map(src).eq("Orders")
     orders = h["Orders"] if "Orders" in h.columns else np.nan
     h["demand"] = np.where(use_orders, orders, h["POS"])

@@ -3,7 +3,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dashboard_app.config import C_ACTUAL, C_UPDATED, C_ORIGINAL, C_GRID, fmt_dollar
+from dashboard_app.config import (
+    C_ACTUAL, C_UPDATED, C_ORIGINAL, C_GRID, MIXED_SOURCE, fmt_dollar,
+)
 from dashboard_app.summaries import historical_window
 
 
@@ -283,12 +285,23 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None,
     When date_range is given, the plotted traces are clipped to that window so the
     Y-axis rescales to fit the visible weeks. ``prices`` (a SKU->list-price
     map/Series) adds the "Revenue Risk: $X" row to the Original-projection hover.
+
+    An ``agg`` carrying a pre-resolved ``demand`` column (see
+    ``summaries.resolve_demand``) is plotted from THAT rather than from ``source``.
+    For a rolled-up SKU whose customers mix POS and Orders no single column is the
+    actual demand — ``source`` is then ``MIXED_SOURCE`` — and picking one would draw
+    an actuals line below the forecast the tiles beside it report.
     """
     lb, lcw, ffw = anchors
-    col = "Orders" if source == "Orders" else "POS"
     pm = _as_price_map(prices)
 
     a = agg[agg["SKU"].astype(str) == str(sku)].sort_values("WeekDate")
+    if "demand" in a.columns:
+        col = "demand"
+        label = "POS + Orders" if source == MIXED_SOURCE else source
+    else:
+        col = "Orders" if source == "Orders" else "POS"
+        label = source
     hist = a[(a["WeekDate"] >= lb) & (a["WeekDate"] <= lcw)].dropna(subset=[col])
     # Original projection: straight from the spreadsheet's Projection column,
     # across the SAME span shown for actuals + forecast (history start through the
@@ -318,9 +331,9 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None,
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=hist["WeekDate"], y=hist[col], name=f"Actual {source}",
+        x=hist["WeekDate"], y=hist[col], name=f"Actual {label}",
         mode="lines+markers", line=dict(color=C_ACTUAL, width=3),
-        marker=dict(size=7), hovertemplate=_hover_template(f"Actual {source}"),
+        marker=dict(size=7), hovertemplate=_hover_template(f"Actual {label}"),
     ))
     if not hist.empty and not fc.empty:
         fig.add_trace(go.Scatter(
@@ -331,10 +344,10 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None,
         ))
     fig.add_trace(go.Scatter(
         x=fc["WeekDate"], y=fc["projected_pos"],
-        name=f"Updated forecast (from {source})",
+        name=f"Updated forecast (from {label})",
         mode="lines+markers", line=dict(color=C_UPDATED, width=3, dash="dash"),
         marker=dict(size=7),
-        hovertemplate=_hover_template(f"Updated forecast (from {source})"),
+        hovertemplate=_hover_template(f"Updated forecast (from {label})"),
     ))
     if not sys_proj.empty:
         fig.add_trace(go.Scatter(
@@ -347,7 +360,7 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None,
     if rr is not None:
         fig.add_trace(rr)
     title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
-    return _base_layout(fig, title, ffw, y_title=f"Units ({source})")
+    return _base_layout(fig, title, ffw, y_title=f"Units ({label})")
 
 
 def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,

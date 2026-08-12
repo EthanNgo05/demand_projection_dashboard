@@ -118,7 +118,7 @@ from dashboard_app.pipeline import (  # noqa: F401
 )
 from dashboard_app.summaries import (  # noqa: F401
     _format_generated_at, avg_window_phrase, historical_window,
-    historical_window_label, resolve_avg_col, source_map,
+    historical_window_label, resolve_avg_col, resolve_demand, source_map,
 )
 from dashboard_app.charts import (  # noqa: F401
     _base_layout, _clip_to_range, aggregate_chart, chart_range_control, sku_chart,
@@ -147,10 +147,11 @@ from dashboard_app.compute import (  # noqa: F401
     ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, ONHAND_COL, TREND_COL, WOS_COL,
     _agent_summaries_generated_at, _agent_summaries_mtime, _agent_summary_path,
     _best_model_for_group, _forecast_one_group, _load_agent_summary, _region_frame,
-    attach_descriptive_averages, attach_supply_columns,
-    compute_by_customer, compute_by_customer_best,
-    compute_by_customer_frames, compute_view, list_views, run_autofit,
-    single_group_frames, summary_to_excel, view_to_excel, with_export_flags,
+    attach_current_projection, attach_descriptive_averages, attach_supply_columns,
+    attach_top_volume, compute_by_customer, compute_by_customer_best,
+    compute_by_customer_frames, compute_view, list_views, roll_up_summary,
+    roll_up_to_sku_week, run_autofit, single_group_frames, sku_grain_demand_frame,
+    summary_to_excel, view_to_excel, with_export_flags,
 )
 from dashboard_app.refresh import (  # noqa: F401
     BATCH_STALE_SECONDS, EXTRACT_SCRIPT, REFRESH_STALE_SECONDS, WAREHOUSE_EXTRACT_SCRIPT,
@@ -217,6 +218,79 @@ QUICK_CARD_COLS = [
     PRICE_COL, RISK_COL,
     ONHAND_COL, WOS_COL,
 ]
+
+
+def _coverage_note(src, by_cust, agg_by_group, horizon):
+    """What the view's totals do NOT cover, as counts — or None when they cover all.
+
+    Now that every figure on the page is the sum of the per-(SKU, customer) rows, a
+    row that never got forecast is a unit of demand missing from the total. The
+    per-group loop skips such groups silently (``compute._by_customer_frames``), which
+    is precisely how a wrong total hides, so the three ways coverage can fall short
+    are counted here and reported on the page:
+
+    * ``groups`` — customer groups in this view that produced no forecast at all
+      (no POS and no Orders anywhere in the fit window).
+    * ``ungrouped_rows`` — rows whose Customer Grouping is blank. The per-group loop
+      enumerates non-null groups only, so these are outside the totals entirely.
+    * ``planned_pairs`` / ``planned_units`` — (SKU, customer) pairs carrying a forward
+      plan but no forecast, and the weekly units that plan represents. These are
+      genuine over-projection candidates rather than a defect in the total; the
+      Exceptions view is where they are meant to be actioned.
+    """
+    note = {}
+    if src is not None and "Customer Grouping" in src.columns:
+        offered = set(src["Customer Grouping"].dropna().astype(str))
+        covered = set(by_cust["Customer Grouping"].astype(str))
+        note["groups"] = sorted(offered - covered)
+        note["ungrouped_rows"] = int(src["Customer Grouping"].isna().sum())
+    if agg_by_group is not None and "Projection" in agg_by_group.columns:
+        horizon = pd.to_datetime(pd.Series(list(horizon))).unique()
+        fwd = agg_by_group[pd.to_datetime(agg_by_group["WeekDate"]).isin(horizon)]
+        planned = (
+            pd.to_numeric(fwd["Projection"], errors="coerce")
+            .groupby([fwd["Customer Grouping"].astype(str), fwd["SKU"].astype(str)])
+            .sum(min_count=1)
+        )
+        planned = planned[planned.notna() & (planned != 0)]
+        have = set(zip(by_cust["Customer Grouping"].astype(str),
+                       by_cust["SKU"].astype(str)))
+        orphan = planned[[k not in have for k in planned.index]]
+        note["planned_pairs"] = int(len(orphan))
+        note["planned_units"] = float(orphan.sum()) / max(len(horizon), 1)
+    if not any(note.get(k) for k in
+               ("groups", "ungrouped_rows", "planned_pairs")):
+        return None
+    return note
+
+
+def _render_coverage_note(coverage):
+    """Render ``_coverage_note``'s counts as one caption under the KPI row."""
+    if not coverage:
+        return
+    bits = []
+    groups = coverage.get("groups") or []
+    if groups:
+        shown = ", ".join(groups[:4])
+        more = f" +{len(groups) - 4} more" if len(groups) > 4 else ""
+        bits.append(
+            f"**{len(groups)}** customer group(s) had no POS or Orders in the window "
+            f"and are not in these totals ({shown}{more})."
+        )
+    if coverage.get("ungrouped_rows"):
+        bits.append(
+            f"**{coverage['ungrouped_rows']:,}** rows have no Customer Grouping and "
+            "are outside every per-customer forecast."
+        )
+    if coverage.get("planned_pairs"):
+        bits.append(
+            f"**{coverage['planned_pairs']:,}** SKU-customer pairs carry a forward "
+            f"plan of ~{coverage['planned_units']:,.0f} units/wk but no recent demand "
+            "to forecast from, so they are not in the Updated figures — see "
+            "Exceptions for those."
+        )
+    if bits:
+        st.caption("⚑ " + " ".join(bits))
 
 
 @st.cache_data(show_spinner=False)
@@ -1655,54 +1729,104 @@ def main():
         # Move-to-end so a revisited view isn't the next eviction victim.
         stored = fc_cache.pop(cache_key)
         fc_cache[cache_key] = stored
-        summary, weekly, agg, by_cust, weekly_by_group, agg_by_group = stored
+        (summary, weekly, agg, by_cust, weekly_by_group, agg_by_group,
+         coverage) = stored
     else:
         prog = st.progress(0.0, text="Preparing…")
         try:
-            prog.progress(0.15, text="Building forecast for this view…")
-            summary, weekly, agg = compute_view(
-                df, view, today_ts, pipeline_path(),
-                prices, alpha, beta, phi, min_weeks, data_sig,
-            )
-
-            # Every view now needs the per-(SKU, customer) breakdown — it is the
-            # page's main table — plus the un-summed per-group frames its Customer
-            # detail chart and per-row detail cards draw from.
+            summary = weekly = agg = None
             by_cust = weekly_by_group = agg_by_group = None
+            coverage = None
             region_all = region_from_view(view)
             is_combined = view == ALL_CUSTOMERS_VIEW or region_all is not None
-            if summary is not None and not summary.empty:
-                if is_combined:
-                    def _bump(done, total, group):
-                        frac = 0.4 + 0.55 * (done / max(total, 1))
-                        prog.progress(
-                            min(frac, 0.98),
-                            text=f"Per-customer forecast… ({done}/{total})",
-                        )
-                    # A region rollup breaks out only its own region's groups.
-                    src = df if region_all is None else _region_frame(df, P, region_all)
-                    by_cust, weekly_by_group, agg_by_group = (
-                        compute_by_customer_frames(
-                            src, today_ts, pipeline_path(),
-                            prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
-                            data_sig=data_sig,
-                        )
+            if is_combined:
+                # ONE forecast per (SKU, customer group), and the view's totals are
+                # the SUM of those. There is deliberately no second fit on the
+                # customer-summed history here: it produced a different number for
+                # the same SKU than the table below it (+19.9% apart on the live
+                # snapshot, 90% of which was the Orders-only customers that a
+                # single per-SKU source selection silently dropped), and totals
+                # that disagree with their own parts are not usable for ordering.
+                # Optimized Projections has always worked this way; this is Quick
+                # Projections being brought in line with it, through the same
+                # roll_up_to_sku_week helper so the two provably agree.
+                def _bump(done, total, group):
+                    frac = 0.05 + 0.9 * (done / max(total, 1))
+                    prog.progress(
+                        min(frac, 0.98),
+                        text=f"Per-customer forecast… ({done}/{total})",
                     )
-                else:
-                    # The view IS one customer group, so compute_view already fit
-                    # exactly what the per-group loop would (same slice, same
-                    # aggregate, same grouping_label). Reuse those frames instead of
-                    # paying a second fit under a different cache key.
+                # A region rollup breaks out only its own region's groups.
+                src = df if region_all is None else _region_frame(df, P, region_all)
+                by_cust, weekly_by_group, agg_by_group = (
+                    compute_by_customer_frames(
+                        src, today_ts, pipeline_path(),
+                        prices, alpha, beta, phi, min_weeks, progress_cb=_bump,
+                        data_sig=data_sig,
+                    )
+                )
+                if by_cust is not None and not by_cust.empty:
+                    # Resolve each (SKU, customer)'s own POS/Orders signal BEFORE
+                    # summing, so the actuals total covers every customer the same
+                    # way the forecast total does. Charts and KPIs read the
+                    # resulting `demand` column via summaries.historical_window.
+                    agg_by_group = resolve_demand(agg_by_group, by_cust)
+                    weekly = roll_up_to_sku_week(
+                        weekly_by_group, ["projected_pos"], min_count=0)
+                    agg = roll_up_to_sku_week(
+                        agg_by_group, ["POS", "Orders", "Projection", "demand"])
+                    # Make the existing-plan column summable BEFORE rolling up: the
+                    # models' per-series mean divides by however many horizon weeks
+                    # that series has a plan for, so the rows could not be added.
+                    by_cust = attach_current_projection(
+                        by_cust, agg_by_group, weekly["WeekDate"],
+                        ["Customer Grouping", "SKU"],
+                    )
+                    summary = roll_up_summary(by_cust, agg, (lb, lcw, ffw), view)
+                    # Descriptive averages at SKU grain, from the resolved demand.
+                    summary = attach_descriptive_averages(
+                        summary, sku_grain_demand_frame(agg, view), today_ts)
+                    summary = attach_top_volume(summary, P, src, today_ts)
+                    coverage = _coverage_note(src, by_cust, agg_by_group,
+                                              weekly["WeekDate"])
+            else:
+                # The view IS one customer group: one fit, and the total already IS
+                # the part. compute_view's single-group branch does exactly what the
+                # per-group loop would (same slice, same aggregate, same label), so
+                # single_group_frames reuses it rather than paying a second fit.
+                prog.progress(0.15, text="Building forecast for this view…")
+                summary, weekly, agg = compute_view(
+                    df, view, today_ts, pipeline_path(),
+                    prices, alpha, beta, phi, min_weeks, data_sig,
+                )
+                if summary is not None and not summary.empty:
                     by_cust, weekly_by_group, agg_by_group = single_group_frames(
                         summary, weekly, agg, view, today_ts,
                     )
+                    agg_by_group = resolve_demand(agg_by_group, by_cust)
+                    agg = roll_up_to_sku_week(
+                        agg_by_group, ["POS", "Orders", "Projection", "demand"])
+                    # Same fixed-denominator existing-plan figure the combined views
+                    # use, so the column means ONE thing whichever view you open. A
+                    # single group has one row per SKU, so summary and by_cust get
+                    # the identical correction.
+                    horizon = weekly["WeekDate"]
+                    by_cust = attach_current_projection(
+                        by_cust, agg_by_group, horizon, ["Customer Grouping", "SKU"])
+                    summary = attach_current_projection(
+                        summary, agg, horizon, ["SKU"])
             prog.progress(1.0, text="Done")
         finally:
             prog.empty()
 
+        # A 7th element, but not a 7th DataFrame: `coverage` is a handful of ints and
+        # short group-name lists, so it costs nothing against the ~34 MB the
+        # per-group aggregate in slot 6 dominates (see FC_CACHE_MAX above). It has to
+        # ride along rather than be recomputed on a cache hit because it is derived
+        # from `src`, which only the miss branch builds.
         _bounded_put(
             fc_cache, cache_key,
-            (summary, weekly, agg, by_cust, weekly_by_group, agg_by_group),
+            (summary, weekly, agg, by_cust, weekly_by_group, agg_by_group, coverage),
             FC_CACHE_MAX,
         )
 
@@ -1757,8 +1881,19 @@ def main():
     # compute_view's summary, which carries exactly the selected model's own
     # average column, so it always describes the (lb, lcw) span the metric uses.
     # by_cust carries BOTH averages, so its stacked KPIs must be told explicitly.
-    anchors_avg_col = resolve_avg_col(summary)
+    # Window label for the total-weekly-demand KPI. It has to describe `anchors`, so
+    # it comes from the SIDEBAR model's own AVG_COL_LABEL — not from `summary`, which
+    # now carries BOTH descriptive averages (attach_descriptive_averages puts All-Time
+    # first, so resolve_avg_col's fallback would mislabel an 8-week window). Same
+    # reasoning, and the same line, as _render_best_model_combined.
+    anchors_avg_col = (
+        getattr(P, "AVG_COL_LABEL", EIGHT_WK_AVG_COL) if P is not None
+        else resolve_avg_col(summary)
+    )
     _render_kpis(summary, agg, (lb, lcw, ffw), avg_col=anchors_avg_col)
+    # Every figure above is the sum of the per-customer rows in the table below, so
+    # anything those rows don't cover is missing from the total. Say what, and how much.
+    _render_coverage_note(coverage)
 
     # ----- Aggregate chart --------------------------------------------------
     # Per-chart date-range picker (own key => independent from the other charts).
@@ -1831,19 +1966,18 @@ def main():
     # for a single bare customer group the KPI row and the total-demand chart above
     # ARE that group, so the section would only restate the table's detail cards.
     #
-    # Numbers come from the VIEW-TOTAL frames (summary/agg/weekly sliced to the SKU) —
-    # the one combined series the selected model fit, i.e. the same figures behind the
-    # KPI row and chart above and behind the by-SKU expander below. Deliberately NOT
-    # the sum of the per-group fits; the captions say so where the two sit adjacent.
+    # Numbers come from the view-total frames sliced to the SKU — which are the ROLL-UP
+    # of that SKU's per-customer forecasts, the same figures behind the KPI row, the
+    # chart above and the by-SKU expander below. So the tiles here and the customer
+    # breakdown at the bottom of this section are the same number twice, once summed and
+    # once itemised; they tie exactly, and tests/test_rollup_ties.py holds them to it.
     is_view_total = view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None
     if is_view_total:
         st.markdown("### SKU detail")
         st.caption(
-            "One SKU's total weekly demand across every customer group in this view, "
-            "forecast as a single combined series — the same figures the KPI row and "
-            "chart above are built from. Not the sum of the per-customer forecasts, so "
-            "it will not tie out exactly with this SKU's rows in the by-customer table "
-            "below."
+            "One SKU's total weekly demand across every customer group in this view — "
+            "the sum of that SKU's per-customer forecasts, so it ties exactly to its "
+            "rows in the breakdown below and in the by-customer table."
         )
         skus = sorted(summary["SKU"].astype(str))
         desc_by_sku = (
@@ -2011,9 +2145,8 @@ def main():
                 )
                 st.caption(
                     "Each customer group's own forecast for this SKU, largest updated "
-                    "forecast first. These are the per-group fits, so they sum to this "
-                    "SKU's rows in the table below rather than to the combined figures "
-                    "above."
+                    "forecast first. These are the parts the tiles above are the sum "
+                    "of — the two tie exactly."
                 )
 
     # ----- Summary table by SKU and customer --------------------------------
@@ -2051,9 +2184,9 @@ def main():
             st.caption("Each SKU broken out by customer group. Click a row to open "
                        "its chart and metrics.")
 
-        # Top-volume breakdown exists only on compute_view's summary, and only for
-        # the combined / region-rollup fits (the per-group fits pass no
-        # breakdown_df). It is a whole-view figure keyed by SKU; the card labels it
+        # Top-volume breakdown is attached by attach_top_volume, so it exists on the
+        # combined / region-rollup views only (a single-group view has nothing to
+        # break down). It is a whole-view figure keyed by SKU; the card labels it
         # as such.
         top_groups = (
             dict(zip(summary["SKU"].astype(str),
@@ -2077,49 +2210,52 @@ def main():
             extra_kpis=projection_kpi_extras,
             kpi_deltas={"Projection Difference": projection_difference_delta},
         )
+        # Both sheets are now the same grain's numbers: the `summary` sheet is the
+        # per-customer rows and `weekly_forecast` is their roll-up, so pivoting the
+        # weekly sheet reproduces the summary sheet's totals. It used to pair these
+        # bottom-up rows with the combined fit's weekly sheet, which meant one
+        # workbook disagreed with itself.
+        #
+        # "dashboard" in the name because the batch pipeline writes its own
+        # ALL_CUSTOMERS_demand_projections_<date>.xlsx to outputs/ — same old
+        # filename, a separate combined fit inside. Two files with one name and
+        # different numbers is how a spreadsheet ends up in the wrong meeting.
         st.download_button(
             "⬇️ Download the summary table by SKU and Customer",
             data=view_to_excel(with_export_flags(by_cust_table),
                                with_export_flags(weekly)),
             file_name=(
-                f"{view.replace('/', '-').replace(' ', '_')}"
-                f"_demand_projections_{today_str}.xlsx"
-                if view != ALL_CUSTOMERS_VIEW
-                else f"ALL_CUSTOMERS_demand_projections_{today_str}.xlsx"
+                f"{'ALL_CUSTOMERS' if view == ALL_CUSTOMERS_VIEW else view.replace('/', '-').replace(' ', '_')}"
+                f"_dashboard_demand_projections_{today_str}.xlsx"
             ),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_by_customer",
         )
 
     # ----- Summary table by SKU (view total), collapsed ---------------------
-    # One row per SKU for the whole view. Kept because it is a genuinely different
-    # number from the table above — the combined/region fit, not the sum of the
-    # per-group fits — and because it is the only place the top-volume breakdown
-    # appears as a column. Collapsed so it doesn't compete with the main table.
-    # Skipped for a single customer group, where it would just duplicate it. Shares
+    # One row per SKU: the SUM of that SKU's customer rows in the table above, and the
+    # per-SKU grain the KPI row and the chart are built from. It used to be a
+    # separately fit combined series — a different number under identical column
+    # names, which is what this whole change removed. It is kept (rather than deleted
+    # as a duplicate) because per-SKU IS the grain an order is placed at, and because
+    # it is where the top-volume breakdown appears as a column. Collapsed so it
+    # doesn't compete with the main table; skipped for a single customer group, where
+    # one row per SKU and one row per (SKU, customer) are the same table. Shares
     # `is_view_total` with the SKU-detail section above so the two gates can't drift.
     if is_view_total:
         with st.expander("Summary table by SKU (view total)"):
             st.caption(
-                "One row per SKU for the whole view, forecast as a single combined "
-                "series — not the sum of the per-group forecasts above, so the two "
-                "tables will not tie out exactly. Its demand average is the one the "
-                "selected model reports — the mean of the series it actually fit, "
-                "with promo spikes and stockout dips cleansed out — hence the "
-                "“(model fit)” suffix. The table above instead shows the observed "
-                "demand average, model-independent, plus a recent 8-week run-rate."
+                "One row per SKU for the whole view — the sum of that SKU's customer "
+                "rows above, so the two tables tie out exactly. Both carry the same "
+                "observed demand averages (model-independent) plus the recent 8-week "
+                "run-rate; the only column unique to this one is the top-volume "
+                "customer breakdown."
             )
-            # Qualify the model's own average so it can't be read as the canonical
-            # observed one. compute_view's summary is left untouched on purpose (the
-            # agent parity tests hold it to exact equality with fit_regression), so
-            # this table genuinely carries the cleansed fitted figure — under the
-            # unqualified name it would be the third same-name-different-number
-            # collision this whole change exists to remove. Display-only: the rename
-            # lands on a local copy, after the cache and before render/export.
-            model_avg_col = resolve_avg_col(summary)
-            summary_table = summary.rename(
-                columns={model_avg_col: f"{model_avg_col} (model fit)"}
-            )
+            # No "(model fit)" rename any more: there is no separate fitted average
+            # here to distinguish. attach_descriptive_averages gives this frame the
+            # same central observed figures every other table shows, so the column
+            # means exactly what its name says.
+            summary_table = summary
             if RISK_COL in summary_table.columns \
                     and summary_table[RISK_COL].notna().any():
                 # Largest revenue risk first, by magnitude (a big drop is as much a
@@ -2139,7 +2275,7 @@ def main():
                 data=view_to_excel(with_export_flags(summary_table),
                                    with_export_flags(weekly)),
                 file_name=f"{view.replace('/', '-').replace(' ', '_')}"
-                          f"_by_sku_demand_projections_{today_str}.xlsx",
+                          f"_dashboard_by_sku_demand_projections_{today_str}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_by_sku",
             )

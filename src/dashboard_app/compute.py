@@ -11,6 +11,7 @@ import streamlit as st
 
 from dashboard_app.config import (
     ALL_CUSTOMERS_VIEW, region_from_view, MODEL_OPTIONS, MODEL_USED_COL,
+    MIXED_SOURCE, PRICE_COL, RISK_COL,
     model_display, REPO_ROOT,
     # Re-exported below, unchanged, for every caller that has always imported
     # these from this module (dashboard.py, kpis.py, exceptions.py,
@@ -365,6 +366,216 @@ def _by_customer_frames(df, groups, forecast_group, progress_cb=None):
     return (pd.concat(frames, ignore_index=True),
             pd.concat(weekly_by_group_frames, ignore_index=True),
             pd.concat(agg_by_group_frames, ignore_index=True))
+
+
+def roll_up_to_sku_week(frame, value_cols, min_count=1):
+    """(SKU, WeekDate) totals from a per-(SKU, Customer Grouping) frame.
+
+    The one way this app turns per-customer series into a view total. Customer
+    groups are disjoint subsets of the customers, so summing by (SKU, WeekDate) is
+    a plain total with no double counting. Naming the value columns explicitly is
+    what drops the ``Customer Grouping`` the per-group frames carry.
+
+    ``min_count=1`` keeps a genuinely-absent cell NaN rather than coercing it to a
+    real 0 — which the span/first-week logic in ``_descriptive_averages`` depends
+    on. Pass ``min_count=0`` for a column that is never null (the weekly forecast),
+    where it would only risk an int64 -> float64 promotion.
+    """
+    keep = [c for c in value_cols if c in frame.columns]
+    return (
+        frame.groupby(["SKU", "WeekDate"], as_index=False)[keep]
+        .sum(min_count=min_count)
+    )
+
+
+def attach_current_projection(summary, agg_frame, horizon, keys):
+    """Overwrite ``Current Projection Average`` with an ADDITIVE definition.
+
+    The models compute it as the mean of the snapshot's own ``Projection`` over the
+    horizon weeks that HAVE one — ``.dropna(...).groupby(...).mean()`` — so each
+    series divides by however many of the 15 weeks it happens to cover, 1 to 15.
+    Two customers with the same total plan spread over different numbers of weeks
+    therefore report different averages, and the per-customer values cannot be
+    summed into a SKU total: on the live snapshot that alone put the by-customer
+    table and the view total 1,867 units/week apart on a column that contains no
+    model at all, only raw snapshot data.
+
+    Recomputed here as total planned units over the horizon / the FIXED horizon
+    length, which sums exactly at any grain. A blank week is read as "no plan" (0),
+    which is what an empty forward projection means.
+
+    Deliberately NOT rounded: rounding each of ~4,000 rows and then summing does not
+    equal rounding the sum, and this column has to tie to its own total. The tables
+    and KPIs format it to whole units at display time.
+
+    ``keys`` is the grain of ``summary`` — ``["Customer Grouping", "SKU"]`` for a
+    by-customer frame, ``["SKU"]`` for a per-SKU one. Returns ``summary`` unchanged
+    when either frame lacks what is needed.
+    """
+    col = "Current Projection Average"
+    if summary is None or summary.empty or agg_frame is None or agg_frame.empty:
+        return summary
+    if col not in summary.columns or "Projection" not in agg_frame.columns:
+        return summary
+    if not set(keys) <= set(summary.columns) or not set(keys) <= set(agg_frame.columns):
+        return summary
+
+    horizon = pd.to_datetime(pd.Series(list(horizon))).unique()
+    n_weeks = max(len(horizon), 1)
+    a = agg_frame[pd.to_datetime(agg_frame["WeekDate"]).isin(horizon)]
+    totals = (
+        pd.to_numeric(a["Projection"], errors="coerce")
+        .groupby([a[k].astype(str) for k in keys]).sum(min_count=1)
+    )
+    out = summary.copy()
+    idx = (
+        pd.MultiIndex.from_arrays([out[k].astype(str) for k in keys])
+        if len(keys) > 1 else pd.Index(out[keys[0]].astype(str))
+    )
+    out[col] = totals.reindex(idx).to_numpy() / n_weeks
+    # A pair with no forward plan at all has 0 planned units, not an unknown one.
+    out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    if "Updated Projection Average" in out.columns:
+        out["Projection Difference"] = (
+            pd.to_numeric(out["Updated Projection Average"], errors="coerce") - out[col]
+        )
+        if PRICE_COL in out.columns:
+            out[RISK_COL] = (
+                out["Projection Difference"] * pd.to_numeric(
+                    out[PRICE_COL], errors="coerce")
+            ).round(2)
+    return out
+
+
+def sku_grain_demand_frame(agg_all, view_label):
+    """``agg_all`` reshaped so ``_descriptive_averages`` reads it at SKU grain.
+
+    ``_avg`` picks the source itself per (Customer Grouping, SKU) — POS if the pair
+    has any, else Orders — which at SKU grain would resolve ONE source for the whole
+    SKU and so re-drop exactly the Orders-only customers the roll-up exists to keep.
+    The already-resolved per-customer ``demand`` is therefore handed over AS the POS
+    column with Orders blanked, which makes that choice a no-op and leaves ``_avg``
+    doing only the part that is wanted: total / weeks-in-span from the SKU's first
+    week. Reusing the golden-mastered helper beats reimplementing its span rules.
+    """
+    out = agg_all[["SKU", "WeekDate"]].copy()
+    out["POS"] = pd.to_numeric(agg_all["demand"], errors="coerce")
+    out["Orders"] = np.nan
+    out["Customer Grouping"] = view_label
+    return out
+
+
+def roll_up_summary(by_cust, agg_all, anchors, view_label):
+    """One row per SKU from a per-(SKU, Customer Grouping) summary — a TOTAL.
+
+    This is the view-level summary for the combined and region-rollup views: the
+    sum of the SKU's customer rows, NOT a separate fit on the customer-summed
+    history. Forecasts are made per SKU x customer, so a view total is the sum of
+    those parts and nothing else — that is what lets the KPI row, the chart, the
+    by-SKU table and the by-customer table below them all carry one number.
+
+    ``by_cust`` must already have been through ``attach_current_projection``, which
+    is what makes ``Current Projection Average`` summable; both unit columns are then
+    plain sums here and the total ties to its own rows exactly.
+
+    Two columns are re-derived rather than summed:
+
+    * ``Projection Difference`` / ``Revenue Risk`` — recomputed from the summed
+      terms, so they stay consistent with the two figures above them (summing them
+      gives the same answer; deriving makes that impossible to drift).
+    * ``Data Source`` — ``MIXED_SOURCE`` where the SKU's groups disagree.
+
+    ``Weeks with data`` is recounted over the window as the weeks the SKU sold to
+    ANY customer (summing the per-customer counts would multiply-count a week two
+    customers both sold in). The descriptive averages are likewise recomputed at SKU
+    grain by the caller, via ``sku_grain_demand_frame`` +
+    ``attach_descriptive_averages``, rather than summed — same different-denominators
+    reason as ``Current Projection Average``.
+
+    Column order follows ``by_cust``, because it drives the Excel exports.
+    """
+    if by_cust is None or by_cust.empty:
+        return by_cust
+
+    b = by_cust.copy()
+    b["SKU"] = b["SKU"].astype(str)
+    sums = [c for c in ["Updated Projection Average", "Current Projection Average"]
+            if c in b.columns]
+    for c in sums:
+        b[c] = pd.to_numeric(b[c], errors="coerce")
+    out = b.groupby("SKU", as_index=False)[sums].sum(min_count=1)
+
+    def _first(col):
+        """That SKU's first non-null value of ``col`` — genuinely per-SKU fields."""
+        if col not in b.columns:
+            return None
+        s = b.dropna(subset=[col]).groupby("SKU")[col].first()
+        return out["SKU"].map(s)
+
+    for col in ("Description", PRICE_COL):
+        vals = _first(col)
+        if vals is not None:
+            out[col] = vals
+    if "Weeks with data" in b.columns and "demand" in agg_all.columns:
+        lb, lcw, _ = anchors
+        wk = pd.to_datetime(agg_all["WeekDate"])
+        win = agg_all[(wk >= lb) & (wk <= lcw) & agg_all["demand"].notna()]
+        out["Weeks with data"] = (
+            out["SKU"].map(win.groupby(win["SKU"].astype(str))["WeekDate"].nunique())
+            .fillna(0).astype("int64")
+        )
+    # One label for the whole view, mirroring what the per-view fit used to stamp.
+    out["Customer Grouping"] = view_label
+
+    # Data Source: one value where every group agrees, else explicitly mixed.
+    if "Data Source" in b.columns:
+        nunique = b.groupby("SKU")["Data Source"].nunique()
+        first_src = b.groupby("SKU")["Data Source"].first()
+        out["Data Source"] = np.where(
+            out["SKU"].map(nunique).fillna(0) > 1,
+            MIXED_SOURCE,
+            out["SKU"].map(first_src),
+        )
+
+    if {"Updated Projection Average", "Current Projection Average"} <= set(out.columns):
+        out["Projection Difference"] = (
+            out["Updated Projection Average"] - out["Current Projection Average"]
+        )
+        if PRICE_COL in out.columns:
+            out[RISK_COL] = (
+                out["Projection Difference"].astype("float64") * out[PRICE_COL]
+            ).round(2)
+
+    cols = [c for c in by_cust.columns if c in out.columns]
+    cols += [c for c in out.columns if c not in cols]
+    return out[cols].sort_values("SKU").reset_index(drop=True)
+
+
+def attach_top_volume(summary, P, src, today_ts):
+    """Add ``Top Volume Customer Groups`` to a view-total summary.
+
+    Which customer groups drive each SKU's volume. It used to arrive as a side
+    effect of the combined fit (``fit_regression``'s ``breakdown_df``), but the
+    underlying ``top_volume_customers`` has always been a standalone rollup of the
+    RAW frame that needs no fit at all — it is part of the documented pipeline
+    surface and present on all five models. Calling it directly is what lets the
+    combined fit go without losing the column. A pipeline that doesn't define it
+    simply yields no column, exactly as a per-group fit does today.
+    """
+    fn = getattr(P, "top_volume_customers", None)
+    if fn is None or summary is None or summary.empty:
+        return summary
+    contributors = fn(src, today_ts)
+    if contributors is None or contributors.empty:
+        return summary
+    contributors = contributors.copy()
+    contributors["SKU"] = contributors["SKU"].astype(str)
+    out = summary.merge(contributors, on="SKU", how="left")
+    # A SKU whose POS is present but all zero has no volume to attribute.
+    out["Top Volume Customer Groups"] = (
+        out["Top Volume Customer Groups"].fillna("(no volume)")
+    )
+    return out
 
 
 def compute_by_customer(df, today_ts, model_path, prices=None, alpha=None,
@@ -899,19 +1110,12 @@ def compute_by_customer_best(df, today_ts, prices=None, min_weeks=None,
         cols.insert(pos, MODEL_USED_COL)
         combined = combined[cols]
 
-    # Stitch the per-group series into one total per (SKU, WeekDate). min_count=1
-    # keeps a genuinely-absent cell NaN rather than coercing it to 0. Naming the
-    # value columns explicitly is what drops the "Customer Grouping" the per-group
-    # frames carry, so these two come out at (SKU, WeekDate) grain.
-    weekly_all = (
-        weekly_by_group
-        .groupby(["SKU", "WeekDate"], as_index=False)["projected_pos"].sum()
-    )
-    agg_all = (
-        agg_by_group
-        .groupby(["SKU", "WeekDate"], as_index=False)[["POS", "Orders", "Projection"]]
-        .sum(min_count=1)
-    )
+    # Stitch the per-group series into one total per (SKU, WeekDate) — the same
+    # roll-up Quick Projections uses, so the two views provably total identically.
+    # projected_pos is never null, so min_count=0 there (matching the plain .sum()
+    # this used to call, and avoiding an int64 -> float64 promotion).
+    weekly_all = roll_up_to_sku_week(weekly_by_group, ["projected_pos"], min_count=0)
+    agg_all = roll_up_to_sku_week(agg_by_group, ["POS", "Orders", "Projection"])
     return combined, weekly_all, agg_all, weekly_by_group, agg_by_group, excluded
 
 
