@@ -104,8 +104,8 @@ if not logger.handlers:
 from dashboard_app.config import (  # noqa: F401
     ALL_CUSTOMERS_VIEW, ALL_REGIONS, BEST_MODEL_COMBINED_VIEW, C_ACTUAL, C_GRID,
     C_ORIGINAL, C_UPDATED,
-    DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, HISTORICAL_VIEW, LOGO_PATH, MODEL_DISPLAY,
-    MODEL_OPTIONS, MODEL_USED_COL,
+    DEFAULT_MODEL, EXCEPTIONS_VIEW, HERE, HISTORICAL_VIEW, KPI_HELP, LOGO_PATH,
+    MODEL_DISPLAY, MODEL_OPTIONS, MODEL_USED_COL,
     PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
     SCOPE_LABELS, WATCHLIST_VIEW,
     _ENV_PIPELINE,
@@ -1821,6 +1821,201 @@ def main():
             _render_kpis(summary_c, agg_c, (lb, lcw, ffw), stacked=True,
                          avg_col=anchors_avg_col)
 
+    # ----- Per-SKU detail (view total) --------------------------------------
+    # The mirror of Customer detail, drilled the other way: ONE SKU's total weekly
+    # demand across every customer group in the view — the order-sizing view of the
+    # page ("how many units of this SKU do I need per week?").
+    #
+    # Gated to the all-customers scopes (combined or a region rollup), the only ones
+    # where "total across all customers" is a number the page doesn't already show:
+    # for a single bare customer group the KPI row and the total-demand chart above
+    # ARE that group, so the section would only restate the table's detail cards.
+    #
+    # Numbers come from the VIEW-TOTAL frames (summary/agg/weekly sliced to the SKU) —
+    # the one combined series the selected model fit, i.e. the same figures behind the
+    # KPI row and chart above and behind the by-SKU expander below. Deliberately NOT
+    # the sum of the per-group fits; the captions say so where the two sit adjacent.
+    is_view_total = view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None
+    if is_view_total:
+        st.markdown("### SKU detail")
+        st.caption(
+            "One SKU's total weekly demand across every customer group in this view, "
+            "forecast as a single combined series — the same figures the KPI row and "
+            "chart above are built from. Not the sum of the per-customer forecasts, so "
+            "it will not tie out exactly with this SKU's rows in the by-customer table "
+            "below."
+        )
+        skus = sorted(summary["SKU"].astype(str))
+        desc_by_sku = (
+            dict(zip(summary["SKU"].astype(str), summary["Description"]))
+            if "Description" in summary.columns else {}
+        )
+
+        def _sku_label(s, _d=desc_by_sku):
+            # Label carries the description so the search box matches on either; the
+            # stored value stays the raw SKU (same value-vs-label split as
+            # quick_group_label on the Customer-group selector).
+            desc = _d.get(s)
+            return f"{s} — {desc}" if isinstance(desc, str) and desc else str(s)
+
+        sku = st.selectbox("SKU", skus, key="quick_sku", help="Type to search",
+                           format_func=_sku_label)
+        summary_s = summary[summary["SKU"].astype(str) == sku]
+        agg_s = agg[agg["SKU"].astype(str) == sku]
+        weekly_s = weekly[weekly["SKU"].astype(str) == sku]
+
+        if agg_s.empty or weekly_s.empty:
+            st.caption("No weekly data for this SKU in this snapshot.")
+        else:
+            desc = desc_by_sku.get(sku) if isinstance(desc_by_sku.get(sku), str) else ""
+            source = (
+                summary_s["Data Source"].iloc[0]
+                if "Data Source" in summary_s.columns and not summary_s.empty
+                else "POS"
+            )
+            # Chart-only history floor, per SKU — same reasoning as chart_anchors
+            # above (`lb` is as short as 8 weeks under the 8-Week Moving Average
+            # model, which would trap the range picker inside that window), but keyed
+            # to this SKU's own first week rather than the whole view's.
+            sku_anchors = (pd.to_datetime(agg_s["WeekDate"]).min(), lcw, ffw)
+
+            scL, scR = st.columns([3, 1])
+            with scL:
+                # Own key => this picker is independent of range_agg / range_cust_quick.
+                # Handed the SKU-sliced frames (rather than the full ones, which
+                # sku_chart would filter itself) so the picker's history floor is this
+                # SKU's first week, not the view's.
+                sku_range = chart_range_control(agg_s, weekly_s, lcw,
+                                                key="range_sku_quick")
+                st.plotly_chart(
+                    sku_chart(sku, desc, source, agg_s, weekly_s, sku_anchors,
+                              date_range=sku_range, prices=prices),
+                    width="stretch",
+                )
+            with scR:
+                # Same seven metrics as the top of the view, scoped to this SKU and
+                # stacked to fit the side column. Section anchors (not the widened
+                # chart range) so the historical-demand window lines up with the KPI
+                # row above.
+                _render_kpis(summary_s, agg_s, (lb, lcw, ffw), stacked=True,
+                             avg_col=anchors_avg_col)
+                # On Hand / Weeks of Supply — the two figures that turn a weekly
+                # forecast into an order quantity. Both are SKU-level constants across
+                # a SKU's customer rows (see attach_supply_columns), so this is a
+                # lookup off by_cust, not a second computation. Absent when no
+                # warehouse snapshot was loaded: "unknown stock" must not read as zero.
+                supply = (
+                    by_cust[by_cust["SKU"].astype(str) == sku] if has_by_cust else None
+                )
+                if supply is not None and not supply.empty:
+                    for col, fmt in ((ONHAND_COL, "{:,.0f}"), (WOS_COL, "{:,.1f}")):
+                        if col not in supply.columns:
+                            continue
+                        vals = supply[col].dropna()
+                        if vals.empty:
+                            continue
+                        st.metric(col, fmt.format(vals.iloc[0]),
+                                  help=KPI_HELP.get(col))
+
+            # --- Weekly forecast numbers ---------------------------------------
+            # The chart's forecast line as a table: the point of the section is to read
+            # an order quantity off a row instead of hovering a trace. Cumulative Units
+            # answers "how much to cover the next N weeks" without any arithmetic.
+            st.markdown("#### Weekly forecast")
+            wk_tbl = (
+                weekly_s[["WeekDate", "projected_pos"]]
+                .sort_values("WeekDate")
+                .rename(columns={"WeekDate": "Week of",
+                                 "projected_pos": "Forecast Units"})
+                .reset_index(drop=True)
+            )
+            wk_tbl["Week of"] = pd.to_datetime(wk_tbl["Week of"])
+            wk_tbl["Cumulative Units"] = wk_tbl["Forecast Units"].cumsum()
+            # The original projection over the same weeks, straight from the snapshot's
+            # Projection column — no recomputation, blank where it has none.
+            wk_tbl = wk_tbl.merge(
+                agg_s[["WeekDate", "Projection"]]
+                .assign(WeekDate=lambda d: pd.to_datetime(d["WeekDate"]))
+                .rename(columns={"WeekDate": "Week of",
+                                 "Projection": "Original Projection"}),
+                on="Week of", how="left",
+            )
+            wk_tbl["Difference"] = (
+                wk_tbl["Forecast Units"] - wk_tbl["Original Projection"]
+            )
+            st.dataframe(
+                wk_tbl, width="stretch", hide_index=True,
+                # Formatted through column_config and NOT style_summary: column_config
+                # formatting SILENTLY overrides a Styler on the same column, so a table
+                # gets one or the other, never both.
+                column_config={
+                    "Week of": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
+                    **{c: st.column_config.NumberColumn(format="%,.0f")
+                       for c in ["Forecast Units", "Cumulative Units",
+                                 "Original Projection", "Difference"]},
+                },
+            )
+            # The sheet outlives the filename, so the export repeats the SKU on every
+            # row; single-sheet because there is no second frame to pair here.
+            wk_export = wk_tbl.copy()
+            wk_export.insert(0, "SKU", str(sku))
+            # Same filename convention as the two summary downloads below.
+            view_slug = (
+                "ALL_CUSTOMERS" if view == ALL_CUSTOMERS_VIEW
+                else view.replace("/", "-").replace(" ", "_")
+            )
+            st.download_button(
+                "⬇️ Download this SKU's weekly forecast",
+                data=summary_to_excel(with_export_flags(wk_export),
+                                      sheet_name="weekly_forecast"),
+                file_name=(
+                    f"{view_slug}_{str(sku).replace('/', '-')}"
+                    f"_weekly_forecast_{today_str}.xlsx"
+                ),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_sku_weekly",
+            )
+
+            # --- Customer group breakdown --------------------------------------
+            # Where this SKU's volume comes from. These are the PER-GROUP fits, so they
+            # sum to the SKU's rows in the by-customer table below — not to the
+            # combined figures above.
+            st.markdown("#### Customer group breakdown")
+            bd = by_cust[by_cust["SKU"].astype(str) == sku] if has_by_cust else None
+            if bd is None or bd.empty:
+                st.caption("No per-customer forecasts for this SKU in this snapshot.")
+            else:
+                upd_col = "Updated Projection Average"
+                share_col = "Share of Updated Forecast"
+                if upd_col in bd.columns:
+                    bd = bd.sort_values(upd_col, ascending=False, na_position="last")
+                    upd = pd.to_numeric(bd[upd_col], errors="coerce")
+                    total_upd = upd.sum()
+                    # Share as a PREFORMATTED STRING so the frame can still go through
+                    # style_summary (which colours Projection Difference / Revenue Risk
+                    # the same as every other table on the page) — a column_config for
+                    # a percent format would clobber that Styler.
+                    bd = bd.assign(**{share_col: (
+                        (upd / total_upd * 100).map(
+                            lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+                        if total_upd else "—"
+                    )})
+                cols = [c for c in [
+                    "Customer Grouping", "Data Source", EIGHT_WK_AVG_COL,
+                    "Current Projection Average", upd_col, share_col,
+                    "Projection Difference", RISK_COL,
+                ] if c in bd.columns]
+                st.dataframe(
+                    style_summary(bd[cols].reset_index(drop=True)),
+                    width="stretch", hide_index=True,
+                )
+                st.caption(
+                    "Each customer group's own forecast for this SKU, largest updated "
+                    "forecast first. These are the per-group fits, so they sum to this "
+                    "SKU's rows in the table below rather than to the combined figures "
+                    "above."
+                )
+
     # ----- Summary table by SKU and customer --------------------------------
     # The page's main table: every SKU broken out by customer group, mirroring the
     # pipeline's ALL_CUSTOMERS_demand_projections file. Computed alongside the main
@@ -1901,8 +2096,9 @@ def main():
     # number from the table above — the combined/region fit, not the sum of the
     # per-group fits — and because it is the only place the top-volume breakdown
     # appears as a column. Collapsed so it doesn't compete with the main table.
-    # Skipped for a single customer group, where it would just duplicate it.
-    if view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None:
+    # Skipped for a single customer group, where it would just duplicate it. Shares
+    # `is_view_total` with the SKU-detail section above so the two gates can't drift.
+    if is_view_total:
         with st.expander("Summary table by SKU (view total)"):
             st.caption(
                 "One row per SKU for the whole view, forecast as a single combined "

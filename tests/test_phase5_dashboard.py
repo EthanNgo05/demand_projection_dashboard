@@ -609,8 +609,9 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
     Region defaults to the ALL_REGIONS sentinel and Customer group to the raw
     ALL_CUSTOMERS_VIEW string (raw, not the prettified label — several callers,
     including the agent-run button, read the selected value as a view ID). The
-    body then reads KPIs -> total demand -> Customer detail -> the by-SKU-and-
-    customer table, with the view-level per-SKU table in a collapsed expander.
+    body then reads KPIs -> total demand -> Customer detail -> SKU detail -> the
+    by-SKU-and-customer table, with the view-level per-SKU table in a collapsed
+    expander.
     """
     import dashboard
 
@@ -621,13 +622,15 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
 
     headings = _headings(at)
     assert "### Customer detail" in headings
+    # The two drill-downs, one per axis: SKU detail is the view TOTAL for one SKU
+    # across every customer group (the table's row detail cards remain the
+    # per-(SKU, customer group) view), so it is gated to the aggregate scopes.
+    assert "### SKU detail" in headings
     assert "### Summary table by SKU and customer" in headings
-    # Customer detail comes before the table.
+    # Both drill-downs come before the table, customer first.
     assert headings.index("### Customer detail") < \
+        headings.index("### SKU detail") < \
         headings.index("### Summary table by SKU and customer")
-    # The old dropdown-driven SKU-detail section is gone (it lives in the table's
-    # row detail cards now).
-    assert "### SKU detail" not in headings
     assert any("Summary table by SKU (view total)" in (e.label or "")
                for e in at.expander)
 
@@ -686,8 +689,10 @@ def test_quick_single_group_renders_the_by_customer_table():
 
     It used to be gated to the combined / region-rollup views, so this branch had
     no coverage at all. It now runs through single_group_frames (the fast path that
-    reuses compute_view's frames). Customer detail and the view-total expander are
-    deliberately absent: with one group both would just restate the totals above.
+    reuses compute_view's frames). Customer detail, SKU detail and the view-total
+    expander are deliberately absent: with one group all three would just restate
+    the totals above (the chart and KPI row at the top of the page ARE that group,
+    and the table's row detail cards already hold its per-SKU charts).
 
     Groups are probed rather than assumed — a group with no demand in the model's
     window legitimately stops the body with a "nothing to forecast" error, and
@@ -715,6 +720,7 @@ def test_quick_single_group_renders_the_by_customer_table():
     headings = _headings(at)
     assert "### Summary table by SKU and customer" in headings
     assert "### Customer detail" not in headings
+    assert "### SKU detail" not in headings
     assert not any("Summary table by SKU (view total)" in (e.label or "")
                    for e in at.expander)
 
