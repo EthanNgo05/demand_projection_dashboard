@@ -1,4 +1,5 @@
 """Constants, model catalog, and pure view/format helpers (streamlit-free)."""
+import datetime
 import os
 
 import pandas as pd
@@ -392,6 +393,73 @@ def fmt_compact(v, money=False, decimals=1):
             return f"{sign}{prefix}{n / cutoff:,.{decimals}f}{suffix}"
     # Below 1,000 an abbreviation would lose information for no width saving.
     return f"{sign}{prefix}{n:,.0f}"
+
+
+def _to_datetime(ts):
+    """Coerce any timestamp shape this app produces into a ``datetime``, or None.
+
+    Four mechanisms wrote timestamps before this existed -- ``pd.Timestamp``,
+    ``datetime``, ``time.time()`` epoch floats, and the ``"%Y-%m-%d %H:%M:%S"``
+    strings that ``refresh.py`` persists to its lock files -- so the display
+    helpers below need one funnel rather than a format assumption per call site.
+
+    Returns None (never raises) for anything unparseable, so a cosmetic
+    timestamp can NEVER take down a render path. The lock-file string in
+    particular is read off a network share and may be empty or half-written.
+    """
+    if ts is None or ts == "":
+        return None
+    # Reject containers up front. pd.to_datetime([]) returns an empty index
+    # rather than raising, and pd.isna() on that yields an ARRAY, whose truth
+    # value then raises out of the very guard meant to catch bad input.
+    if not pd.api.types.is_scalar(ts):
+        return None
+    # Epoch seconds (time.time()) -- checked before the pandas path, which would
+    # otherwise read a bare float as nanoseconds since 1970.
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        try:
+            if pd.isna(ts):
+                return None
+            return datetime.datetime.fromtimestamp(float(ts))
+        except (ValueError, OSError, OverflowError):
+            return None
+    try:
+        dt = pd.to_datetime(ts)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if dt is None or pd.isna(dt):
+        return None
+    return dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt
+
+
+def _time_of_day(dt):
+    """``3:15 PM`` from a datetime.
+
+    ``%I`` is zero-padded (``03``), so the leading zero is stripped; midnight and
+    noon both render as ``12``, where the strip would otherwise leave an empty
+    hour.
+    """
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    return dt.strftime(f"{hour}:%M %p")
+
+
+def fmt_when(ts):
+    """Format a timestamp as ``2026-08-11 3:18 PM``.
+
+    Absolute, never relative. "yesterday at 3:18 PM" made the reader do date
+    arithmetic to answer the only question they have ("which snapshot is this?"),
+    and it went stale in a tab left open overnight -- a page open past midnight
+    still claimed "today". The ISO date matches the ``%Y-%m-%d`` form used for
+    snapshot filenames and lock files, so a caption and a filename can be
+    compared by eye.
+
+    Seconds are dropped -- they are never read. Returns an em dash, never raises,
+    for anything unparseable.
+    """
+    dt = _to_datetime(ts)
+    if dt is None:
+        return "—"
+    return f"{dt.strftime('%Y-%m-%d')} {_time_of_day(dt)}"
 
 
 def bounded_put(store, key, value, cap):

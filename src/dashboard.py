@@ -109,8 +109,8 @@ from dashboard_app.config import (  # noqa: F401
     PRICE_COL, QUICK_VIEW, REGION_ALL_PREFIX, REPO_ROOT, RISK_COL, SCOPE_CAPTIONS,
     SCOPE_LABELS, WATCHLIST_VIEW,
     _ENV_PIPELINE,
-    bounded_put, fmt_dollar, model_display, quick_group_label, region_all_view,
-    region_from_view,
+    bounded_put, fmt_dollar, fmt_when, model_display, quick_group_label,
+    region_all_view, region_from_view,
 )
 from dashboard_app.pipeline import (  # noqa: F401
     _load_pipeline_cached, _supports_autofit, _supports_min_weeks, _supports_prices,
@@ -787,7 +787,8 @@ def main():
         # self-healing baseline.
         if running or wh_running:
             st.info(
-                f"⏳ Syncing from data warehouse… started {started or wh_started}. "
+                f"⏳ Syncing from data warehouse… started at "
+                f"{fmt_when(started or wh_started)}. "
                 "You can keep working on the current snapshot; the page "
                 "switches to the fresh data automatically when it finishes "
                 "(usually a few minutes)."
@@ -800,11 +801,22 @@ def main():
         # and is visible from every session and both hosts.
         for _label, _when, _host, _detail in sync_failures():
             st.error(
-                f"❌ **{_label} sync failed** — last attempt {_when} on "
-                f"`{_host}`.\n\n```\n{_detail}\n```\n"
-                "The dashboard is still serving the previous snapshot. Full "
-                "detail is in `logs/<date>/logs_refresh_*.txt`."
+                # Label first, verbatim — lowercasing it to fit a sentence turned
+                # "Key-SKU list" into "key-sku list".
+                f"❌ **{_label} — couldn't sync.** The last attempt "
+                f"{fmt_when(_when)} didn't finish. You're still seeing the "
+                "previous data, which is safe to keep working with."
             )
+            # The raw error line and the host that produced it are what a
+            # developer needs and what everyone else scrolls past, so they go
+            # behind the same "Technical details" disclosure the top-level
+            # error handler uses (see the except block at the end of _run).
+            with st.expander(f"Technical details — {_label} sync"):
+                st.code(_detail)
+                st.caption(
+                    f"Reported by `{_host}`. Full logs are in "
+                    f"{os.path.dirname(dated_log_path(LOG_FILENAME))}."
+                )
         if sync_failures() and st.button("Dismiss sync errors", key="clear_sync_err"):
             clear_sync_failures()
             st.rerun()
@@ -870,10 +882,7 @@ def main():
             # pickers. Sits right under the sync button as its status line.
             if files:
                 _d0, _p0 = files[0]
-                st.caption(
-                    f"Latest snapshot: "
-                    f"{time.strftime('%Y-%m-%d %I:%M %p', time.localtime(os.path.getmtime(_p0)))}"
-                )
+                st.caption(f"Latest snapshot: {fmt_when(os.path.getmtime(_p0))}")
             override = st.toggle(
                 "Manually override data",
                 # Default on only when there's no snapshot on disk yet, so a
@@ -913,7 +922,10 @@ def main():
                     os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
                 )
                 if anthropic_no_key:
-                    st.caption("⚠️ No ANTHROPIC_API_KEY found — select **Local LLM** to run the analysis.")
+                    st.caption(
+                        "⚠️ Claude isn't set up on this machine — select "
+                        "**Local LLM** to run the analysis."
+                    )
 
         if do_refresh:
             ok_dw, msg_dw = start_refresh()
@@ -942,12 +954,15 @@ def main():
             )
             if ok_dw or ok_wh:
                 st.success(
-                    f"Refresh started ({msg_dw if ok_dw else msg_wh}) — "
-                    "running in the background."
+                    "Sync started — it's running in the background, so you can "
+                    "keep working. The page picks up the new data on its own."
                 )
                 st.rerun()
             else:
-                st.warning(msg_dw)
+                # Neither pull started, so both carry a reason; the demand one is
+                # the primary and `or` keeps the warehouse reason as a fallback
+                # rather than dropping it on the floor.
+                st.warning(msg_dw or msg_wh)
 
         # If a refresh we launched this session just finished AND actually wrote
         # a newer file than existed when it started, jump the snapshot selection
@@ -964,8 +979,10 @@ def main():
                 st.toast("Fresh snapshot loaded from the data warehouse.")
             else:
                 st.warning(
-                    "The data-warehouse refresh didn't produce a new snapshot — "
-                    "see logs/<date>/logs_refresh.txt for details."
+                    "The sync finished but didn't bring back a new snapshot, so "
+                    "you're still seeing the previous data. Logs are in "
+                    f"{os.path.dirname(dated_log_path(LOG_FILENAME))} if this "
+                    "keeps happening."
                 )
 
         # Manual data-file pickers live in ONE collapsible section at the top so
@@ -1061,9 +1078,11 @@ def main():
                 prices = None
                 if override:
                     st.warning(
-                        f"Couldn't fetch the Plytix feed ({e}); "
-                        "falling back to the newest local list-price file."
+                        "Couldn't reach the Plytix feed, so list prices are "
+                        "coming from the newest local price file instead."
                     )
+                    with st.expander("Technical details — Plytix feed"):
+                        st.code(str(e))
 
         # Fall back to the newest local xlsx when neither an upload nor the feed
         # produced prices (feed disabled/unreachable and nothing uploaded).
@@ -1107,8 +1126,10 @@ def main():
                 st.toast("Fresh warehouse projections loaded from the data warehouse.")
             else:
                 st.warning(
-                    "The warehouse refresh didn't produce a new snapshot — "
-                    "see logs/<date>/logs_refresh.txt for details."
+                    "The warehouse projections synced but didn't bring back a new "
+                    "file, so you're still seeing the previous ones. Logs are in "
+                    f"{os.path.dirname(dated_log_path(LOG_FILENAME))} if this "
+                    "keeps happening."
                 )
 
         if override:
@@ -1347,8 +1368,8 @@ def main():
                     key="run_agent_summary",
                     disabled=anthropic_no_key,
                     help=(
-                        "⚠️ No ANTHROPIC_API_KEY found — pick Local LLM above to "
-                        "enable this."
+                        "⚠️ Claude isn't set up on this machine (no "
+                        "ANTHROPIC_API_KEY) — pick Local LLM above to enable this."
                         if anthropic_no_key else
                         "Backtests all models for this view, recommends the most "
                         "accurate one, and writes an AI summary + flagged anomalies. "

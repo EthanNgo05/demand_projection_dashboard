@@ -5,7 +5,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from dashboard_app.config import model_display
+from dashboard_app.config import fmt_when, model_display
 from dashboard_app.compute import _load_agent_summary
 from dashboard_app.summaries import _format_generated_at
 from dashboard_app.refresh import start_agent_batch
@@ -180,7 +180,7 @@ def _agent_progress_fragment():
         text=f"Analyzing models — {job.get('step', 'Working…')}{elapsed_txt}",
     )
     if started:
-        st.caption(f"Started at {time.strftime('%H:%M:%S', time.localtime(started))}")
+        st.caption(f"Started at {fmt_when(started)}")
     if job.get("status") in ("done", "error"):
         st.rerun(scope="app")
 

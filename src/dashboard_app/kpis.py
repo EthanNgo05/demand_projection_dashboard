@@ -15,7 +15,7 @@ from dashboard_app.summaries import (
 )
 from dashboard_app.compute import (
     compute_by_customer_best, _agent_summaries_mtime, _agent_summaries_oldest_at,
-    attach_supply_columns, summary_to_excel,
+    attach_supply_columns, summary_to_excel, with_export_flags,
 )
 from dashboard_app.refresh import batch_in_progress
 from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart

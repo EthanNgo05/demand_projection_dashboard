@@ -1,10 +1,8 @@
 """Pure summary/column helpers and timestamp formatting (no streamlit)."""
-import datetime
-
 import numpy as np
 import pandas as pd
 
-from dashboard_app.config import PRICE_COL
+from dashboard_app.config import PRICE_COL, fmt_when
 
 
 # --------------------------------------------------------------------------- #
@@ -116,12 +114,13 @@ def historical_window(agg, summary, anchors):
 def _format_generated_at(gen):
     """Format an ISO timestamp (e.g. '2026-07-17T14:12:00') as '2026-07-17 2:12 PM'.
 
-    Falls back to the raw string if it can't be parsed.
+    Thin wrapper over ``config.fmt_when`` — this used to hand-roll the 12-hour
+    conversion, as did ``refresh.batch_elapsed_suffix`` and dashboard.py's
+    "Latest snapshot" caption, and the three had drifted apart. Kept as a named
+    function so its callers don't move.
+
+    Falls back to the raw string if it can't be parsed, which ``fmt_when``
+    signals by returning an em dash.
     """
-    try:
-        dt = datetime.datetime.fromisoformat(str(gen))
-    except (ValueError, TypeError):
-        return gen
-    # %I is zero-padded (02); lstrip("0") on the hour gives a cleaner "2:12 PM".
-    hour = dt.strftime("%I").lstrip("0") or "12"
-    return dt.strftime(f"%Y-%m-%d {hour}:%M %p")
+    formatted = fmt_when(gen)
+    return gen if formatted == "—" else formatted

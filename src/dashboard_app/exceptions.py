@@ -27,7 +27,7 @@ from dashboard_app.compute import (
     with_export_flags,
 )
 from dashboard_app.config import (
-    ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, bounded_put, fmt_dollar,
+    ALL_CUSTOMERS_VIEW, PRICE_COL, RISK_COL, bounded_put, fmt_when, fmt_dollar,
     ONHAND_COL, TREND_COL, WOS_COL,
 )
 from dashboard_app.dataquality import (
@@ -1279,7 +1279,7 @@ def _render_key_skus_fetch_prompt():
     if running:
         st.info(
             f"Fetching the key-SKU list from the data warehouse… "
-            f"(started {started}). This usually takes under a minute."
+            f"(started at {fmt_when(started)}). This usually takes under a minute."
         )
         if st.button("Check for the list", key="key_skus_check"):
             st.rerun()

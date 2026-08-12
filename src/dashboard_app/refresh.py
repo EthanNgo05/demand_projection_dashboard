@@ -13,7 +13,7 @@ import streamlit as st
 from log_config import dated_log_path
 from agent import data_io
 
-from dashboard_app.config import HERE, REPO_ROOT
+from dashboard_app.config import HERE, REPO_ROOT, fmt_when
 from dashboard_app import datasources
 
 logger = logging.getLogger("demand_dashboard")
@@ -280,7 +280,7 @@ def start_refresh(incremental: bool = True):
     """
     running, started = refresh_in_progress()
     if running:
-        return False, f"A refresh is already running (started {started})."
+        return False, f"A sync is already running (it started at {fmt_when(started)})."
 
     raw_dir = datasources._raw_dir()
     os.makedirs(raw_dir, exist_ok=True)
@@ -432,7 +432,10 @@ def start_warehouse_refresh():
     """Launch extract_warehouse_projections.py in the background; (ok, msg)."""
     running, started = warehouse_refresh_in_progress()
     if running:
-        return False, f"A warehouse refresh is already running (started {started})."
+        return False, (
+            "A warehouse sync is already running (it started at "
+            f"{fmt_when(started)})."
+        )
 
     wh_dir = data_io._warehouse_dir()
     os.makedirs(wh_dir, exist_ok=True)
@@ -494,7 +497,9 @@ def start_key_skus_refresh():
     """
     running, started = key_skus_refresh_in_progress()
     if running:
-        return False, f"A key-SKU refresh is already running (started {started})."
+        return False, (
+            f"A key-SKU sync is already running (it started at {fmt_when(started)})."
+        )
 
     os.makedirs(_key_skus_dir(), exist_ok=True)
     return _launch_refresh(
@@ -572,7 +577,7 @@ def batch_progress():
 
 
 def batch_elapsed_suffix(started):
-    """" Started 2:05 PM, running 12 min." for the run banner, or "".
+    """" Started 2026-08-12 2:05 PM, running 12 min." for the run banner, or "".
 
     ``started`` is the "%Y-%m-%d %H:%M:%S" start string batch_in_progress
     returns; yields "" if it's missing or unparseable so the banner degrades
@@ -584,8 +589,7 @@ def batch_elapsed_suffix(started):
         start = pd.Timestamp(started)
     except (ValueError, TypeError):
         return ""
-    hour = start.strftime("%I").lstrip("0") or "12"          # 2, not 02
-    clock = start.strftime(f"{hour}:%M %p")
+    clock = fmt_when(start)
     mins = max(int((pd.Timestamp.now() - start).total_seconds() // 60), 0)
     run = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60}m"
     return f" Started {clock}, running {run}."
@@ -777,7 +781,9 @@ def start_agent_batch(provider, views=None):
     """
     running, started = batch_in_progress()
     if running:
-        return False, f"An agent batch is already running (started {started})."
+        return False, (
+            f"An agent batch is already running (it started at {fmt_when(started)})."
+        )
 
     lock_path = _batch_lock_path()
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
