@@ -58,6 +58,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 # Shared, Streamlit-free I/O (Phase 2 of the agentic workflow): file discovery
 # and raw-frame cleaning live in agent/data_io.py so the dashboard and the
@@ -318,17 +319,57 @@ def _logo_data_uri():
 _bounded_put = bounded_put
 
 
+# One-shot flag: set by the SKU dropdown's on_change, consumed once by the render
+# below. Lives in Session State rather than a local because the write happens in a
+# callback, one rerun before the element it scrolls to exists.
+BY_CUST_SCROLL_KEY = "by_cust_scroll"
+# Class Streamlit puts on the keyed container wrapping the SKU picker and its
+# results — the scroll target, and what the scroll-margin rule is scoped to.
+BY_CUST_FOCUS_KEY = "by_cust_focus"
+
+
 def _clear_by_cust_selection():
     """Callback: drop the by-customer table's open detail cards when its SKU
-    dropdown changes.
+    dropdown changes, and arm the scroll to its results.
 
     ``render_selectable_table`` keys its selection POSITIONALLY, so row 3 of
     "All SKUs" and row 3 of one SKU's rows are different (SKU, customer) pairs —
     leaving the selection alone would silently swap a card's subject. Writing the
     selection through Session State is the documented affordance ``_dismiss_card``
     already relies on (see tables.py).
+
+    The scroll is armed HERE, not at the render, because this callback is the one
+    place that means "the reader just picked a SKU". The table is a fragment and
+    re-runs on every row click and filter-chip edit; keying the scroll off the render
+    would yank the page around on all of them. The selectbox sits outside the
+    fragment, so its change is a full rerun and the flag is set exactly once.
     """
     st.session_state["filter_by_customer__sel"] = {"selection": {"rows": []}}
+    st.session_state[BY_CUST_SCROLL_KEY] = True
+
+
+def _scroll_to_by_cust_results():
+    """Scroll the by-customer SKU picker and its results into view, once.
+
+    Streamlit has no scroll API, so this is the app's only JavaScript: a zero-height
+    component whose iframe is same-origin and can therefore reach ``window.parent``.
+    The retry loop exists because the iframe can load before the card it scrolls to
+    has been painted — the fragment below renders independently of this element.
+
+    ``scroll-margin-top`` keeps the target clear of the sticky page header, which
+    ``scrollIntoView`` knows nothing about and would otherwise scroll underneath.
+    """
+    st.markdown(
+        f"<style>.st-key-{BY_CUST_FOCUS_KEY}{{scroll-margin-top:5rem;}}</style>",
+        unsafe_allow_html=True,
+    )
+    components.html(
+        "<script>const d=window.parent.document;let n=0;(function go(){"
+        f"const el=d.querySelector('.st-key-{BY_CUST_FOCUS_KEY}');"
+        "if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}"
+        "else if(n++<40){setTimeout(go,50);}})();</script>",
+        height=0,
+    )
 
 
 def main():
@@ -2206,65 +2247,90 @@ def main():
                 .drop(columns="_abs_risk")
                 .reset_index(drop=True)
             )
-            st.caption(
+            sort_note = (
                 "Each SKU broken out by customer group; within a SKU, largest "
-                "revenue risk first (by magnitude). Click a row to open its "
-                "chart and metrics."
+                "revenue risk first (by magnitude)."
             )
         else:
             by_cust_table = (
                 by_cust.sort_values(["SKU", "Customer Grouping"])
                 .reset_index(drop=True)
             )
-            st.caption("Each SKU broken out by customer group. Click a row to "
-                       "open its chart and metrics.")
+            sort_note = "Each SKU broken out by customer group."
 
-        # Narrow to one SKU's customer rows, the same drill the Customer detail
-        # and SKU detail pickers offer — but with an "all" option first, because
-        # unlike those sections this table is legible whole and that is how it
-        # read before the picker existed. Options come from the TABLE's own SKUs
-        # rather than `summary`'s: on a single-group view the two frames are the
-        # same grain, and offering a SKU with no row here would blank the table.
-        # Display only — the filter chips and the Excel download below both still
-        # run on the full `by_cust_table`.
-        sku_opts = [ALL_SKUS_OPTION] + sorted(
-            by_cust_table["SKU"].astype(str).unique()
-        )
-        table_sku = st.selectbox(
-            "SKU", sku_opts, key="by_cust_sku", help="Type to search",
-            format_func=lambda s: s if s == ALL_SKUS_OPTION else _sku_label(s),
-            on_change=_clear_by_cust_selection,
-        )
-        table_df = (
-            by_cust_table if table_sku == ALL_SKUS_OPTION
-            else by_cust_table[by_cust_table["SKU"].astype(str) == table_sku]
-        )
+        # Keyed container so the scroll after a SKU pick can target it: it starts at
+        # the picker, so the reader lands with the control they just used still on
+        # screen and the results directly beneath it — scrolling to the card alone
+        # would push the picker off the top.
+        with st.container(key=BY_CUST_FOCUS_KEY):
+            # Narrow to one SKU's customer rows, the same drill the Customer detail
+            # and SKU detail pickers offer — but with an "all" option first, because
+            # unlike those sections this table is legible whole and that is how it
+            # read before the picker existed. Options come from the TABLE's own SKUs
+            # rather than `summary`'s: on a single-group view the two frames are the
+            # same grain, and offering a SKU with no row here would blank the table.
+            # Display only — the filter chips and the Excel download below both still
+            # run on the full `by_cust_table`.
+            sku_opts = [ALL_SKUS_OPTION] + sorted(
+                by_cust_table["SKU"].astype(str).unique()
+            )
+            table_sku = st.selectbox(
+                "SKU", sku_opts, key="by_cust_sku", help="Type to search",
+                format_func=lambda s: s if s == ALL_SKUS_OPTION else _sku_label(s),
+                on_change=_clear_by_cust_selection,
+            )
+            table_df = (
+                by_cust_table if table_sku == ALL_SKUS_OPTION
+                else by_cust_table[by_cust_table["SKU"].astype(str) == table_sku]
+            )
 
-        # Top-volume breakdown is attached by attach_top_volume, so it exists on
-        # the combined / region-rollup views only (a single-group view has
-        # nothing to break down). It is a whole-view figure keyed by SKU; the
-        # card labels it as such.
-        top_groups = (
-            dict(zip(summary["SKU"].astype(str),
-                     summary["Top Volume Customer Groups"]))
-            if "Top Volume Customer Groups" in summary.columns else None
-        )
-        # Condensed rows (five scannable columns); clicking one reveals that
-        # exact (SKU, customer group) combination's chart, date range and
-        # metrics — what the standalone "SKU detail" section used to hold.
-        sku_card = functools.partial(
-            render_sku_detail_card, agg_by_group, weekly_by_group,
-            (lb, lcw, ffw), chart_anchors, prices,
-            model_label=model_display(st.session_state.get("model_choice")),
-            top_groups=top_groups,
-        )
-        render_selectable_table(
-            table_df, "filter_by_customer", P,
-            condensed_cols=QUICK_CONDENSED_COLS, style=True,
-            detail_chart=sku_card, detail_cols=QUICK_CARD_COLS,
-            extra_kpis=projection_kpi_extras,
-            kpi_deltas={"Projection Difference": projection_difference_delta},
-        )
+            # A SKU picked on a single-group view leaves ONE row, and one row is not
+            # a choice: render_selectable_table drops the table and opens that row's
+            # card outright (see `focus_single`). The caption has to match, or it
+            # tells the reader to click a table that is not there. On the combined
+            # view the same SKU can still span several customer groups, and there the
+            # table stays because it is the only way to pick between them.
+            # `sort_note` describes an ORDERING, which one row does not have — so the
+            # focused caption replaces it rather than appending to it.
+            focused = table_sku != ALL_SKUS_OPTION and len(table_df) == 1
+            st.caption(
+                "One customer group carries this SKU — its chart and metrics are "
+                "below. Pick “All SKUs” to go back to the full table."
+                if focused else
+                f"{sort_note} Click a row to open its chart and metrics."
+            )
+
+            # Top-volume breakdown is attached by attach_top_volume, so it exists on
+            # the combined / region-rollup views only (a single-group view has
+            # nothing to break down). It is a whole-view figure keyed by SKU; the
+            # card labels it as such.
+            top_groups = (
+                dict(zip(summary["SKU"].astype(str),
+                         summary["Top Volume Customer Groups"]))
+                if "Top Volume Customer Groups" in summary.columns else None
+            )
+            # Condensed rows (five scannable columns); clicking one reveals that
+            # exact (SKU, customer group) combination's chart, date range and
+            # metrics — what the standalone "SKU detail" section used to hold.
+            sku_card = functools.partial(
+                render_sku_detail_card, agg_by_group, weekly_by_group,
+                (lb, lcw, ffw), chart_anchors, prices,
+                model_label=model_display(st.session_state.get("model_choice")),
+                top_groups=top_groups,
+            )
+            render_selectable_table(
+                table_df, "filter_by_customer", P,
+                condensed_cols=QUICK_CONDENSED_COLS, style=True,
+                detail_chart=sku_card, detail_cols=QUICK_CARD_COLS,
+                extra_kpis=projection_kpi_extras,
+                kpi_deltas={"Projection Difference": projection_difference_delta},
+                focus_single=table_sku != ALL_SKUS_OPTION,
+            )
+
+        # Consumed (not just read) so the scroll fires once per SKU pick — leaving it
+        # set would re-scroll on the next unrelated rerun.
+        if st.session_state.pop(BY_CUST_SCROLL_KEY, False):
+            _scroll_to_by_cust_results()
         # `by_cust_table`, NOT `table_df`: the SKU picker and the filter chips
         # narrow what is on SCREEN, and a planner who drilled to one SKU before
         # hitting download still expects the whole workbook — every SKU × customer

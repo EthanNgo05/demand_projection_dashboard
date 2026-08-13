@@ -64,6 +64,32 @@ def _normalised_skus(series):
             .str.removeprefix(STAR_PREFIX).str.rstrip("*").str.strip())
 
 
+def _normalise_sku(value):
+    """Scalar twin of ``_normalised_skus`` — same strip/prefix/suffix rules.
+
+    Kept as a separate function rather than routing one value through a Series:
+    the detail card asks about ONE SKU per render, and building a pandas object to
+    answer that is more machinery than the question deserves. The two must agree,
+    so any change to the decoration rules belongs in both.
+    """
+    return str(value).strip().removeprefix(STAR_PREFIX).rstrip("*").strip()
+
+
+def is_key_sku(sku, key_skus=None):
+    """Whether one SKU string is a key SKU (``★ `` / trailing ``*`` tolerated).
+
+    The frame-wide question is ``key_sku_mask``; this is the single-row form the
+    detail cards need, and it exists so callers stop reaching for the raw
+    ``current_key_skus()`` frozenset — membership against that set is only correct
+    for an UNDECORATED SKU, and a card's row can carry either form.
+    """
+    if key_skus is None:
+        key_skus = current_key_skus()
+    if not key_skus:
+        return False
+    return _normalise_sku(sku) in key_skus
+
+
 def key_sku_mask(df, key_skus=None):
     """Boolean Series (index-aligned to ``df``) marking rows whose SKU is a key SKU.
 

@@ -116,6 +116,22 @@ def test_identity_fields_are_text_not_stat_tiles():
         assert c not in KPI_TEXT_FIELDS, f"{c} would lose tabular-nums alignment"
 
 
+def test_identity_flags_sit_with_the_other_identity_fields():
+    """Watchlist / Key SKU are what the row IS, not what it measured.
+
+    They are the only two tiles no frame carries a column for — the card derives them
+    from the watchlist and the key-SKU snapshot — so nothing else would fail if they
+    drifted to the end of the grid, away from Customer Grouping and Data Source.
+    """
+    assert "Watchlist" in KPI_ORDER and "Key SKU" in KPI_ORDER
+    # Text tiles: "Not starred" at the stat size would read as a headline figure.
+    assert "Watchlist" in KPI_TEXT_FIELDS and "Key SKU" in KPI_TEXT_FIELDS
+    # Both tooltips exist — "Key SKU: No" is meaningless without saying who decides.
+    assert KPI_HELP.get("Watchlist") and KPI_HELP.get("Key SKU")
+    ordered = kpi_sort(["Watchlist", RISK_COL, "Key SKU", "Data Source", TREND_COL])
+    assert ordered[:3] == ["Data Source", "Watchlist", "Key SKU"]
+
+
 def test_measurement_fields_carry_help_text():
     """Every number a planner has to interpret gets a tooltip.
 

@@ -259,10 +259,17 @@ MIXED_SOURCE = "Mixed (POS + Orders)"
 # Container Impact) appear here as literals rather than imports: exceptions.py
 # imports tables.py, which imports this module, so importing back would cycle.
 # They mirror the constants at the top of exceptions.py — keep the two in sync.
+# "Key SKU" is a literal for the same reason (it is keyskus.KEY_SKU_COL, and
+# keyskus.py imports datasources.py which imports this module).
 KPI_ORDER = [
     # --- who ---------------------------------------------------------------
     "Customer Grouping", "Customer", "Region", "Region Code",
     "Data Source", "Active in", MODEL_USED_COL, "Status",
+    # Not columns on any frame — the detail card derives these two from the
+    # watchlist and the key-SKU snapshot (tables._render_row_detail). They sit
+    # with the other identity fields because that is what they are: what this
+    # row IS, not what it measured.
+    "Watchlist", "Key SKU",
     # --- what it sold ------------------------------------------------------
     "Weeks with data", ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL,
     "First Week Spike", "Weeks Since Spike",
@@ -282,12 +289,22 @@ KPI_ORDER = [
 KPI_TEXT_FIELDS = {
     "Customer Grouping", "Customer", "Region", "Region Code",
     "Data Source", "Active in", MODEL_USED_COL, "Status", "First Week Spike",
+    "Watchlist", "Key SKU",
 }
 
 # Tile tooltips. Wording is lifted from the page-top KPI row's help text in
 # kpis._render_kpis where the same quantity appears there, so the card and the KPI
 # row explain a number the same way. Fields with no entry simply get no tooltip.
 KPI_HELP = {
+    "Watchlist": (
+        "Whether this SKU + customer group is on the active watchlist. Starred "
+        "rows are also marked with a ★ on every table."
+    ),
+    "Key SKU": (
+        "Whether the planning team flags this SKU as a key item (KeyItem = Yes "
+        "in the week-of-supply parameters). Key rows carry a blue “Key” chip on "
+        "every table."
+    ),
     ALL_TIME_AVG_COL: (
         "Observed weekly demand (POS/Orders) averaged over this SKU's whole "
         "history with this customer — total demand ÷ weeks from its first sale "

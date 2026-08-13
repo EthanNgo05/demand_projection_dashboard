@@ -706,13 +706,131 @@ def test_by_customer_sku_picker_narrows_the_table_but_not_the_download():
     assert target != dashboard.ALL_SKUS_OPTION
 
     after = _by_cust_rows(at)
-    assert set(after) == {target}, f"table still shows {sorted(set(after))}"
-    assert len(after) < len(before) or len(set(before)) == 1
+    if after is None:
+        # The picked SKU left exactly ONE row, so focus_single dropped the table and
+        # opened that row's card outright — see the focus test below. Nothing to
+        # assert about narrowing here; the export assertion still applies.
+        assert any(m.label == "Customer Grouping" for m in at.metric)
+    else:
+        assert set(after) == {target}, f"table still shows {sorted(set(after))}"
+        assert len(after) < len(before) or len(set(before)) == 1
 
     body = inspect.getsource(dashboard.main)
     assert "with_export_flags(by_cust_table)" in body, (
         "the by-customer download must export the FULL frame, not the picked SKU"
     )
+
+
+def _condensed_by_cust_table(app):
+    """The by-customer table's rendered frame, or None when it is not on the page.
+
+    Identified by its CONDENSED column set, the same way
+    ``test_by_customer_sku_picker_narrows_the_table_but_not_the_download`` does: the
+    view-total table above it also carries SKU and Customer Grouping, but renders the
+    full frame, so "has both columns" would match that one first.
+    """
+    import dashboard
+
+    condensed = set(dashboard.QUICK_CONDENSED_COLS)
+    for df in app.dataframe:
+        data = getattr(df.value, "data", df.value)
+        if "SKU" in data.columns and set(data.columns) <= condensed:
+            return data
+    return None
+
+
+def _single_group_view(at):
+    """Drive the app to a single customer group, or skip. Returns the AppTest.
+
+    A single-group view has exactly one Customer Grouping, so each of its SKUs has
+    exactly ONE row in the by-customer table — which is the situation focus_single
+    exists for. Mirrors the region/group walk in
+    ``test_quick_single_group_renders_the_by_customer_table``: which groups carry
+    demand depends on the snapshot, so both loops are needed.
+    """
+    import dashboard
+
+    for region in [r for r in at.selectbox(key="quick_region").options
+                   if r != dashboard.ALL_REGIONS]:
+        at.selectbox(key="quick_region").set_value(region).run()
+        assert not at.exception
+        for i in range(1, len(at.selectbox(key="quick_group").options)):
+            at.selectbox(key="quick_group").select_index(i).run()
+            assert not at.exception
+            if not at.error and len(at.selectbox(key="by_cust_sku").options) > 1:
+                return at
+    pytest.skip("no individual customer group has demand in this snapshot")
+
+
+@needs_data
+def test_one_row_left_opens_its_card_and_drops_the_table():
+    """A SKU that leaves one row needs no click: the card opens, the table goes.
+
+    The table earns its place by being a CHOICE. Narrowed to a single row it is not
+    one — it is a click standing between the reader and something they have already
+    asked for, and its five condensed columns are all repeated by the card's tiles.
+    So on a single-group view (one Customer Grouping, therefore one row per SKU)
+    picking a SKU must leave the card and nothing else.
+
+    The ✕ goes with the table: it deselects a table row, and closing the card would
+    otherwise strand the reader with no way to re-open it.
+    """
+    import dashboard
+
+    at = _single_group_view(
+        AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    )
+    assert _condensed_by_cust_table(at) is not None, "table must show for All SKUs"
+    before = [m.label for m in at.metric]
+
+    at.selectbox(key="by_cust_sku").select_index(1).run()
+    assert not at.exception, at.exception
+    assert at.session_state["by_cust_sku"] != dashboard.ALL_SKUS_OPTION
+
+    assert _condensed_by_cust_table(at) is None, (
+        "the one-row table is redundant with the card and must not render"
+    )
+    added = [m.label for m in at.metric if m.label not in before]
+    assert "Customer Grouping" in added, f"the card did not open; got {added}"
+    assert not [b for b in at.button if b.label == "✕"], (
+        "no table to deselect from, so the card must not offer a ✕"
+    )
+
+
+@needs_data
+def test_picking_a_sku_arms_a_one_shot_scroll():
+    """The scroll flag is set by the picker's callback and consumed by the render.
+
+    Both halves matter. Set at the callback because that is the one event meaning
+    "the reader just picked a SKU" — the table is a fragment that reruns on every row
+    click and filter-chip edit, and keying the scroll off the render would yank the
+    page around on all of them. Consumed (popped, not read) at the render so it fires
+    once: a flag left set would re-scroll on the next unrelated rerun.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    # AppTest's session_state proxy is dict-like but has no .get, so test membership.
+    assert dashboard.BY_CUST_SCROLL_KEY not in at.session_state, (
+        "nothing has been picked yet, so nothing should be armed"
+    )
+    if len(at.selectbox(key="by_cust_sku").options) < 2:
+        pytest.skip("no SKUs in the by-customer table for this snapshot")
+
+    at.selectbox(key="by_cust_sku").select_index(1).run()
+    assert not at.exception, at.exception
+    # The callback armed it and the same rerun's render consumed it.
+    assert dashboard.BY_CUST_SCROLL_KEY not in at.session_state, (
+        "the flag must be popped by the render, not left set for the next rerun"
+    )
+    # The scroll targets the keyed container that STARTS at the picker, so the
+    # control the reader just used stays on screen above the results. Moving the
+    # container below the selectbox would still scroll, just to the wrong place.
+    body = inspect.getsource(dashboard.main)
+    assert "with st.container(key=BY_CUST_FOCUS_KEY):" in body
+    assert body.index("st.container(key=BY_CUST_FOCUS_KEY)") < \
+        body.index('key="by_cust_sku"')
 
 
 @needs_data

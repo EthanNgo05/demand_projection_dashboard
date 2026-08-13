@@ -15,7 +15,8 @@ import pytest
 from dashboard_app.compute import summary_to_excel, with_export_flags
 from dashboard_app.keyskus import (
     CHIP_LABEL, KEY_SKU_COL, SKU_TAG_NEUTRAL,
-    key_sku_mask, mark_key_sku, sku_chip_column_config, with_key_sku_column,
+    is_key_sku, key_sku_mask, mark_key_sku, sku_chip_column_config,
+    with_key_sku_column,
 )
 from dashboard_app.watchlist import STAR_PREFIX, WATCHLIST_COL
 
@@ -76,6 +77,37 @@ def test_mask_ignores_rolled_up_count_labels():
     cell (exceptions._dim_labels). Those rows are not key SKUs and must not be
     chipped, which is also what keeps the filter field from being offered there."""
     assert not key_sku_mask(_frame(["12 SKUs", "1 SKU"]), KEYS).any()
+
+
+# --------------------------------------------------------------------------- #
+# is_key_sku — the single-row form the detail cards ask                        #
+# --------------------------------------------------------------------------- #
+def test_is_key_sku_answers_for_one_sku():
+    assert is_key_sku("ST1001", KEYS)
+    assert not is_key_sku("ST1002", KEYS)
+
+
+@pytest.mark.parametrize("cell", [
+    f"{STAR_PREFIX}ST1001",
+    "ST1001*",
+    "  ST1001  ",
+    f"{STAR_PREFIX}ST1001*",
+])
+def test_is_key_sku_sees_through_the_same_decoration_as_the_mask(cell):
+    """It must agree with ``key_sku_mask`` cell for cell — a card and its table row
+    disagreeing about whether a SKU is a key item is worse than neither saying so."""
+    assert is_key_sku(cell, KEYS)
+    assert bool(key_sku_mask(_frame([cell]), KEYS).iloc[0])
+
+
+def test_is_key_sku_is_false_without_a_key_list():
+    """No snapshot extracted yet -> "No" on every card, rather than an error."""
+    assert not is_key_sku("ST1001", frozenset())
+
+
+def test_is_key_sku_ignores_rolled_up_count_labels():
+    """Rolled-up grains put "12 SKUs" where the SKU goes; that is not a key SKU."""
+    assert not is_key_sku("12 SKUs", KEYS)
 
 
 # --------------------------------------------------------------------------- #

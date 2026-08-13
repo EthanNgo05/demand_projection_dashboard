@@ -9,7 +9,8 @@ from dashboard_app.config import (
     KPI_HELP, KPI_TEXT_FIELDS, ONHAND_COL, TREND_COL, WOS_COL, kpi_sort,
 )
 from dashboard_app.keyskus import (
-    key_sku_mask, mark_key_sku, sku_chip_column_config,
+    CHIP_LABEL, KEY_SKU_COL, is_key_sku, key_sku_mask, mark_key_sku,
+    sku_chip_column_config,
 )
 from dashboard_app.watchlist import (
     STAR_PREFIX, active_pairs, mark_starred_sku, starred_mask,
@@ -499,7 +500,8 @@ def _tile_value(col, val):
     return _fmt_detail_value(col, val)
 
 
-def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, per_row=4):
+def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, identity=None,
+                      per_row=4):
     """Render a detail card's KPIs as the same shaded tiles the KPI row uses.
 
     Every card in the app funnels through here, which is the point: KPIs used to be
@@ -523,6 +525,11 @@ def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, per_row=4):
       below the value. Used for the percentage under Projection Difference, which has
       to modify a tile rather than add one.
 
+    ``identity`` is the same tuple shape as ``extra`` returns, but already built and
+    the same for every view — the Watchlist / Key SKU flags ``_render_row_detail``
+    derives. It is a list rather than a callback because there is nothing per-view to
+    bind: every card answers those two questions the same way.
+
     Each tile row is wrapped in a keyed container so the stylesheet can equalise
     heights within the row — otherwise a value that wraps to three lines (a long
     model name) leaves its neighbours short and the grid reads ragged.
@@ -537,6 +544,8 @@ def _render_kpi_tiles(row, cols, card_key, extra=None, deltas=None, per_row=4):
         ))
     if extra is not None:
         tiles.extend(extra(row))
+    if identity:
+        tiles.extend(identity)
     if not tiles:
         return
     # Order AFTER folding in the extras, not before: a derived tile is a KPI like any
@@ -597,9 +606,14 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
     ``_render_kpi_tiles`` for KPIs derived rather than read off the row. When
     ``detail_chart`` is given it is called with ``(row, key_base)`` to draw a chart
     below the tiles.
+    Every card carries the row's two identity flags — watchlist membership and key-SKU
+    status — as a ★ / blue "Key" badge on the title AND as a pair of tiles, so the card
+    answers both questions whichever way the reader looks.
     A ✕ button (top-right) closes the card by deselecting its table row via
     ``sel_key``/``close_pos`` (so the row's checkbox clears too, matching an
-    in-table deselect), letting the user close it without scrolling back up.
+    in-table deselect), letting the user close it without scrolling back up. Callers
+    that render a card with no table to deselect from (``focus_single``) pass neither,
+    which suppresses the button.
     ``row_action`` (if given) is a ``{label, help, danger, callback}`` dict rendered
     as a button at the bottom of the card; clicking it calls ``callback(row)`` (the
     callback owns any rerun — e.g. by opening a confirmation dialog)."""
@@ -628,16 +642,35 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
     show_note = note_val is not None and not pd.isna(note_val) and str(note_val) != ""
 
     desc = row["Description"] if "Description" in row.index else ""
-    # Mark the card title with a ★ when this row is on the active watchlist, so an
-    # opened card (in any view) shows membership without a dedicated column.
+    # Mark the card title with a ★ when this row is on the active watchlist, and a
+    # blue "Key" badge when it is a key SKU — the card's echo of the two decorations
+    # the tables carry (watchlist.mark_starred_sku's ★ prefix left of the SKU,
+    # keyskus' chip right of it), so an opened card reads the same way as its row.
+    #
+    # Both also become explicit KPI tiles below, because a badge can only say YES:
+    # the absence of a ★ is indistinguishable from a card that never draws one, and
+    # "is this a key item?" is a question a planner asks of every SKU, not only of
+    # the ones that happen to be flagged. Skipped whole at a rolled-up grain (no SKU
+    # column), where neither flag has a subject to be true of.
     cust = row.get("Customer Grouping") or row.get("Customer")
-    star = STAR_PREFIX if (str(row.get("SKU", "")), str(cust)) in active_pairs() else ""
+    has_sku = "SKU" in row.index
+    starred = has_sku and (str(row.get("SKU", "")), str(cust)) in active_pairs()
+    key_sku = has_sku and is_key_sku(row.get("SKU", ""))
+    star = STAR_PREFIX if starred else ""
+    identity = [
+        ("Watchlist", f"{STAR_PREFIX}Starred" if starred else "Not starred", None,
+         KPI_HELP.get("Watchlist"), "text"),
+        (KEY_SKU_COL, "Yes" if key_sku else "No", None,
+         KPI_HELP.get(KEY_SKU_COL), "text"),
+    ] if has_sku else None
     # Keyed so the scoped CSS in render_selectable_table can tint + space each card.
     card_key = re.sub(r"[^0-9A-Za-z_-]+", "-", f"detailcard-{key_base}-{close_label}")
     with st.container(border=True, key=card_key):
         title_c, x_col = st.columns([12, 1])
         title_txt = f"{star}{row.get(title_col, '')}"
         title = f"**{title_txt}** — {desc}" if desc else f"**{title_txt}**"
+        if key_sku:
+            title = f"{title} :blue-badge[{CHIP_LABEL}]"
         title_c.markdown(title)
         if sel_key is not None and close_pos is not None:
             x_col.button(
@@ -645,7 +678,7 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
                 on_click=_dismiss_card, args=(sel_key, close_pos),
             )
         _render_kpi_tiles(row, detail_cols, card_key, extra=extra_kpis,
-                          deltas=kpi_deltas)
+                          deltas=kpi_deltas, identity=identity)
         if show_note:
             st.markdown(f"**Note**\n\n{_fmt_detail_value('Note', note_val)}")
         if detail_chart is not None:
@@ -672,7 +705,7 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
 def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
                             column_config=None, detail_chart=None, detail_cols=None,
                             row_action=None, title_col="SKU", extra_kpis=None,
-                            kpi_deltas=None):
+                            kpi_deltas=None, focus_single=False):
     """Like render_filtered_table, but shows only ``condensed_cols`` per row and
     reveals the full row in a detail card below when a row is clicked.
 
@@ -690,27 +723,46 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     callers can add a per-row button (e.g. the watchlist's "Remove" affordance), and
     ``extra_kpis`` / ``kpi_deltas`` likewise for KPI tiles a view derives rather than
     reads off the row.
+
+    ``focus_single`` says "the caller has already narrowed to one thing": when it is
+    set AND the filters leave exactly one row, the table is not rendered at all and
+    that row's card opens on its own. A one-row table is not a choice — it is a click
+    the reader has to make to see something they have already asked for, and its five
+    condensed columns are all repeated by the card's tiles. Callers pass it only when
+    a picker of theirs did the narrowing (dashboard.py's SKU dropdown); it is off by
+    default, so a table that happens to filter down to one row still behaves normally.
     """
     filtered = filter_table(df, key, P)
+    # Deliberately NOT `focus_single and len(df) == 1`: the filter chips run after the
+    # caller's picker, so it is `filtered` that decides. A chip that empties the frame
+    # leaves focused False and falls through to the ordinary empty-table path.
+    focused = focus_single and len(filtered) == 1
     display_cols = [c for c in condensed_cols if c in filtered.columns]
-    display_df = mark_starred_sku(filtered[display_cols])
-    display_df, sku_values = mark_key_sku(display_df)
-    cfg = {**(column_config or {}),
-           **(sku_chip_column_config(sku_values) if sku_values else {})}
-    event = st.dataframe(
-        style_summary(display_df) if style else display_df,
-        width="stretch", hide_index=True, column_config=cfg or None,
-        on_select="rerun", selection_mode="multi-row", key=f"{key}__sel",
-    )
-    # Positional indices persist across reruns, so drop any that a filter has since
-    # pushed out of range (sorted so cards stack in table order, not click order).
-    rows = event.selection.rows if event and event.selection else []
-    rows = sorted(r for r in rows if r < len(filtered))
+    if focused:
+        rows = [0]
+    else:
+        display_df = mark_starred_sku(filtered[display_cols])
+        display_df, sku_values = mark_key_sku(display_df)
+        cfg = {**(column_config or {}),
+               **(sku_chip_column_config(sku_values) if sku_values else {})}
+        event = st.dataframe(
+            style_summary(display_df) if style else display_df,
+            width="stretch", hide_index=True, column_config=cfg or None,
+            on_select="rerun", selection_mode="multi-row", key=f"{key}__sel",
+        )
+        # Positional indices persist across reruns, so drop any that a filter has
+        # since pushed out of range (sorted so cards stack in table order, not click
+        # order).
+        rows = event.selection.rows if event and event.selection else []
+        rows = sorted(r for r in rows if r < len(filtered))
 
     # The dataframe selection is the single source of truth: each selected row gets
     # a card, and a card's ✕ deselects its row (see _dismiss_card) so closing a card
-    # and unchecking its row are the same action.
-    sel_key = f"{key}__sel"
+    # and unchecking its row are the same action. Under `focused` there is no
+    # dataframe and so no selection to be the source of anything: the card is passed
+    # no sel_key, which also suppresses its ✕ (closing it would leave the reader with
+    # no way back — the table that would re-open it is gone).
+    sel_key = None if focused else f"{key}__sel"
     if rows:
         # Tint + space each detail card so stacked cards read as separate panels
         # rather than one long card. Scoped to the cards' keyed wrappers; the
@@ -730,7 +782,8 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
             _render_row_detail(filtered.iloc[r], shown=display_cols,
                                detail_chart=detail_chart, key_base=key,
                                sel_key=sel_key, close_label=filtered.index[r],
-                               close_pos=r, card_cols=detail_cols,
+                               close_pos=None if focused else r,
+                               card_cols=detail_cols,
                                row_action=row_action, title_col=title_col,
                                extra_kpis=extra_kpis, kpi_deltas=kpi_deltas)
     else:
