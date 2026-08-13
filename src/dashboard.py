@@ -2127,133 +2127,25 @@ def main():
                         st.metric(col, fmt.format(vals.iloc[0]),
                                   help=KPI_HELP.get(col))
 
-    # ----- Summary table by SKU and customer --------------------------------
-    # The page's main table: every SKU broken out by customer group, mirroring the
-    # pipeline's ALL_CUSTOMERS_demand_projections file. Computed alongside the main
-    # forecast above (and cached in session_state) so it stays on the same
-    # snapshot / prices / parameters as the KPIs and charts.
-    #
-    # Collapsed, and titled by the expander label rather than an "###" heading, so
-    # it reads as the same kind of thing as the by-SKU table below it.
-    with st.expander("Summary table by SKU and customer"):
-        if not has_by_cust:
-            st.info("No per-customer forecasts to show for this snapshot.")
-        else:
-            if RISK_COL in by_cust.columns and by_cust[RISK_COL].notna().any():
-                # Keep each SKU's customers together; within a SKU show the largest
-                # revenue risk (by magnitude) first, blanks last.
-                by_cust_table = (
-                    by_cust.assign(_abs_risk=by_cust[RISK_COL].abs())
-                    .sort_values(
-                        ["SKU", "_abs_risk"],
-                        ascending=[True, False],
-                        na_position="last",
-                    )
-                    .drop(columns="_abs_risk")
-                    .reset_index(drop=True)
-                )
-                st.caption(
-                    "Each SKU broken out by customer group; within a SKU, largest "
-                    "revenue risk first (by magnitude). Click a row to open its "
-                    "chart and metrics."
-                )
-            else:
-                by_cust_table = (
-                    by_cust.sort_values(["SKU", "Customer Grouping"])
-                    .reset_index(drop=True)
-                )
-                st.caption("Each SKU broken out by customer group. Click a row to "
-                           "open its chart and metrics.")
-
-            # Narrow to one SKU's customer rows, the same drill the Customer detail
-            # and SKU detail pickers offer — but with an "all" option first, because
-            # unlike those sections this table is legible whole and that is how it
-            # read before the picker existed. Options come from the TABLE's own SKUs
-            # rather than `summary`'s: on a single-group view the two frames are the
-            # same grain, and offering a SKU with no row here would blank the table.
-            # Display only — the filter chips and the Excel download below both still
-            # run on the full `by_cust_table`.
-            sku_opts = [ALL_SKUS_OPTION] + sorted(
-                by_cust_table["SKU"].astype(str).unique()
-            )
-            table_sku = st.selectbox(
-                "SKU", sku_opts, key="by_cust_sku", help="Type to search",
-                format_func=lambda s: s if s == ALL_SKUS_OPTION else _sku_label(s),
-                on_change=_clear_by_cust_selection,
-            )
-            table_df = (
-                by_cust_table if table_sku == ALL_SKUS_OPTION
-                else by_cust_table[by_cust_table["SKU"].astype(str) == table_sku]
-            )
-
-            # Top-volume breakdown is attached by attach_top_volume, so it exists on
-            # the combined / region-rollup views only (a single-group view has
-            # nothing to break down). It is a whole-view figure keyed by SKU; the
-            # card labels it as such.
-            top_groups = (
-                dict(zip(summary["SKU"].astype(str),
-                         summary["Top Volume Customer Groups"]))
-                if "Top Volume Customer Groups" in summary.columns else None
-            )
-            # Condensed rows (five scannable columns); clicking one reveals that
-            # exact (SKU, customer group) combination's chart, date range and
-            # metrics — what the standalone "SKU detail" section used to hold.
-            sku_card = functools.partial(
-                render_sku_detail_card, agg_by_group, weekly_by_group,
-                (lb, lcw, ffw), chart_anchors, prices,
-                model_label=model_display(st.session_state.get("model_choice")),
-                top_groups=top_groups,
-            )
-            render_selectable_table(
-                table_df, "filter_by_customer", P,
-                condensed_cols=QUICK_CONDENSED_COLS, style=True,
-                detail_chart=sku_card, detail_cols=QUICK_CARD_COLS,
-                extra_kpis=projection_kpi_extras,
-                kpi_deltas={"Projection Difference": projection_difference_delta},
-            )
-            # `by_cust_table`, NOT `table_df`: the SKU picker and the filter chips
-            # narrow what is on SCREEN, and a planner who drilled to one SKU before
-            # hitting download still expects the whole workbook — every SKU × customer
-            # combination in the view. An export that silently inherited the picker
-            # would be indistinguishable from a complete one once it is off the page.
-            #
-            # Both sheets are the same grain's numbers: the `summary` sheet is the
-            # per-customer rows and `weekly_forecast` is their roll-up, so pivoting the
-            # weekly sheet reproduces the summary sheet's totals. It used to pair these
-            # bottom-up rows with the combined fit's weekly sheet, which meant one
-            # workbook disagreed with itself.
-            #
-            # "dashboard" in the name because the batch pipeline writes its own
-            # ALL_CUSTOMERS_demand_projections_<date>.xlsx to outputs/ — same old
-            # filename, a separate combined fit inside. Two files with one name and
-            # different numbers is how a spreadsheet ends up in the wrong meeting.
-            st.download_button(
-                "⬇️ Download the summary table by SKU and Customer (all SKUs)",
-                data=view_to_excel(with_export_flags(by_cust_table),
-                                   with_export_flags(weekly)),
-                file_name=(
-                    f"{'ALL_CUSTOMERS' if view == ALL_CUSTOMERS_VIEW else view.replace('/', '-').replace(' ', '_')}"
-                    f"_dashboard_demand_projections_{today_str}.xlsx"
-                ),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_by_customer",
-            )
-
     # ----- Summary table by SKU (view total), collapsed ---------------------
-    # One row per SKU: the SUM of that SKU's customer rows in the table above, and the
+    # One row per SKU: the SUM of that SKU's customer rows in the table below, and the
     # per-SKU grain the KPI row and the chart are built from. It used to be a
     # separately fit combined series — a different number under identical column
     # names, which is what this whole change removed. It is kept (rather than deleted
     # as a duplicate) because per-SKU IS the grain an order is placed at, and because
-    # it is where the top-volume breakdown appears as a column. Collapsed so it
-    # doesn't compete with the main table; skipped for a single customer group, where
-    # one row per SKU and one row per (SKU, customer) are the same table. Shares
-    # `is_view_total` with the SKU-detail section above so the two gates can't drift.
+    # it is where the top-volume breakdown appears as a column.
+    #
+    # Directly under SKU detail because it is the table form of exactly what that
+    # section just charted — one row per SKU at the view total — so the two read
+    # together; collapsed so it still doesn't compete with the main table beneath it.
+    # Skipped for a single customer group, where one row per SKU and one row per
+    # (SKU, customer) are the same table: it shares `is_view_total` with the
+    # SKU-detail section above so the two gates can't drift.
     if is_view_total:
         with st.expander("Summary table by SKU (view total)"):
             st.caption(
                 "One row per SKU for the whole view — the sum of that SKU's customer "
-                "rows above, so the two tables tie out exactly. Both carry the same "
+                "rows below, so the two tables tie out exactly. Both carry the same "
                 "observed demand averages (model-independent) plus the recent 8-week "
                 "run-rate; the only column unique to this one is the top-volume "
                 "customer breakdown."
@@ -2286,6 +2178,120 @@ def main():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_by_sku",
             )
+
+    # ----- Summary table by SKU and customer --------------------------------
+    # The page's main table: every SKU broken out by customer group, mirroring the
+    # pipeline's ALL_CUSTOMERS_demand_projections file. Computed alongside the main
+    # forecast above (and cached in session_state) so it stays on the same
+    # snapshot / prices / parameters as the KPIs and charts.
+    #
+    # Deliberately NOT collapsible: it is the page's main content and stays on
+    # screen. Only the view-total roll-up above it folds away — the two are not a
+    # matched pair, and putting this one behind a click as well would leave the page
+    # opening on nothing but the drill-downs.
+    st.markdown("### Summary table by SKU and customer")
+    if not has_by_cust:
+        st.info("No per-customer forecasts to show for this snapshot.")
+    else:
+        if RISK_COL in by_cust.columns and by_cust[RISK_COL].notna().any():
+            # Keep each SKU's customers together; within a SKU show the largest
+            # revenue risk (by magnitude) first, blanks last.
+            by_cust_table = (
+                by_cust.assign(_abs_risk=by_cust[RISK_COL].abs())
+                .sort_values(
+                    ["SKU", "_abs_risk"],
+                    ascending=[True, False],
+                    na_position="last",
+                )
+                .drop(columns="_abs_risk")
+                .reset_index(drop=True)
+            )
+            st.caption(
+                "Each SKU broken out by customer group; within a SKU, largest "
+                "revenue risk first (by magnitude). Click a row to open its "
+                "chart and metrics."
+            )
+        else:
+            by_cust_table = (
+                by_cust.sort_values(["SKU", "Customer Grouping"])
+                .reset_index(drop=True)
+            )
+            st.caption("Each SKU broken out by customer group. Click a row to "
+                       "open its chart and metrics.")
+
+        # Narrow to one SKU's customer rows, the same drill the Customer detail
+        # and SKU detail pickers offer — but with an "all" option first, because
+        # unlike those sections this table is legible whole and that is how it
+        # read before the picker existed. Options come from the TABLE's own SKUs
+        # rather than `summary`'s: on a single-group view the two frames are the
+        # same grain, and offering a SKU with no row here would blank the table.
+        # Display only — the filter chips and the Excel download below both still
+        # run on the full `by_cust_table`.
+        sku_opts = [ALL_SKUS_OPTION] + sorted(
+            by_cust_table["SKU"].astype(str).unique()
+        )
+        table_sku = st.selectbox(
+            "SKU", sku_opts, key="by_cust_sku", help="Type to search",
+            format_func=lambda s: s if s == ALL_SKUS_OPTION else _sku_label(s),
+            on_change=_clear_by_cust_selection,
+        )
+        table_df = (
+            by_cust_table if table_sku == ALL_SKUS_OPTION
+            else by_cust_table[by_cust_table["SKU"].astype(str) == table_sku]
+        )
+
+        # Top-volume breakdown is attached by attach_top_volume, so it exists on
+        # the combined / region-rollup views only (a single-group view has
+        # nothing to break down). It is a whole-view figure keyed by SKU; the
+        # card labels it as such.
+        top_groups = (
+            dict(zip(summary["SKU"].astype(str),
+                     summary["Top Volume Customer Groups"]))
+            if "Top Volume Customer Groups" in summary.columns else None
+        )
+        # Condensed rows (five scannable columns); clicking one reveals that
+        # exact (SKU, customer group) combination's chart, date range and
+        # metrics — what the standalone "SKU detail" section used to hold.
+        sku_card = functools.partial(
+            render_sku_detail_card, agg_by_group, weekly_by_group,
+            (lb, lcw, ffw), chart_anchors, prices,
+            model_label=model_display(st.session_state.get("model_choice")),
+            top_groups=top_groups,
+        )
+        render_selectable_table(
+            table_df, "filter_by_customer", P,
+            condensed_cols=QUICK_CONDENSED_COLS, style=True,
+            detail_chart=sku_card, detail_cols=QUICK_CARD_COLS,
+            extra_kpis=projection_kpi_extras,
+            kpi_deltas={"Projection Difference": projection_difference_delta},
+        )
+        # `by_cust_table`, NOT `table_df`: the SKU picker and the filter chips
+        # narrow what is on SCREEN, and a planner who drilled to one SKU before
+        # hitting download still expects the whole workbook — every SKU × customer
+        # combination in the view. An export that silently inherited the picker
+        # would be indistinguishable from a complete one once it is off the page.
+        #
+        # Both sheets are the same grain's numbers: the `summary` sheet is the
+        # per-customer rows and `weekly_forecast` is their roll-up, so pivoting the
+        # weekly sheet reproduces the summary sheet's totals. It used to pair these
+        # bottom-up rows with the combined fit's weekly sheet, which meant one
+        # workbook disagreed with itself.
+        #
+        # "dashboard" in the name because the batch pipeline writes its own
+        # ALL_CUSTOMERS_demand_projections_<date>.xlsx to outputs/ — same old
+        # filename, a separate combined fit inside. Two files with one name and
+        # different numbers is how a spreadsheet ends up in the wrong meeting.
+        st.download_button(
+            "⬇️ Download the summary table by SKU and Customer (all SKUs)",
+            data=view_to_excel(with_export_flags(by_cust_table),
+                               with_export_flags(weekly)),
+            file_name=(
+                f"{'ALL_CUSTOMERS' if view == ALL_CUSTOMERS_VIEW else view.replace('/', '-').replace(' ', '_')}"
+                f"_dashboard_demand_projections_{today_str}.xlsx"
+            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_by_customer",
+        )
 
     # The four data-quality sections (inactive-region / missing forecasts /
     # missing POS-Orders / discontinued-with-forecasts) used to render here for

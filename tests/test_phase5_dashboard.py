@@ -610,9 +610,13 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
     ALL_CUSTOMERS_VIEW string (raw, not the prettified label — several callers,
     including the agent-run button, read the selected value as a view ID). The
     body then reads KPIs -> total demand -> Customer detail -> SKU detail -> the
-    by-SKU-and-customer table, with BOTH tables in collapsed expanders (they are
-    titled by their expander label, not by an "###" heading, which is why only the
-    two drill-downs show up in _headings).
+    by-SKU view-total table -> the by-SKU-and-customer table.
+
+    The view-total table sits directly under SKU detail because it is the table form
+    of what that section just charted, and is the ONLY one of the two in a (collapsed)
+    expander — so it is titled by its label rather than an "###" heading and does not
+    show up in _headings. The by-customer table below it is the page's main content
+    and always renders, heading and all.
     """
     import dashboard
 
@@ -627,11 +631,20 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
     # across every customer group (the table's row detail cards remain the
     # per-(SKU, customer group) view), so it is gated to the aggregate scopes.
     assert "### SKU detail" in headings
-    # Customer first, then SKU; the tables come after both, in their expanders.
-    assert headings.index("### Customer detail") < headings.index("### SKU detail")
-    labels = [e.label or "" for e in at.expander]
-    assert any("Summary table by SKU and customer" in lbl for lbl in labels), labels
-    assert any("Summary table by SKU (view total)" in lbl for lbl in labels), labels
+    assert "### Summary table by SKU and customer" in headings
+    # Both drill-downs come before the table, customer first.
+    assert headings.index("### Customer detail") < \
+        headings.index("### SKU detail") < \
+        headings.index("### Summary table by SKU and customer")
+
+    expanders = list(at.expander)
+    labels = [e.label or "" for e in expanders]
+    hits = [e for e, lbl in zip(expanders, labels)
+            if "Summary table by SKU (view total)" in lbl]
+    assert len(hits) == 1, labels
+    # AppTest's Expander wrapper surfaces only label/icon; the open/closed flag
+    # lives on the underlying Expandable proto.
+    assert not hits[0].proto.expanded, "the view-total table must stay collapsed"
 
 
 @needs_data
@@ -667,10 +680,16 @@ def test_by_customer_sku_picker_narrows_the_table_but_not_the_download():
         return str(cell).lstrip("★ ")
 
     def _by_cust_rows(app):
-        """SKU values of the by-customer table, undecorated."""
+        """SKU values of the by-customer table, undecorated.
+
+        Identified by its CONDENSED column set: the view-total table above it also
+        carries SKU and Customer Grouping columns, but renders the full frame, so
+        "has both columns" would match that one first.
+        """
+        condensed = set(dashboard.QUICK_CONDENSED_COLS)
         for df in app.dataframe:
             data = getattr(df.value, "data", df.value)
-            if "SKU" in data.columns and "Customer Grouping" in data.columns:
+            if "SKU" in data.columns and set(data.columns) <= condensed:
                 return [_undecorate(s) for s in data["SKU"]]
         return None
 
@@ -812,10 +831,10 @@ def test_quick_single_group_renders_the_by_customer_table():
         pytest.skip("no individual customer group has demand in this snapshot")
 
     headings = _headings(at)
+    assert "### Summary table by SKU and customer" in headings
     assert "### Customer detail" not in headings
     assert "### SKU detail" not in headings
     labels = [e.label or "" for e in at.expander]
-    assert any("Summary table by SKU and customer" in lbl for lbl in labels), labels
     assert not any("Summary table by SKU (view total)" in lbl for lbl in labels)
     # Its SKU picker is built from the TABLE's SKUs and offers "all" first, which is
     # what keeps this branch showing the whole table on arrival. It renders here even
