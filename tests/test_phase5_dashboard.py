@@ -610,8 +610,9 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
     ALL_CUSTOMERS_VIEW string (raw, not the prettified label — several callers,
     including the agent-run button, read the selected value as a view ID). The
     body then reads KPIs -> total demand -> Customer detail -> SKU detail -> the
-    by-SKU-and-customer table, with the view-level per-SKU table in a collapsed
-    expander.
+    by-SKU-and-customer table, with BOTH tables in collapsed expanders (they are
+    titled by their expander label, not by an "###" heading, which is why only the
+    two drill-downs show up in _headings).
     """
     import dashboard
 
@@ -626,13 +627,73 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
     # across every customer group (the table's row detail cards remain the
     # per-(SKU, customer group) view), so it is gated to the aggregate scopes.
     assert "### SKU detail" in headings
-    assert "### Summary table by SKU and customer" in headings
-    # Both drill-downs come before the table, customer first.
-    assert headings.index("### Customer detail") < \
-        headings.index("### SKU detail") < \
-        headings.index("### Summary table by SKU and customer")
-    assert any("Summary table by SKU (view total)" in (e.label or "")
-               for e in at.expander)
+    # Customer first, then SKU; the tables come after both, in their expanders.
+    assert headings.index("### Customer detail") < headings.index("### SKU detail")
+    labels = [e.label or "" for e in at.expander]
+    assert any("Summary table by SKU and customer" in lbl for lbl in labels), labels
+    assert any("Summary table by SKU (view total)" in lbl for lbl in labels), labels
+
+
+@needs_data
+def test_by_customer_sku_picker_narrows_the_table_but_not_the_download():
+    """Picking a SKU drills the on-screen table; the Excel export stays whole.
+
+    The two must not track each other. A planner who drilled to one SKU and then
+    hit download expects the same workbook they'd have got without touching the
+    picker — every SKU x customer combination in the view — because once the file
+    is off the page a silently narrowed export is indistinguishable from a
+    complete one. So `data=` reads `by_cust_table` (the full, sorted frame) while
+    only `render_selectable_table` sees the narrowed `table_df`.
+
+    AppTest does not surface download buttons as elements, so the export side is
+    checked at the source (as test_sku_detail_... does for its donut) and the
+    display side through the rendered table.
+    """
+    import dashboard
+
+    at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
+    assert not at.exception
+    picker = at.selectbox(key="by_cust_sku")
+    assert picker.value == dashboard.ALL_SKUS_OPTION, "must open showing every row"
+    if len(picker.options) < 2:
+        pytest.skip("no SKUs in the by-customer table for this snapshot")
+
+    def _undecorate(cell):
+        """The raw SKU behind a rendered cell. mark_starred_sku prefixes ``★ ``
+        to watchlist rows and mark_key_sku turns key SKUs into a ``[sku, "Key"]``
+        chip list; neither reaches the frame the picker filters."""
+        if not isinstance(cell, str) and hasattr(cell, "__getitem__") and len(cell):
+            cell = cell[0]
+        return str(cell).lstrip("★ ")
+
+    def _by_cust_rows(app):
+        """SKU values of the by-customer table, undecorated."""
+        for df in app.dataframe:
+            data = getattr(df.value, "data", df.value)
+            if "SKU" in data.columns and "Customer Grouping" in data.columns:
+                return [_undecorate(s) for s in data["SKU"]]
+        return None
+
+    before = _by_cust_rows(at)
+    assert before, "did not find the by-customer table among the rendered frames"
+
+    # .options are FORMATTED labels ("<SKU> — <description>") while the stored value
+    # is the raw SKU, so select by INDEX and read the raw value back off session
+    # state — writing a raw SKU into session_state directly skips the mapping
+    # AppTest does between the two and blows up in Selectbox.index.
+    at.selectbox(key="by_cust_sku").select_index(1).run()
+    assert not at.exception, at.exception
+    target = at.session_state["by_cust_sku"]
+    assert target != dashboard.ALL_SKUS_OPTION
+
+    after = _by_cust_rows(at)
+    assert set(after) == {target}, f"table still shows {sorted(set(after))}"
+    assert len(after) < len(before) or len(set(before)) == 1
+
+    body = inspect.getsource(dashboard.main)
+    assert "with_export_flags(by_cust_table)" in body, (
+        "the by-customer download must export the FULL frame, not the picked SKU"
+    )
 
 
 @needs_data
@@ -751,11 +812,15 @@ def test_quick_single_group_renders_the_by_customer_table():
         pytest.skip("no individual customer group has demand in this snapshot")
 
     headings = _headings(at)
-    assert "### Summary table by SKU and customer" in headings
     assert "### Customer detail" not in headings
     assert "### SKU detail" not in headings
-    assert not any("Summary table by SKU (view total)" in (e.label or "")
-                   for e in at.expander)
+    labels = [e.label or "" for e in at.expander]
+    assert any("Summary table by SKU and customer" in lbl for lbl in labels), labels
+    assert not any("Summary table by SKU (view total)" in lbl for lbl in labels)
+    # Its SKU picker is built from the TABLE's SKUs and offers "all" first, which is
+    # what keeps this branch showing the whole table on arrival. It renders here even
+    # though `is_view_total` is False, so _sku_label has to live outside that gate.
+    assert at.selectbox(key="by_cust_sku").value == dashboard.ALL_SKUS_OPTION
 
 
 @needs_data
