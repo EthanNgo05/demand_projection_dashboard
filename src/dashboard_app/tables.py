@@ -1,4 +1,5 @@
 """Summary-table styling and the Excel-style add-filter-chip table filters."""
+import functools
 import re
 
 import pandas as pd
@@ -83,6 +84,11 @@ _ADD_PLACEHOLDER = "➕ Add filter…"
 # Label of the key-SKU filter chip. Public so page-level sections can ask whether a
 # table has been narrowed to key items (see ``key_only_active``).
 KEY_FILTER_LABEL = "Key SKU"
+# The four fields the two main projections tables (Quick's and Optimized's
+# "Summary table by SKU and customer") show as a FIXED bar — always on screen, no
+# add/remove step. Every other table keeps the add-filter picker, which is why this
+# is a caller-supplied set rather than a change to the default. See ``filter_table``.
+FIXED_FILTER_LABELS = ("SKU", "Customer", "Region", KEY_FILTER_LABEL)
 # Recognised week/date columns across the summary and data-quality tables.
 _DATE_COLS = ["First_WeekDate", "Last_WeekDate",
               "First Projected Week", "Last Projected Week",
@@ -94,7 +100,28 @@ def _ms_key(wkey):
     return f"{wkey}__ms"
 
 
-def _build_fields(df, key, P):
+def _sku_label_map(df):
+    """``{sku: "SKU — Description"}`` for the SKU filter's dropdown labels.
+
+    Lets the reader search the SKU dropdown by product name as well as by number —
+    the affordance Quick's standalone SKU picker had before the fixed bar replaced
+    it. The stored VALUE stays the raw SKU; only the label carries the description.
+    Empty (so the raw SKU shows) when the frame has no ``Description``.
+
+    Descriptions arrive space-padded from the warehouse, which a dropdown renders as
+    a long gap after the text — so they are stripped here.
+    """
+    if "SKU" not in df.columns or "Description" not in df.columns:
+        return {}
+    pairs = df[["SKU", "Description"]].drop_duplicates("SKU")
+    return {
+        str(s): f"{s} — {d.strip()}"
+        for s, d in zip(pairs["SKU"].astype(str), pairs["Description"])
+        if isinstance(d, str) and d.strip()
+    }
+
+
+def _build_fields(df, key, P, fixed=None):
     """Whitelist of filterable fields for ``df``, in a fixed order.
 
     Only Starred / Key SKU / SKU / Customer / Data Source / Model Used / Region /
@@ -102,22 +129,38 @@ def _build_fields(df, key, P):
     exists (and, for checklists, varies). Each field is a dict describing how to read
     options and build a mask; ``kind`` is ``checklist``, ``active_in``, ``date``,
     ``starred`` or ``key_sku``.
+
+    ``fixed`` restricts the build to those labels AND relaxes the "would this
+    actually narrow anything?" gates. Those gates exist to keep the *add-filter menu*
+    short — a single-valued field there is a menu entry that does nothing. A fixed bar
+    makes the opposite promise: the caller has said these controls are always on
+    screen, so one vanishing on a single-region view would read as a bug. The one
+    gate that survives is Key SKU's ``.any()``: a button that can only ever empty the
+    table is worse than no button.
     """
     fields = []
+    want = None if fixed is None else set(fixed)
 
-    def add_checklist(label, series):
-        if series is not None and series.nunique(dropna=True) > 1:
-            fields.append({
-                "label": label, "wkey": f"{key}::{label}", "kind": "checklist",
-                "values": series,
-                "options": sorted(series.dropna().unique(), key=str),
-            })
+    def add_checklist(label, series, **extra):
+        if series is None or (want is not None and label not in want):
+            return
+        # Fixed bar: build whenever the column exists. Add-filter menu: only when
+        # the field would narrow something.
+        if want is None and series.nunique(dropna=True) <= 1:
+            return
+        fields.append({
+            "label": label, "wkey": f"{key}::{label}", "kind": "checklist",
+            "values": series,
+            "options": sorted(series.dropna().unique(), key=str),
+            **extra,
+        })
 
     # Watchlist ("Starred") filter — a single toggle that narrows to rows on the
     # active watchlist. Membership is computed live (no column); only offered when
     # it actually varies (some but not all rows starred), so it would narrow.
     starred = starred_mask(df)
-    if starred is not None and starred.any() and not starred.all():
+    if (want is None or "Starred" in want) and starred is not None \
+            and starred.any() and not starred.all():
         fields.append({
             "label": "Starred", "wkey": f"{key}::Starred",
             "kind": "starred", "values": starred,
@@ -128,14 +171,15 @@ def _build_fields(df, key, P):
     # but not all rows are key SKUs, so it would narrow. Rolled-up Exceptions grains
     # put "12 SKUs" in the SKU cell and so match nothing — the field drops out there.
     key_mask = key_sku_mask(df)
-    if key_mask.any() and not key_mask.all():
+    if (want is None or KEY_FILTER_LABEL in want) and key_mask.any() \
+            and (want is not None or not key_mask.all()):
         fields.append({
             "label": KEY_FILTER_LABEL, "wkey": f"{key}::{KEY_FILTER_LABEL}",
             "kind": "key_sku", "values": key_mask,
         })
 
     if "SKU" in df.columns:
-        add_checklist("SKU", df["SKU"])
+        add_checklist("SKU", df["SKU"], labels=_sku_label_map(df))
 
     cust_col = next((c for c in ("Customer Grouping", "Customer")
                      if c in df.columns), None)
@@ -161,7 +205,7 @@ def _build_fields(df, key, P):
                       df["Customer Grouping"].map(lambda g: str(P.region_for_group(g))))
 
     date_cols = [c for c in _DATE_COLS if c in df.columns]
-    if date_cols:
+    if date_cols and (want is None or "Date range" in want):
         parsed = {c: pd.to_datetime(df[c], errors="coerce") for c in date_cols}
         allv = pd.concat(parsed.values())
         lo, hi = allv.min(), allv.max()
@@ -175,7 +219,7 @@ def _build_fields(df, key, P):
                 "min_d": lo.date(), "max_d": hi.date(),
             })
 
-    if "Active in" in df.columns:
+    if "Active in" in df.columns and (want is None or "Active In" in want):
         codes = sorted({x.strip() for s in df["Active in"].dropna()
                         for x in str(s).split(",") if x.strip()})
         if len(codes) > 1:
@@ -231,16 +275,24 @@ def _field_mask(df, field, selection):
     return overlap.fillna(True)  # keep rows with unknown dates
 
 
-def _multiselect_field(label, options, wkey):
+def _multiselect_field(label, options, wkey, labels=None, on_change=None):
     """A filter chip: a multiselect listing the field's currently-reachable values.
 
     Values are OR-ed within the field. ``st.multiselect`` is natively multi-select
     with built-in type-to-search (fine for the ~700-SKU list) and shows the picks
     as removable tags. Its own session-state key (``_ms_key``) persists the choice
-    across reruns. Returns the set of picked values (empty = no filter)."""
+    across reruns. Returns the set of picked values (empty = no filter).
+
+    ``labels`` maps a value to its display string (the SKU field passes
+    ``"SKU — Description"``), so the search box matches on either while the stored
+    value stays raw — the same value-vs-label split the SKU pickers use.
+    ``on_change`` is forwarded to the widget; the fixed bar uses it to drop the
+    table's positional row selection when the frame underneath it changes."""
     picked = st.multiselect(
         label, list(options), key=_ms_key(wkey),
         placeholder=f"All {label.lower()} — type to search",
+        format_func=(lambda v: labels.get(str(v), str(v))) if labels else str,
+        on_change=on_change,
     )
     return set(picked)
 
@@ -291,6 +343,53 @@ def _popover_key_sku(label, field):
     return on
 
 
+def _button_key_sku(label, field, on_change=None):
+    """The fixed bar's key-SKU control: a pressable button, not a popover checkbox.
+
+    "See key SKUs by clicking a button" is one click; the popover form is three (open,
+    tick, dismiss). Pressed state is the button's own ``type="primary"`` rather than a
+    ``✓`` suffix, so it reads as a toggle at a glance.
+
+    Writes the SAME ``__on`` session key ``_popover_key_sku`` does, so ``key_only_active``
+    and any state saved under the other form keep working. The app-scoped rerun is there
+    for the same reason the popover's is: the bar lives inside an ``@st.fragment``, and
+    page-level sections keyed off this filter sit outside it.
+    """
+    onkey = f"{field['wkey']}__on"
+    on = bool(st.session_state.get(onkey, False))
+    if st.button(f"⭐ {label}s only", key=f"{field['wkey']}__btn",
+                 type="primary" if on else "secondary", width="stretch",
+                 help="Show only SKUs on the current key-SKU list"):
+        st.session_state[onkey] = not on
+        st.session_state[f"{field['wkey']}__applied"] = not on
+        if on_change is not None:
+            on_change()
+        st.rerun(scope="app")
+    return on
+
+
+def _clear_row_selection(key):
+    """Callback: drop a selectable table's open detail cards.
+
+    ``render_selectable_table`` keys its selection POSITIONALLY, so row 3 of the
+    unfiltered frame and row 3 of a filtered one are different (SKU, customer) pairs —
+    leaving the selection alone when a filter changes would silently swap an open
+    card's subject. Writing the selection through Session State is the documented
+    affordance ``_dismiss_card`` already relies on.
+    """
+    st.session_state[f"{key}__sel"] = {"selection": {"rows": []}}
+
+
+def sku_filter_narrowed(key):
+    """True when the fixed bar's SKU filter has exactly one SKU picked.
+
+    This is what lets ``render_selectable_table`` decide ``focused`` for itself: it is
+    the "the reader has already narrowed to one thing" signal that a caller-side SKU
+    dropdown used to supply through ``focus_single``.
+    """
+    return len(st.session_state.get(_ms_key(f"{key}::SKU"), [])) == 1
+
+
 def _add_filter(key, active_key):
     """Callback: activate the field chosen in the "Add filter" selectbox."""
     choice = st.session_state.get(f"{key}__add")
@@ -316,39 +415,55 @@ def _remove_filter(active_key, label, wkey, kind):
         st.session_state.pop(_ms_key(wkey), None)
 
 
-def filter_table(df, key, P=None):
-    """Add-filter-chip filtering: start clean, add only the fields you want.
+def filter_table(df, key, P=None, *, fixed=None):
+    """Table filtering with Excel semantics: OR within a field, AND across fields.
 
-    An "Add filter" picker activates a field; each active filter shows as a row
-    — a multiselect (or a date-range / starred / key-SKU popover) plus a ✕ to remove
-    it. Excel semantics (OR within a field, AND across fields) with cross-filtering,
-    so the active multiselects only offer values that still yield rows. Only the
-    whitelist Starred / Key SKU / SKU / Customer / Data Source / Model Used / Region /
-    Date range / Active In is offered. ``key`` namespaces the widgets.
+    Two layouts over one field/mask model:
+
+    * **Add-filter chips** (the default, every table but the two main projections
+      ones). An "Add filter" picker activates a field; each active filter shows as a
+      row — a multiselect (or a date-range / starred / key-SKU popover) plus a ✕ to
+      remove it. Only the whitelist Starred / Key SKU / SKU / Customer / Data Source /
+      Model Used / Region / Date range / Active In is offered.
+    * **A fixed bar** (``fixed`` = a tuple of labels, normally ``FIXED_FILTER_LABELS``).
+      Those fields, and only those, render on first paint with no add/remove step:
+      the checklists side by side as dropdowns, the key-SKU toggle as a button
+      beneath them.
+
+    Both share the cross-filtering below, which is the property that matters: each
+    dropdown offers only the values that still yield rows under every OTHER field's
+    current pick, so Region = AU leaves no AMEA-only customer selectable. ``key``
+    namespaces the widgets.
     """
-    fields = _build_fields(df, key, P)
+    fields = _build_fields(df, key, P, fixed=fixed)
     if not fields:
         return df
-    by_label = {f["label"]: f for f in fields}
-    labels_in_order = [f["label"] for f in fields]
 
-    active_key = f"{key}__active"
-    active = [l for l in st.session_state.get(active_key, []) if l in by_label]
-    st.session_state[active_key] = active  # sanitised (columns change per view)
-    active_fields = [by_label[l] for l in active]
+    if fixed is not None:
+        # Every built field is active, always — that is what "fixed" means. No
+        # active-list bookkeeping and no picker.
+        active_fields = fields
+    else:
+        by_label = {f["label"]: f for f in fields}
+        labels_in_order = [f["label"] for f in fields]
 
-    # "Add filter" picker — only fields not already active.
-    addable = [l for l in labels_in_order if l not in active]
-    add_col, _ = st.columns([1, 2])
-    with add_col:
-        if addable:
-            st.selectbox(
-                "Add filter", [_ADD_PLACEHOLDER] + addable, key=f"{key}__add",
-                label_visibility="collapsed", on_change=_add_filter,
-                args=(key, active_key),
-            )
-        else:
-            st.caption("All filters added.")
+        active_key = f"{key}__active"
+        active = [l for l in st.session_state.get(active_key, []) if l in by_label]
+        st.session_state[active_key] = active  # sanitised (columns change per view)
+        active_fields = [by_label[l] for l in active]
+
+        # "Add filter" picker — only fields not already active.
+        addable = [l for l in labels_in_order if l not in active]
+        add_col, _ = st.columns([1, 2])
+        with add_col:
+            if addable:
+                st.selectbox(
+                    "Add filter", [_ADD_PLACEHOLDER] + addable, key=f"{key}__add",
+                    label_visibility="collapsed", on_change=_add_filter,
+                    args=(key, active_key),
+                )
+            else:
+                st.caption("All filters added.")
 
     # Current selections, read from session_state (persist across reruns).
     sel = {f["label"]: _selection(f) for f in active_fields}
@@ -385,27 +500,58 @@ def filter_table(df, key, P=None):
             st.session_state[_ms_key(f["wkey"])] = kept
             sel[f["label"]] = set(kept)
 
-    # Render active filters one per row — [ control ][✕] — so each multiselect has
-    # room to show every picked value as a tag (date/starred keep compact popovers).
     selections = {}
-    for f in active_fields:
-        ctrl_col, x_col = st.columns([12, 1], vertical_alignment="bottom")
-        with ctrl_col:
-            if f["kind"] == "date":
-                selections[f["label"]] = _popover_daterange(f["label"], f)
-            elif f["kind"] == "starred":
-                selections[f["label"]] = _popover_starred(f["label"], f)
-            elif f["kind"] == "key_sku":
-                selections[f["label"]] = _popover_key_sku(f["label"], f)
-            else:
+    if fixed is not None:
+        # Fixed bar: the dropdowns side by side on one row (they are read together —
+        # "this SKU, at this customer, in this region"), the key-SKU button on its own
+        # line beneath so a click can't be mistaken for a fourth dropdown.
+        #
+        # Every control drops the table's open detail cards: the selection is keyed by
+        # POSITION, so a narrowed frame would leave a card describing a different
+        # (SKU, customer) than the row that opened it.
+        clear = functools.partial(_clear_row_selection, key)
+        drops = [f for f in active_fields if f["kind"] == "checklist"]
+        toggles = [f for f in active_fields if f["kind"] != "checklist"]
+        # st.columns(0) raises, and a frame carrying none of SKU / Customer / Region
+        # (only the key-SKU toggle survived) is a legal caller.
+        for col, f in zip(st.columns(len(drops)) if drops else [], drops):
+            with col:
                 selections[f["label"]] = _multiselect_field(
-                    f["label"], sorted(reachable_by[f["label"]], key=str), f["wkey"]
+                    f["label"], sorted(reachable_by[f["label"]], key=str), f["wkey"],
+                    labels=f.get("labels"), on_change=clear,
                 )
-        with x_col:
-            st.button("✕", key=f"{f['wkey']}__rm",
-                      help=f"Remove the {f['label']} filter",
-                      on_click=_remove_filter,
-                      args=(active_key, f["label"], f["wkey"], f["kind"]))
+        for f in toggles:
+            btn_col, _ = st.columns([1, 3])
+            with btn_col:
+                if f["kind"] == "key_sku":
+                    selections[f["label"]] = _button_key_sku(f["label"], f,
+                                                             on_change=clear)
+                elif f["kind"] == "starred":
+                    selections[f["label"]] = _popover_starred(f["label"], f)
+                else:
+                    selections[f["label"]] = _popover_daterange(f["label"], f)
+    else:
+        # Render active filters one per row — [ control ][✕] — so each multiselect has
+        # room to show every picked value as a tag (date/starred keep compact popovers).
+        for f in active_fields:
+            ctrl_col, x_col = st.columns([12, 1], vertical_alignment="bottom")
+            with ctrl_col:
+                if f["kind"] == "date":
+                    selections[f["label"]] = _popover_daterange(f["label"], f)
+                elif f["kind"] == "starred":
+                    selections[f["label"]] = _popover_starred(f["label"], f)
+                elif f["kind"] == "key_sku":
+                    selections[f["label"]] = _popover_key_sku(f["label"], f)
+                else:
+                    selections[f["label"]] = _multiselect_field(
+                        f["label"], sorted(reachable_by[f["label"]], key=str),
+                        f["wkey"]
+                    )
+            with x_col:
+                st.button("✕", key=f"{f['wkey']}__rm",
+                          help=f"Remove the {f['label']} filter",
+                          on_click=_remove_filter,
+                          args=(active_key, f["label"], f["wkey"], f["kind"]))
 
     mask = pd.Series(True, index=df.index)
     for f in active_fields:
@@ -705,7 +851,7 @@ def _render_row_detail(row, shown, detail_chart=None, key_base=None,
 def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
                             column_config=None, detail_chart=None, detail_cols=None,
                             row_action=None, title_col="SKU", extra_kpis=None,
-                            kpi_deltas=None, focus_single=False):
+                            kpi_deltas=None, focus_single=False, fixed=None):
     """Like render_filtered_table, but shows only ``condensed_cols`` per row and
     reveals the full row in a detail card below when a row is clicked.
 
@@ -724,19 +870,24 @@ def render_selectable_table(df, key, P=None, *, condensed_cols, style=True,
     ``extra_kpis`` / ``kpi_deltas`` likewise for KPI tiles a view derives rather than
     reads off the row.
 
+    ``fixed`` is forwarded to ``filter_table`` — pass ``FIXED_FILTER_LABELS`` for the
+    always-on SKU / Customer / Region / Key-SKU bar the two main projections tables use.
+
     ``focus_single`` says "the caller has already narrowed to one thing": when it is
     set AND the filters leave exactly one row, the table is not rendered at all and
     that row's card opens on its own. A one-row table is not a choice — it is a click
     the reader has to make to see something they have already asked for, and its five
-    condensed columns are all repeated by the card's tiles. Callers pass it only when
-    a picker of theirs did the narrowing (dashboard.py's SKU dropdown); it is off by
-    default, so a table that happens to filter down to one row still behaves normally.
+    condensed columns are all repeated by the card's tiles. Under ``fixed`` the same
+    signal is DERIVED — one SKU picked in the bar means the same thing a caller-side
+    SKU dropdown used to mean — so those callers pass nothing. It is off by default,
+    so a table that happens to filter down to one row still behaves normally.
     """
-    filtered = filter_table(df, key, P)
+    filtered = filter_table(df, key, P, fixed=fixed)
     # Deliberately NOT `focus_single and len(df) == 1`: the filter chips run after the
     # caller's picker, so it is `filtered` that decides. A chip that empties the frame
     # leaves focused False and falls through to the ordinary empty-table path.
-    focused = focus_single and len(filtered) == 1
+    narrowed = focus_single or (fixed is not None and sku_filter_narrowed(key))
+    focused = narrowed and len(filtered) == 1
     display_cols = [c for c in condensed_cols if c in filtered.columns]
     if focused:
         rows = [0]

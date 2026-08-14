@@ -8,6 +8,7 @@ import streamlit as st
 from dashboard_app.config import (
     PRICE_COL, RISK_COL, fmt_dollar, MODEL_USED_COL, BEST_MODEL_COMBINED_VIEW,
     ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL, ONHAND_COL, WOS_COL, KPI_HELP,
+    MIXED_SOURCE,
 )
 from dashboard_app.summaries import (
     resolve_avg_col, avg_window_phrase, historical_window,
@@ -18,8 +19,10 @@ from dashboard_app.compute import (
     attach_supply_columns, summary_to_excel, with_export_flags,
 )
 from dashboard_app.refresh import batch_in_progress
-from dashboard_app.charts import chart_range_control, aggregate_chart, sku_chart
-from dashboard_app.tables import render_selectable_table
+from dashboard_app.charts import (
+    chart_range_control, aggregate_chart, sku_chart, customer_share_donut,
+)
+from dashboard_app.tables import FIXED_FILTER_LABELS, render_selectable_table
 
 # The summary table's condensed row: the five columns a planner scans. Every
 # other field is one click away in the detail card, and the Excel download still
@@ -270,6 +273,179 @@ def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors
             )
 
 
+def _sku_detail_source(summary_s):
+    """The ``Data Source`` label for one SKU's chart title.
+
+    One value when the SKU's rows agree, ``MIXED_SOURCE`` when they don't. Quick
+    passes a SKU-grain roll-up, where ``roll_up_summary`` has already collapsed
+    disagreement into exactly that constant; Optimized passes its SKU × customer
+    frame, where the groups can still disagree and the reduction has to happen here.
+    Defaults to POS when the column is missing or empty, as the section always has.
+    """
+    if "Data Source" not in summary_s.columns:
+        return "POS"
+    vals = [v for v in summary_s["Data Source"].dropna().unique() if isinstance(v, str)]
+    if not vals:
+        return "POS"
+    return vals[0] if len(vals) == 1 else MIXED_SOURCE
+
+
+def render_sku_detail_section(summary, agg, weekly, by_cust, anchors, prices,
+                              avg_col=None, key="sku"):
+    """The ``SKU detail`` section: ONE SKU's total weekly demand across every
+    customer group in the view — the order-sizing view of the page ("how many units
+    of this SKU do I need per week?"). The mirror of ``Customer detail``, drilled the
+    other way.
+
+    Shared by Quick Projections and Optimized Projections so the two read identically
+    (the same reason ``render_sku_detail_card`` is shared). The numbers are the
+    ROLL-UP of that SKU's per-customer forecasts — the same figures behind the KPI
+    row, the aggregate chart and the by-customer table — so the tiles here and the
+    donut beside them are the same number twice, once summed and once itemised. They
+    tie exactly, and ``tests/test_rollup_ties.py`` holds them to it.
+
+    ``summary`` supplies the SKU list and the KPI tiles; ``by_cust`` the customer
+    breakdown and the supply figures. The two frames are at different grains per view
+    and that is deliberate:
+
+    ==========  =============================  ==================
+    argument    Quick passes                   Optimized passes
+    ==========  =============================  ==================
+    summary     ``summary`` (SKU grain)        ``combined`` (SKU × customer)
+    by_cust     ``by_cust``                    ``combined``
+    ==========  =============================  ==================
+
+    ``_render_kpis`` counts SKUs with ``nunique`` and sums the projection columns, so
+    a SKU × customer frame scoped to one SKU yields precisely its roll-up — which is
+    why Optimized needs no per-SKU summary frame of its own. Building one would be a
+    second path to the same number, and two paths are how two numbers start.
+
+    ``key`` namespaces the widgets (``{key}_sku`` selector, ``range_sku_{key}`` range
+    picker) so both views can be open in one session without colliding.
+    """
+    _, lcw, ffw = anchors
+    st.markdown("### SKU detail")
+    st.caption(
+        "One SKU's total weekly demand across every customer group in this view — "
+        "the sum of that SKU's per-customer forecasts, so it ties exactly to its "
+        "rows in the breakdown below and in the by-customer table."
+    )
+
+    # Label carries the description so the search box matches on either; the stored
+    # value stays the raw SKU (the same value-vs-label split as quick_group_label on
+    # the Customer-group selector). drop_duplicates because `summary` is one row per
+    # SKU on Quick but one row per (SKU, customer) on Optimized.
+    desc_by_sku = (
+        dict(zip(summary.drop_duplicates("SKU")["SKU"].astype(str),
+                 summary.drop_duplicates("SKU")["Description"]))
+        if "Description" in summary.columns else {}
+    )
+
+    def _sku_label(s):
+        # .strip(): warehouse descriptions are space-padded, which a dropdown
+        # renders as a long gap after the text.
+        desc = desc_by_sku.get(s)
+        desc = desc.strip() if isinstance(desc, str) else ""
+        return f"{s} — {desc}" if desc else str(s)
+
+    skus = sorted(summary["SKU"].astype(str).unique())
+    sku = st.selectbox("SKU", skus, key=f"{key}_sku", help="Type to search",
+                       format_func=_sku_label)
+    summary_s = summary[summary["SKU"].astype(str) == sku]
+    agg_s = agg[agg["SKU"].astype(str) == sku]
+    weekly_s = weekly[weekly["SKU"].astype(str) == sku]
+
+    if agg_s.empty or weekly_s.empty:
+        st.caption("No weekly data for this SKU in this snapshot.")
+        return
+
+    desc = desc_by_sku.get(sku)
+    desc = desc.strip() if isinstance(desc, str) else ""
+    source = _sku_detail_source(summary_s)
+    # Chart-only history floor, per SKU — same reasoning as the view's chart_anchors
+    # (`lb` is as short as 8 weeks under the 8-Week Moving Average model, which would
+    # trap the range picker inside that window), but keyed to this SKU's first week.
+    sku_anchors = (pd.to_datetime(agg_s["WeekDate"]).min(), lcw, ffw)
+
+    scL, scR = st.columns([3, 1])
+    with scL:
+        # Own key => this picker is independent of the aggregate / customer ones.
+        # Handed the SKU-sliced frames (rather than the full ones, which sku_chart
+        # would filter itself) so the picker's history floor is this SKU's first
+        # week, not the view's.
+        sku_range = chart_range_control(agg_s, weekly_s, lcw, key=f"range_sku_{key}")
+        st.plotly_chart(
+            sku_chart(sku, desc, source, agg_s, weekly_s, sku_anchors,
+                      date_range=sku_range, prices=prices),
+            width="stretch",
+        )
+
+        # --- Customer group breakdown --------------------------------------
+        # Where this SKU's volume comes from. These are the PER-GROUP fits, so
+        # they sum to the SKU's rows in the by-customer table below.
+        #
+        # A donut rather than a table: the question here is a SHARE ("where does
+        # this SKU's volume come from?"), which a table makes the reader compute.
+        # Every column such a table would carry is a row of the slice's hover
+        # instead — see charts.customer_share_donut.
+        #
+        # Inside the chart column, not full width below the row: it is part of
+        # THIS section, and drawn across the whole page a 460px figure is a small
+        # circle in a wide empty band.
+        st.markdown("#### Customer group breakdown")
+        bd = (by_cust[by_cust["SKU"].astype(str) == sku]
+              if by_cust is not None and not by_cust.empty else None)
+        share_fig = (customer_share_donut(bd)
+                     if bd is not None and not bd.empty else None)
+        if bd is None or bd.empty:
+            st.caption("No per-customer forecasts for this SKU in this snapshot.")
+        elif share_fig is None:
+            st.caption(
+                "Every customer group's updated forecast for this SKU is zero, "
+                "so there is no share to chart."
+            )
+        else:
+            st.plotly_chart(share_fig, width="stretch")
+            n_groups = int(
+                (pd.to_numeric(bd["Updated Projection Average"],
+                               errors="coerce") > 0).sum()
+            )
+            st.caption(
+                "Each customer group's share of this SKU's updated forecast. "
+                "Hover a slice for that group's full figures — current and "
+                "updated forecast, 8-week run rate, projection difference, "
+                "revenue risk and data source. These are the parts the tiles "
+                "beside it are the sum of; the two tie exactly."
+                + (f" Groups past the largest 8 (of {n_groups}) are folded into "
+                   "one grey slice, whose hover totals them."
+                   if n_groups > 9 else "")
+            )
+    with scR:
+        # The same metrics as the top of the view, scoped to this SKU and stacked to
+        # fit the side column. Section anchors (not the widened chart range) so the
+        # historical-demand window lines up with the KPI row above.
+        #
+        # Minus "SKUs Forecasted", which is 1 by construction here. Its help text
+        # carried the "forecast from Orders (no POS)" flag; for a single SKU that
+        # fact is still on screen twice — sku_chart names the source in its title
+        # and axis, and the breakdown hover carries Data Source per customer group.
+        _render_kpis(summary_s, agg_s, anchors, stacked=True, avg_col=avg_col,
+                     show_sku_count=False)
+        # On Hand / Weeks of Supply — the two figures that turn a weekly forecast
+        # into an order quantity. Both are SKU-level constants across a SKU's
+        # customer rows (see attach_supply_columns), so this is a lookup, not a
+        # second computation. Absent when no warehouse snapshot was loaded:
+        # "unknown stock" must not read as zero.
+        if bd is not None and not bd.empty:
+            for col, fmt in ((ONHAND_COL, "{:,.0f}"), (WOS_COL, "{:,.1f}")):
+                if col not in bd.columns:
+                    continue
+                vals = bd[col].dropna()
+                if vals.empty:
+                    continue
+                st.metric(col, fmt.format(vals.iloc[0]), help=KPI_HELP.get(col))
+
+
 def projection_kpi_extras(row):
     """Derived KPI tiles for a projections-table row (the ``extra_kpis`` contract).
 
@@ -499,6 +675,14 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         _render_kpis(summary_c, agg_c, anchors, stacked=True,
                      avg_col=anchors_avg_col)
 
+    # ----- Per-SKU detail ---------------------------------------------------
+    # The mirror of Customer detail, drilled the other way. `combined` serves as both
+    # the KPI frame and the breakdown frame: scoped to one SKU it IS that SKU's
+    # per-customer rows, and _render_kpis sums them — which is exactly the roll-up
+    # this section shows. No gate: unlike Quick, this view always spans every group.
+    render_sku_detail_section(combined, agg_all, weekly_all, combined, anchors, pm,
+                              avg_col=anchors_avg_col, key="best")
+
     st.markdown("### Summary table by SKU and customer")
 
     # Keep each SKU's rows together; largest revenue risk first when present.
@@ -518,11 +702,16 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
 
     # Condensed rows (five scannable columns); clicking one reveals that exact
     # (SKU, customer group) combination's detail card below — the chart, date
-    # range and metrics the standalone "SKU detail" section used to hold. The
-    # filter chips and the Excel download still run on the full frame.
+    # range and metrics for one row of what the SKU detail section above totals. The
+    # filters and the Excel download still run on the full frame.
     # model_label is left unbound: every row carries its own MODEL_USED_COL, which
     # the card prefers. top_groups is unbound too — this view has no compute_view
     # summary, so no breakdown exists (see render_sku_detail_card).
+    #
+    # `fixed`: SKU / Customer / Region / Key SKU, on screen from the first paint and
+    # cross-filtered against each other. Data Source and Model Used were reachable
+    # through the old add-filter menu and are not here — both are still on every
+    # detail card and in the download, and neither is how a planner narrows this table.
     sku_card = functools.partial(render_sku_detail_card, agg_by_group,
                                  weekly_by_group, anchors, chart_anchors, pm)
     render_selectable_table(
@@ -531,6 +720,7 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
         detail_chart=sku_card, detail_cols=BEST_MIX_CARD_COLS,
         extra_kpis=projection_kpi_extras,
         kpi_deltas={"Projection Difference": projection_difference_delta},
+        fixed=FIXED_FILTER_LABELS,
     )
     st.download_button(
         "⬇️ Download the combined best-model table",

@@ -647,16 +647,32 @@ def test_quick_default_view_is_all_customers_in_the_new_order():
     assert not hits[0].proto.expanded, "the view-total table must stay collapsed"
 
 
+# The fixed filter bar's SKU dropdown, as Streamlit keys it: tables._ms_key over
+# "<table key>::SKU". Driving the widget through session_state (rather than
+# .set_value) is how the rest of this file reaches inside the table's fragment.
+BY_CUST_SKU_FILTER = "filter_by_customer::SKU__ms"
+
+
+def _undecorate(cell):
+    """The raw SKU behind a rendered cell. ``mark_starred_sku`` prefixes ``★ `` to
+    watchlist rows and ``mark_key_sku`` turns key SKUs into a ``[sku, "Key"]`` chip
+    list; neither reaches the frame the filters run on, so a test that feeds a
+    rendered cell back into the SKU filter has to strip both first."""
+    if not isinstance(cell, str) and hasattr(cell, "__getitem__") and len(cell):
+        cell = cell[0]
+    return str(cell).lstrip("★ ")
+
+
 @needs_data
-def test_by_customer_sku_picker_narrows_the_table_but_not_the_download():
-    """Picking a SKU drills the on-screen table; the Excel export stays whole.
+def test_by_customer_sku_filter_narrows_the_table_but_not_the_download():
+    """Filtering to a SKU drills the on-screen table; the Excel export stays whole.
 
     The two must not track each other. A planner who drilled to one SKU and then
     hit download expects the same workbook they'd have got without touching the
-    picker — every SKU x customer combination in the view — because once the file
+    filter — every SKU x customer combination in the view — because once the file
     is off the page a silently narrowed export is indistinguishable from a
     complete one. So `data=` reads `by_cust_table` (the full, sorted frame) while
-    only `render_selectable_table` sees the narrowed `table_df`.
+    only `render_selectable_table` sees the filtered one.
 
     AppTest does not surface download buttons as elements, so the export side is
     checked at the source (as test_sku_detail_... does for its donut) and the
@@ -666,18 +682,10 @@ def test_by_customer_sku_picker_narrows_the_table_but_not_the_download():
 
     at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
     assert not at.exception
-    picker = at.selectbox(key="by_cust_sku")
-    assert picker.value == dashboard.ALL_SKUS_OPTION, "must open showing every row"
-    if len(picker.options) < 2:
+    sku_filter = at.multiselect(key=BY_CUST_SKU_FILTER)
+    assert sku_filter.value == [], "must open showing every row"
+    if len(sku_filter.options) < 2:
         pytest.skip("no SKUs in the by-customer table for this snapshot")
-
-    def _undecorate(cell):
-        """The raw SKU behind a rendered cell. mark_starred_sku prefixes ``★ ``
-        to watchlist rows and mark_key_sku turns key SKUs into a ``[sku, "Key"]``
-        chip list; neither reaches the frame the picker filters."""
-        if not isinstance(cell, str) and hasattr(cell, "__getitem__") and len(cell):
-            cell = cell[0]
-        return str(cell).lstrip("★ ")
 
     def _by_cust_rows(app):
         """SKU values of the by-customer table, undecorated.
@@ -696,19 +704,20 @@ def test_by_customer_sku_picker_narrows_the_table_but_not_the_download():
     before = _by_cust_rows(at)
     assert before, "did not find the by-customer table among the rendered frames"
 
-    # .options are FORMATTED labels ("<SKU> — <description>") while the stored value
-    # is the raw SKU, so select by INDEX and read the raw value back off session
-    # state — writing a raw SKU into session_state directly skips the mapping
-    # AppTest does between the two and blows up in Selectbox.index.
-    at.selectbox(key="by_cust_sku").select_index(1).run()
+    # The multiselect's .options are FORMATTED labels ("<SKU> — <description>") while
+    # the stored value is the raw SKU, so pick a raw SKU off the rendered rows and
+    # write it to the widget's own session-state key. That is legal here for the same
+    # reason filter_table's clamp loop does it: the write lands before the widget
+    # instantiates on the next run.
+    target = before[0]
+    at.session_state[BY_CUST_SKU_FILTER] = [target]
+    at.run()
     assert not at.exception, at.exception
-    target = at.session_state["by_cust_sku"]
-    assert target != dashboard.ALL_SKUS_OPTION
 
     after = _by_cust_rows(at)
     if after is None:
-        # The picked SKU left exactly ONE row, so focus_single dropped the table and
-        # opened that row's card outright — see the focus test below. Nothing to
+        # The picked SKU left exactly ONE row, so the derived focus dropped the table
+        # and opened that row's card outright — see the focus test below. Nothing to
         # assert about narrowing here; the export assertion still applies.
         assert any(m.label == "Customer Grouping" for m in at.metric)
     else:
@@ -717,7 +726,7 @@ def test_by_customer_sku_picker_narrows_the_table_but_not_the_download():
 
     body = inspect.getsource(dashboard.main)
     assert "with_export_flags(by_cust_table)" in body, (
-        "the by-customer download must export the FULL frame, not the picked SKU"
+        "the by-customer download must export the FULL frame, not the filtered one"
     )
 
 
@@ -757,7 +766,7 @@ def _single_group_view(at):
         for i in range(1, len(at.selectbox(key="quick_group").options)):
             at.selectbox(key="quick_group").select_index(i).run()
             assert not at.exception
-            if not at.error and len(at.selectbox(key="by_cust_sku").options) > 1:
+            if not at.error and len(at.multiselect(key=BY_CUST_SKU_FILTER).options) > 1:
                 return at
     pytest.skip("no individual customer group has demand in this snapshot")
 
@@ -772,20 +781,23 @@ def test_one_row_left_opens_its_card_and_drops_the_table():
     So on a single-group view (one Customer Grouping, therefore one row per SKU)
     picking a SKU must leave the card and nothing else.
 
+    The signal is DERIVED now (``tables.sku_filter_narrowed`` — exactly one SKU picked
+    in the fixed bar) rather than passed in as ``focus_single`` by a caller-side
+    dropdown, so this pins the behaviour to the filter that replaced that dropdown.
+
     The ✕ goes with the table: it deselects a table row, and closing the card would
     otherwise strand the reader with no way to re-open it.
     """
-    import dashboard
-
     at = _single_group_view(
         AppTest.from_file(DASHBOARD, default_timeout=300).run()
     )
-    assert _condensed_by_cust_table(at) is not None, "table must show for All SKUs"
+    table = _condensed_by_cust_table(at)
+    assert table is not None, "table must show when nothing is filtered"
     before = [m.label for m in at.metric]
 
-    at.selectbox(key="by_cust_sku").select_index(1).run()
+    at.session_state[BY_CUST_SKU_FILTER] = [_undecorate(table["SKU"].iloc[0])]
+    at.run()
     assert not at.exception, at.exception
-    assert at.session_state["by_cust_sku"] != dashboard.ALL_SKUS_OPTION
 
     assert _condensed_by_cust_table(at) is None, (
         "the one-row table is redundant with the card and must not render"
@@ -798,39 +810,36 @@ def test_one_row_left_opens_its_card_and_drops_the_table():
 
 
 @needs_data
-def test_picking_a_sku_arms_a_one_shot_scroll():
-    """The scroll flag is set by the picker's callback and consumed by the render.
+def test_changing_a_filter_closes_the_open_detail_cards():
+    """A filter change must drop the table's open cards, not re-point them.
 
-    Both halves matter. Set at the callback because that is the one event meaning
-    "the reader just picked a SKU" — the table is a fragment that reruns on every row
-    click and filter-chip edit, and keying the scroll off the render would yank the
-    page around on all of them. Consumed (popped, not read) at the render so it fires
-    once: a flag left set would re-scroll on the next unrelated rerun.
+    ``render_selectable_table`` keys its selection by POSITION, so row 0 of the
+    unfiltered frame and row 0 of a filtered one are different (SKU, customer) pairs.
+    Leaving the selection alone would silently swap an open card's subject — a card
+    labelled with one customer group showing another's numbers. Every control on the
+    fixed bar therefore clears ``{key}__sel`` (``tables._clear_row_selection``); this
+    used to be one dropdown's bespoke callback.
     """
-    import dashboard
-
     at = AppTest.from_file(DASHBOARD, default_timeout=300).run()
     assert not at.exception
-    # AppTest's session_state proxy is dict-like but has no .get, so test membership.
-    assert dashboard.BY_CUST_SCROLL_KEY not in at.session_state, (
-        "nothing has been picked yet, so nothing should be armed"
-    )
-    if len(at.selectbox(key="by_cust_sku").options) < 2:
-        pytest.skip("no SKUs in the by-customer table for this snapshot")
+    table = _condensed_by_cust_table(at)
+    if table is None or table.empty:
+        pytest.skip("no rows in the by-customer table for this snapshot")
 
-    at.selectbox(key="by_cust_sku").select_index(1).run()
+    at.session_state["filter_by_customer__sel"] = {"selection": {"rows": [0]}}
+    at.run()
     assert not at.exception, at.exception
-    # The callback armed it and the same rerun's render consumed it.
-    assert dashboard.BY_CUST_SCROLL_KEY not in at.session_state, (
-        "the flag must be popped by the render, not left set for the next rerun"
+    assert any(m.label == "Customer Grouping" for m in at.metric), "card did not open"
+
+    # Streamlit fires on_change only when the widget's value actually changes, so
+    # this drives the callback rather than writing the key straight through.
+    at.multiselect(key=BY_CUST_SKU_FILTER).set_value(
+        [_undecorate(table["SKU"].iloc[0])]
+    ).run()
+    assert not at.exception, at.exception
+    assert at.session_state["filter_by_customer__sel"]["selection"]["rows"] == [], (
+        "the filter change must clear the positional row selection"
     )
-    # The scroll targets the keyed container that STARTS at the picker, so the
-    # control the reader just used stays on screen above the results. Moving the
-    # container below the selectbox would still scroll, just to the wrong place.
-    body = inspect.getsource(dashboard.main)
-    assert "with st.container(key=BY_CUST_FOCUS_KEY):" in body
-    assert body.index("st.container(key=BY_CUST_FOCUS_KEY)") < \
-        body.index('key="by_cust_sku"')
 
 
 @needs_data
@@ -854,11 +863,14 @@ def test_sku_detail_is_a_chart_a_kpi_stack_and_a_share_donut():
     assert "#### Weekly forecast" not in headings
     # AppTest does not surface download buttons as elements, so the export that sat
     # under the table is checked at the source (as test_mix_tab does for its donut).
-    body = inspect.getsource(dashboard.main)
-    assert "dl_sku_weekly" not in body, (
+    # The section itself lives in kpis.render_sku_detail_section — shared with
+    # Optimized Projections — so that, not dashboard.main, is where it is read from.
+    assert "dl_sku_weekly" not in inspect.getsource(dashboard.main), (
         "the weekly-forecast export went with its table"
     )
-    assert "customer_share_donut" in body
+    assert "customer_share_donut" in inspect.getsource(
+        dashboard.render_sku_detail_section
+    )
     # Twice, not three times: the page-top row and Customer detail (one group, many
     # SKUs) both still count SKUs. SKU detail no longer does.
     assert sum(m.label == "SKUs Forecasted" for m in at.metric) == 2
@@ -954,10 +966,14 @@ def test_quick_single_group_renders_the_by_customer_table():
     assert "### SKU detail" not in headings
     labels = [e.label or "" for e in at.expander]
     assert not any("Summary table by SKU (view total)" in lbl for lbl in labels)
-    # Its SKU picker is built from the TABLE's SKUs and offers "all" first, which is
-    # what keeps this branch showing the whole table on arrival. It renders here even
-    # though `is_view_total` is False, so _sku_label has to live outside that gate.
-    assert at.selectbox(key="by_cust_sku").value == dashboard.ALL_SKUS_OPTION
+    # The fixed filter bar renders here too — the table is on every Quick view, not
+    # just the view-total ones — and opens with nothing picked, which is what keeps
+    # this branch showing the whole table on arrival.
+    assert at.multiselect(key=BY_CUST_SKU_FILTER).value == []
+    assert at.multiselect(key="filter_by_customer::Customer__ms").value == [], (
+        "Customer must be on the bar even on a single-group view, where it has "
+        "exactly one option — a fixed control that vanishes reads as a bug"
+    )
 
 
 @needs_data
