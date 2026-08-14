@@ -187,6 +187,14 @@ The dashboard **introspects `fit_regression`'s signature** to decide which sideb
 
 **⚠️ If you change the customer groupings or ignore lists, edit all five model files identically** (`regression.py`, `exponential_smoothing.py`, `holt_winters.py`, `xgboost.py`, `tsb.py`). `src/agent/data_io.py`'s `_clean` is the shared cleaning step and must stay in sync too (see the sync comment in `regression.py`'s `__main__`).
 
+### Whitespace: the warehouse pads everything, `_clean` unpads it
+
+Dynamics GP stores `ITEMNMBR` / `ITEMDESC` / customer numbers in fixed-width `CHAR` columns, so **every text value arrives right-padded with spaces** (`'BT1028      '`). The extract deliberately preserves that — the snapshot stays a faithful copy of the warehouse, and `tests/test_parquet_sidecar.py` pins it — so **`data_io._clean` is the one place it comes off**, for the dashboard, the agent and the upload path alike. Don't add a second `.strip()` at a render site; fix it there.
+
+`SKU` and `Customer` are stripped because padding **breaks joins**: a padded SKU missed the list-price index (blank revenue risk) and the Plytix SKU sets (the active-in / discontinued checks silently ran on nothing), and a padded customer missed `CUSTOMERS_TO_IGNORE` / `COMBINED_GROUPING`, fragmenting a group across its padded and clean spellings. `Description` is stripped because padding **looks broken** — it is display text, and it reached every chart title, detail-card title, table cell, Excel export and LLM prompt with a trailing gap.
+
+**`Description` is stripped differently from the other two, and the difference is load-bearing.** It is nullable, and the models group by `["SKU", "Description"]` with pandas' default `dropna=True` — so anything that moves a value into or out of NaN silently adds or removes a whole SKU from the forecast. `.astype(str).str.strip()` (what the two keys use) would turn NaN into the string `"nan"`; a bare `.str.strip()` would turn any non-string into NaN. Both are wrong here, so the strip is masked to the string values only. For the same reason an all-whitespace description collapses to `""` and is **not** normalised to NaN; `charts._sku_title` treats `""` as absent so the title falls back to the bare SKU. `tests/test_phase2_pipeline.py::test_clean_strips_description_whitespace` pins all four cases.
+
 ### The five models (`src/models/`)
 
 - **`regression.py`** — 8-week moving average nudged by a dampened linear-regression slope (`TREND_WEIGHT = 0.25`). Labeled "8-Week Moving Average" in the UI.

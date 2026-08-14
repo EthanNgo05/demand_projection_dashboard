@@ -342,11 +342,11 @@ def render_sku_detail_section(summary, agg, weekly, by_cust, anchors, prices,
     )
 
     def _sku_label(s):
-        # .strip(): warehouse descriptions are space-padded, which a dropdown
-        # renders as a long gap after the text.
+        # No .strip(): the warehouse's fixed-width padding comes off at ingestion
+        # (agent.data_io._clean), and a description that was nothing but padding
+        # arrives as "" and falls back to the bare SKU here.
         desc = desc_by_sku.get(s)
-        desc = desc.strip() if isinstance(desc, str) else ""
-        return f"{s} — {desc}" if desc else str(s)
+        return f"{s} — {desc}" if isinstance(desc, str) and desc else str(s)
 
     skus = sorted(summary["SKU"].astype(str).unique())
     sku = st.selectbox("SKU", skus, key=f"{key}_sku", help="Type to search",
@@ -359,8 +359,7 @@ def render_sku_detail_section(summary, agg, weekly, by_cust, anchors, prices,
         st.caption("No weekly data for this SKU in this snapshot.")
         return
 
-    desc = desc_by_sku.get(sku)
-    desc = desc.strip() if isinstance(desc, str) else ""
+    desc = desc_by_sku.get(sku) if isinstance(desc_by_sku.get(sku), str) else ""
     source = _sku_detail_source(summary_s)
     # Chart-only history floor, per SKU — same reasoning as the view's chart_anchors
     # (`lb` is as short as 8 weeks under the 8-Week Moving Average model, which would

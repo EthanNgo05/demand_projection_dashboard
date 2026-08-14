@@ -279,6 +279,20 @@ def aggregate_chart(agg, summary, weekly, anchors, view, date_range=None,
     return _base_layout(fig, f"Total weekly demand — {view}", ffw)
 
 
+def _sku_title(sku, desc):
+    """``"SKU — Description"``, or the bare SKU when there is no description.
+
+    Truthiness, not ``isinstance(desc, str)``: ``agent.data_io._clean`` strips the
+    warehouse's fixed-width padding, so a description that was nothing but spaces
+    now arrives as ``""`` — which is a str, and would have titled the chart
+    ``"BT1028 — "``. (It is deliberately left as ``""`` rather than turned into NaN
+    at ingestion: the models group by ["SKU", "Description"] with dropna=True, so
+    NaN would drop the SKU from the forecast entirely.)
+    """
+    desc = desc.strip() if isinstance(desc, str) else ""
+    return f"{sku} — {desc}" if desc else str(sku)
+
+
 def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None,
               prices=None):
     """Per-SKU: actuals (historical window, from its source) + updated forecast + original proj.
@@ -360,8 +374,8 @@ def sku_chart(sku, desc, source, agg, weekly, anchors, date_range=None,
     rr = _revenue_risk_trace(sys_proj["WeekDate"], risk_by_week)
     if rr is not None:
         fig.add_trace(rr)
-    title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
-    return _base_layout(fig, title, ffw, y_title=f"Units ({label})")
+    return _base_layout(fig, _sku_title(sku, desc), ffw,
+                        y_title=f"Units ({label})")
 
 
 def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
@@ -442,8 +456,8 @@ def actuals_vs_plan_chart(sku, desc, source, agg, anchors, date_range=None,
     rr = _revenue_risk_trace(sys_proj["WeekDate"], risk_by_week)
     if rr is not None:
         fig.add_trace(rr)
-    title = f"{sku} — {desc}" if isinstance(desc, str) else str(sku)
-    return _base_layout(fig, title, ffw, y_title=f"Units ({source})")
+    return _base_layout(fig, _sku_title(sku, desc), ffw,
+                        y_title=f"Units ({source})")
 
 
 # --------------------------------------------------------------------------- #

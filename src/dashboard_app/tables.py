@@ -108,16 +108,18 @@ def _sku_label_map(df):
     it. The stored VALUE stays the raw SKU; only the label carries the description.
     Empty (so the raw SKU shows) when the frame has no ``Description``.
 
-    Descriptions arrive space-padded from the warehouse, which a dropdown renders as
-    a long gap after the text — so they are stripped here.
+    No ``.strip()`` here: the warehouse's fixed-width padding comes off at the one
+    ingestion boundary (``agent.data_io._clean``), so re-asserting it at each render
+    site would just be a second place to keep in step. A description that was nothing
+    but padding arrives as ``""`` and falls through the truthiness test below.
     """
     if "SKU" not in df.columns or "Description" not in df.columns:
         return {}
     pairs = df[["SKU", "Description"]].drop_duplicates("SKU")
     return {
-        str(s): f"{s} — {d.strip()}"
+        str(s): f"{s} — {d}"
         for s, d in zip(pairs["SKU"].astype(str), pairs["Description"])
-        if isinstance(d, str) and d.strip()
+        if isinstance(d, str) and d
     }
 
 

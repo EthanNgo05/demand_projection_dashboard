@@ -558,10 +558,17 @@ if __name__ == "__main__":
     df = df[["SKU", "Description", "Customer", "WeekDate", "POS", "Orders", "Projection"]]
     # The fixed-width export space-pads SKU/Customer; strip before any key-based
     # lookup so SKUs match the list-price index and customers fold via
-    # COMBINED_GROUPING. Kept in sync with agent/data_io._clean (shared by the
-    # dashboard + agent), which this __main__ block mirrors.
+    # COMBINED_GROUPING. Description is padded too (GP CHAR(101)) and carries the gap
+    # into every chart title, table cell and export. Kept in sync with
+    # agent/data_io._clean (shared by the dashboard + agent), which this __main__
+    # block mirrors — see there for why Description is masked rather than
+    # astype(str)'d: it is nullable, and the fit function groups by
+    # ["SKU", "Description"] with pandas' default dropna=True, so coercing NaN to a
+    # string would silently change which SKUs get forecast.
     df["SKU"] = df["SKU"].astype(str).str.strip()
     df["Customer"] = df["Customer"].astype(str).str.strip()
+    is_text = df["Description"].map(lambda d: isinstance(d, str))
+    df.loc[is_text, "Description"] = df.loc[is_text, "Description"].str.strip()
     df = df[~df['Customer'].isin(CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
 

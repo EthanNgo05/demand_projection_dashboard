@@ -209,6 +209,26 @@ def _clean(raw_df, P):
     # folding together. Strip Customer *before* the ignore filter and grouping map.
     df["SKU"] = df["SKU"].astype(str).str.strip()
     df["Customer"] = df["Customer"].astype(str).str.strip()
+    # Description is display text rather than a join key, so it was left padded while
+    # the two keys above were stripped — but GP pads it to CHAR(101), so it reached
+    # every chart title, detail-card title, table cell, Excel export and LLM prompt
+    # with a long trailing gap ('BT1028 — twin wall mount pumps            '). Strip
+    # it at this one boundary rather than at each render site, so the downloads and
+    # the agent's JSON get it too.
+    #
+    # NOT `.astype(str).str.strip()` like the two above, and not a bare
+    # `.str.strip()`. Description is NULLABLE, and both of those change which SKUs
+    # get forecast: astype(str) turns NaN into the literal "nan", while a bare
+    # .str.strip() turns every non-string into NaN. The models' fit_* functions group
+    # by ["SKU", "Description"] with pandas' default dropna=True, so either direction
+    # silently adds or removes whole SKUs. Masking to the string values touches only
+    # the padding and leaves NaN as NaN.
+    #
+    # Blank-after-stripping ('   ' -> '') is deliberately NOT turned into NaN, for the
+    # same reason: that would drop the SKU from the groupby entirely. The title
+    # builders treat an empty description as absent instead (see charts.sku_chart).
+    is_text = df["Description"].map(lambda d: isinstance(d, str))
+    df.loc[is_text, "Description"] = df.loc[is_text, "Description"].str.strip()
     df = df[~df["Customer"].isin(P.CUSTOMERS_TO_IGNORE)]
     df["WeekDate"] = pd.to_datetime(df["WeekDate"])
     df["Customer Grouping"] = (
