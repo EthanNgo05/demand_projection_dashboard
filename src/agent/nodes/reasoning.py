@@ -25,7 +25,7 @@ def _skip_llm() -> bool:
 
     Set ``AGENT_SKIP_LLM=1`` (the batch runner's ``--no-llm``) for a pure
     numeric refresh — every view still gets its best model + backtest MASEs, just
-    no generated prose, avoiding one LLM call per view (~57× on a full batch)."""
+    no generated prose, avoiding one LLM call per view (~114× on a full batch)."""
     return bool(os.environ.get("AGENT_SKIP_LLM"))
 
 # Cap the anomaly-prompt table. ALL CUSTOMERS summaries can run to hundreds of

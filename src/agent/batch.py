@@ -8,7 +8,7 @@
 The single-view CLI (``agent.run``) runs one view; within a view the four
 models are fit serially, because one model (Holt-Winters) dominates the runtime
 so per-model parallelism doesn't pay off. Parallelism lives HERE instead: this
-runner fans the ~57 views out across a process pool and makes each worker
+runner fans the ~114 views out across a process pool and makes each worker
 single-threaded, so views run concurrently without the per-view dominant-model
 bottleneck and without CPU oversubscription. Every view writes its own
 ``outputs/agent_summary_<view>.json`` (see ``agent/nodes/publish.py``), which

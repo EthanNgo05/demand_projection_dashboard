@@ -19,6 +19,8 @@ summary the dashboard reads back. See [Agentic workflow](#agentic-workflow).
 src/                              # all importable app code
 ├── dashboard.py                  # Streamlit + Plotly front-end; runs any model live
 ├── log_config.py                 # shared date-organized logging helpers
+├── joblocks.py                   # shared lock/failure-marker primitives (streamlit-free)
+├── scheduler.py                  # APScheduler daemon: the 00:00 sync + all-models run
 ├── extract_demand_details.py     # nightly SQL-warehouse pull -> dated .xlsx
 ├── active_missing_projections.py # batch "active SKUs missing forecasts" report
 ├── agent/                        # LangGraph forecasting/reasoning pipeline
@@ -50,6 +52,22 @@ Dashboard (interactive):
 pip install -r requirements.txt
 streamlit run src/dashboard.py
 ```
+
+Nightly automation. `src/scheduler.py` is a long-lived APScheduler daemon that at
+00:00 runs a **full** warehouse sync (demand, warehouse projections, key SKUs)
+and then backtests **all five models across every view** to refresh Optimized
+Projections. Each step takes the same lock files and writes the same failure
+markers the dashboard's refresh buttons use, so a manual click and the nightly
+run never collide and a bad night shows up in the app's error banner by morning.
+
+```
+python src/scheduler.py --once --dry-run   # show the plan, touch nothing
+python src/scheduler.py --once             # run tonight's job right now
+./start_scheduler.ps1                      # boot wrapper; register with Task Scheduler (onstart)
+```
+
+`refresh_demand_data.ps1` runs the same four steps once, synchronously, without
+the locks — handy by hand, but the daemon is what keeps the data fresh.
 
 Batch mode — each model file is also a standalone script that picks up the newest
 raw file and writes per-group + combined Excel forecasts under `outputs/`. Run
@@ -164,7 +182,7 @@ cd src                                        # the agent package lives under sr
 python -m agent.run --view "All customers (combined)"
 python -m agent.run --view "AMAZON-DC"
 
-# precompute every view's summary in parallel (what the nightly job runs)
+# precompute every view's summary in parallel (step 4 of the nightly job)
 python -m agent.batch                         # flags: --workers N, --no-llm (skip LLM prose)
 ```
 

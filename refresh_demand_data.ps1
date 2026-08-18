@@ -1,8 +1,22 @@
 <#
     refresh_demand_data.ps1
     -----------------------
-    Wrapper for the nightly scheduled pull of BOTH dashboard data sets from the
-    SQL data warehouse:
+    MANUAL, one-shot wrapper that runs all four refresh steps synchronously.
+
+    This is NOT the nightly job. Scheduling lives in src/scheduler.py (an
+    APScheduler daemon, started at boot by start_scheduler.ps1), which runs these
+    same four steps at 00:00 AND coordinates with the dashboard: it takes the
+    per-pull .refresh.lock files so a manual click can't collide with it, and it
+    writes the .failed markers that raise the dashboard's error banner. This
+    script does neither, so prefer `python src\scheduler.py --once` unless you
+    specifically want a bare, lock-free run.
+
+    (For the record: this header used to claim the script was registered with
+    Windows Task Scheduler. It never was - no "scheduled DW refresh" header
+    appears anywhere under logs/ - which is why every snapshot until 2026-08-18
+    came from someone clicking the dashboard's Sync button.)
+
+    The four steps, against the SQL data warehouse:
 
       1. src/extract_demand_details.py (the ~10-minute batch) writes
          all_demand_projections_<date>.xlsx atomically into the folder the
@@ -26,9 +40,11 @@
     independent data sets), and the script exits with the worst of all the exit
     codes so Task Scheduler flags a failure in any of them (Last Run Result).
 
-    Register it with Windows Task Scheduler (see the schtasks command in the
-    project notes). It logs each run, with timestamps, to
-    logs/<yyyy-MM-dd>/logs_refresh.txt next to this script.
+    It logs each run, with timestamps, to logs/<yyyy-MM-dd>/logs_refresh.txt next
+    to this script - note that is a DIFFERENT file from the per-pull logs
+    (logs_refresh_demand.txt etc.) the dashboard and the scheduler both write and
+    read, so a run started here is invisible to the app's progress and error
+    reporting.
 
     The interpreter defaults to the repo's Python but can be overridden with the
     DEMAND_PYTHON environment variable (e.g. to point at a venv).
@@ -131,7 +147,7 @@ if ($demandCode -eq 0) {
     Add-Content -Path $Log -Value "===== scheduled agent precompute finished $Stamp (exit $agentCode) ====="
 }
 
-# Worst exit code wins, so Task Scheduler flags a failure in any pull/step.
+# Worst exit code wins, so a caller can tell any pull/step failed.
 exit ([Math]::Max(
     [Math]::Max([Math]::Max([int]$demandCode, [int]$warehouseCode), [int]$keySkusCode),
     [int]$agentCode

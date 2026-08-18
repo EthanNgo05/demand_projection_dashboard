@@ -49,6 +49,7 @@ import atexit
 import socket
 import logging
 import argparse
+import datetime
 import subprocess
 
 # Support both `python src/scheduler.py` and `python -m scheduler` from src/.
@@ -379,6 +380,17 @@ def _configure_logging(verbose=False):
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     if logger.handlers:
         return
+
+    # A daemon's stdout is a pipe or a redirect, not a console, so Windows gives
+    # it the locale code page (cp1252) — and these log lines carry em-dashes.
+    # Own the encoding here rather than relying on the launcher exporting
+    # PYTHONIOENCODING, which is exactly the assumption that makes a supervisor
+    # config change show up days later as an unreadable log.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):  # already wrapped, or not reconfigurable
+        pass
+
     fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
     for handler in (DateFolderHandler(joblocks.SCHEDULER_LOG),
@@ -455,9 +467,13 @@ def main(argv=None):
         misfire_grace_time=MISFIRE_GRACE_SECONDS,
     )
 
+    # A job's own next_run_time isn't computed until the scheduler starts (and
+    # start() blocks), so ask the trigger directly. It needs a concrete "now" in
+    # the scheduler's own timezone — passing None crashes inside APScheduler.
+    now = datetime.datetime.now(scheduler.timezone)
     logger.info("Scheduler started on %s — next run %s. Steps: full demand "
                 "pull, warehouse, key SKUs, then all models for every view.",
-                socket.gethostname(), trigger.get_next_fire_time(None, None))
+                socket.gethostname(), trigger.get_next_fire_time(None, now))
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

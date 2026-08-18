@@ -435,7 +435,7 @@ def start_key_skus_refresh():
 # --------------------------------------------------------------------------- #
 # The "Run Agent Summary" button above runs the agent for ONE view live. This
 # section runs it for EVERY view (the same work as `python -m agent.batch`),
-# which backtests all models across ~60 views and can take up to an hour. It
+# which backtests all models across ~114 views and takes ~50-60 minutes. It
 # reuses the demand-refresh pattern — a detached background process plus a lock
 # file — so the page stays usable while it runs; the batch writes each
 # outputs/agent_summary_<view>.json exactly as the nightly job does. We also keep
@@ -675,7 +675,7 @@ def start_agent_batch(provider, views=None):
     Reuses THIS interpreter/venv and inherits the environment; ``provider`` pins
     the reasoning LLM (LLM_PROVIDER) for the run. Pass ``views`` (a list of view
     names) to re-run ONLY those — the "Retry failed views" path — instead of the
-    full ~60-view batch. The lock is written BEFORE launching so a double-click
+    full ~114-view batch. The lock is written BEFORE launching so a double-click
     can't spawn two batches, then rewritten with the child PID so ANY session can
     check whether the batch is still alive. Output is appended to today's batch
     log; the Popen handle is stored in session_state so this session detects

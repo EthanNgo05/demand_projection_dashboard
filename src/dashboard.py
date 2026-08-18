@@ -1506,7 +1506,7 @@ def main():
                     key="run_agent_all",
                     disabled=anthropic_no_key,
                     help="Recommends the most accurate model for EVERY view and "
-                         "writes each recommendation to disk. Runs ~60 views — can "
+                         "writes each recommendation to disk. Runs ~114 views — can "
                          "take up to 1 hour. Asks for confirmation first.",
                 )
                 if run_all:
