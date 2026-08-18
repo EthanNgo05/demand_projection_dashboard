@@ -84,7 +84,13 @@ REGION_WAREHOUSES = {
     "US": ("LBC", "NJ"),
     "EU": ("SH-CTS",),
     "AU": ("ACR",),
-    "CA": ("YYZ5",),
+    # CA switched 3PL in Aug 2026: 18WHEELS replaced YYZ5, which now returns no
+    # rows at all. YYZ5 is kept because an unmatched code costs nothing (the
+    # filter below is an .isin) while dropping it would hard-fail the entire
+    # five-region pull the moment a YYZ5 row reappears - a rolling cutover, a
+    # restated week, or a re-run against older data. Two entries here is the
+    # same shape as US, and transform_to_regions sums across them.
+    "CA": ("YYZ5", "18WHEELS"),
     "JP": ("NETDEPOT",),
 }
 

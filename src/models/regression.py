@@ -149,6 +149,13 @@ def region_for_group(group):
     elif group in AU_GROUPS:
         return "AU (ACR)"
     elif group in CA_GROUPS:
+        # Legacy DISPLAY name, deliberately not renamed: CA has shipped via
+        # 18WHEELS since Aug 2026, but this string becomes the view id
+        # "All Customers - CA (YYZ5)", which keys the forecast cache and the
+        # outputs/agent_summary_<view>.json filename. Nothing routes on the
+        # warehouse text - data_io._region_code reads only the leading "CA".
+        # The real warehouse -> region mapping is REGION_WAREHOUSES in
+        # extract_warehouse_projections.py; change it there, not here.
         return "CA (YYZ5)"
     elif group in JP_GROUPS:
         return "JP (NETDEPOT)"

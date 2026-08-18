@@ -44,11 +44,36 @@ def test_us_sums_both_warehouses_and_projtypes():
     assert us["Sum of Proj"].iloc[0] == 9  # LBC+NJ, promo+base collapsed
 
 
+def test_ca_sums_both_warehouses():
+    """CA moved from YYZ5 to 18WHEELS (Aug 2026) and both are mapped, so the
+    region has to sum across them exactly as US does across LBC+NJ.
+
+    This is the assertion that actually pins the mapping.
+    ``test_each_warehouse_lands_in_its_region`` compares region *keys*
+    (``set(frames) == set(REGION_WAREHOUSES)``), which is true whether or not
+    18WHEELS is in the CA tuple — an unmapped code raises before it ever gets
+    there. Without a test naming the code, adding a DC to an existing region is
+    an unguarded change.
+    """
+    frames = wex.transform_to_regions(raw_rows([
+        ("CUSTA", "SKU1", W1, "YYZ5", "Projection", 3),
+        ("CUSTA", "SKU1", W1, "18WHEELS", "Projection", 4),
+        ("CUSTA", "SKU1", W1, "18WHEELS", "PromoProj", 2),
+    ]))
+
+    ca = frames["CA"]
+    assert list(ca.columns) == wex.PBI_COLUMNS
+    assert len(ca) == 1
+    assert ca["Sum of Proj"].iloc[0] == 9  # YYZ5+18WHEELS, promo+base collapsed
+
+
 def test_each_warehouse_lands_in_its_region():
     frames = wex.transform_to_regions(raw_rows([
         ("CUSTA", "SKU1", W1, "SH-CTS", "Projection", 1),
         ("CUSTA", "SKU1", W1, "ACR", "Projection", 2),
-        ("CUSTA", "SKU1", W1, "YYZ5", "Projection", 3),
+        # CA's live warehouse since Aug 2026; YYZ5 is covered by
+        # test_ca_sums_both_warehouses.
+        ("CUSTA", "SKU1", W1, "18WHEELS", "Projection", 3),
         ("CUSTA", "SKU1", W1, "NETDEPOT", "Projection", 4),
     ]))
 
