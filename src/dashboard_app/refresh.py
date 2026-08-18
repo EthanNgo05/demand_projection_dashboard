@@ -13,39 +13,22 @@ import streamlit as st
 from log_config import dated_log_path
 from agent import data_io
 
+import joblocks
 from dashboard_app.config import HERE, REPO_ROOT, fmt_when
 from dashboard_app import datasources
 
 logger = logging.getLogger("demand_dashboard")
 
 
-def _bg_creationflags():
-    """Windows flags for a background child that shows NO console window.
-
-    ``CREATE_NO_WINDOW`` gives the child a *hidden* console (rather than none at
-    all, as ``DETACHED_PROCESS`` would); any grandchildren it spawns — e.g. the
-    agent batch's process-pool workers — inherit that hidden console instead of
-    each allocating a fresh visible terminal window. ``CREATE_NEW_PROCESS_GROUP``
-    keeps the child off the parent's Ctrl-C group. Non-Windows: no flags.
-    """
-    if os.name == "nt":
-        return subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    return 0
-
-
-def _child_env(**overrides):
-    """Child environment for a background subprocess whose log we read live.
-
-    - ``PYTHONIOENCODING=utf-8``: without it the child writes its log in the
-      Windows locale code page (cp1252), where characters like '×' become byte
-      0xd7 that a UTF-8 reader can't decode.
-    - ``PYTHONUNBUFFERED=1``: a redirected-to-file stdout is block-buffered by
-      default, so per-view progress lines wouldn't reach the log until the child
-      exits (leaving "Check progress" stuck on "getting started"). Unbuffering
-      flushes each line as it's printed so the progress reader sees it live.
-    """
-    return {**os.environ, "PYTHONIOENCODING": "utf-8",
-            "PYTHONUNBUFFERED": "1", **overrides}
+# The lock/failure/child-process mechanics live in the Streamlit-free
+# ``joblocks`` module, because ``scheduler.py``'s nightly daemon has to write the
+# SAME locks, markers and run headers this module reads — a manual click and the
+# 00:00 run must see each other — and it cannot import this module (the
+# ``streamlit`` import above, plus the ``st.session_state`` reads in the agent-
+# batch helpers below). They are re-exported under their original private names
+# so every caller and test in this repo resolves unchanged.
+_bg_creationflags = joblocks.bg_creationflags
+_child_env = joblocks.child_env
 
 
 # --------------------------------------------------------------------------- #
@@ -69,92 +52,43 @@ EXTRACT_SCRIPT = os.path.join(HERE, "extract_demand_details.py")
 _CHILDREN = {}
 
 
-# One log file PER PULL. The demand, warehouse and key-SKU children are launched
-# within the same second and each inherits its own append handle; pointing all
-# three at a single logs_refresh.txt made their output interleave and clobber
-# each other mid-line — during the 2026-08 outage the "Connecting:" line was cut
-# off mid-token and two of the three children's output vanished entirely, which
-# is a large part of why a hard connection failure went undiagnosed for six days.
-# The repo also lives on a network path shared by more than one host, so several
-# writers are the norm, not the exception.
-DEMAND_LOG = "logs_refresh_demand.txt"
-WAREHOUSE_LOG = "logs_refresh_warehouse.txt"
-KEY_SKUS_LOG = "logs_refresh_key_skus.txt"
+DEMAND_LOG = joblocks.DEMAND_LOG
+WAREHOUSE_LOG = joblocks.WAREHOUSE_LOG
+KEY_SKUS_LOG = joblocks.KEY_SKUS_LOG
+
+_ERROR_LINE_RE = joblocks.ERROR_LINE_RE
+_RUN_HEADER_PREFIX = joblocks.RUN_HEADER_PREFIX
+_failure_path = joblocks.failure_path
 
 
 def _refresh_log_path(filename=DEMAND_LOG):
     """Today's log for one pull: ``logs/<date>/<filename>``. Computed per call
     (not at import) so a long-running dashboard files each refresh under the day
-    it ran, and shares the exact file the scheduled task writes."""
+    it ran, and shares the exact file the nightly scheduler writes."""
     return dated_log_path(filename)
-
-
-# Lines that mean the pull failed. The extracts log "Database error: (...)" for
-# any pyodbc failure and "ERROR" for config problems; a traceback covers the
-# crashes neither path catches.
-_ERROR_LINE_RE = re.compile(r"ERROR|Traceback \(most recent call last\)")
-# Header written by _launch_refresh before each run, used to scope the error
-# scan to the CURRENT run rather than an earlier one in the same day's file.
-_RUN_HEADER_PREFIX = "====="
 
 
 def _last_error_line(log_name):
     """The last error line from this pull's CURRENT run, or None.
 
-    Only lines after the newest run header are considered, so an earlier failure
-    in the same day's file can't be misreported as the running pull's outcome.
-    Best-effort: any read problem simply yields None.
+    Resolves the day's folder HERE, through ``_refresh_log_path``, and hands
+    ``joblocks`` a path — tests monkeypatch that function to redirect a whole run
+    into a tmpdir, which resolving the name inside joblocks would ignore.
     """
-    try:
-        with open(_refresh_log_path(log_name), encoding="utf-8",
-                  errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return None
-
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].lstrip().startswith(_RUN_HEADER_PREFIX):
-            lines = lines[i + 1:]
-            break
-
-    hits = [ln.strip() for ln in lines if _ERROR_LINE_RE.search(ln)]
-    return hits[-1][:500] if hits else None
-
-
-def _failure_path(lock_path):
-    """Sibling of the lock recording the last failed pull.
-
-    Persisted next to the lock (not in session_state) so the error survives a
-    browser reload, reaches a second browser session, and is visible from the
-    other host that shares this folder. Not matched by any snapshot glob.
-    """
-    return lock_path + ".failed"
+    return joblocks.last_error_line(_refresh_log_path(log_name))
 
 
 def _record_failure(lock_path, label, log_name, reason):
-    """Log the failure and persist it for the UI banner.
-
-    Before this, a failed pull was indistinguishable from an idle one: the lock
-    was cleared, the button re-enabled, and nothing was written anywhere the
-    user would look. Six days of failed syncs went unnoticed that way.
-    """
-    detail = _last_error_line(log_name) or reason
-    logger.error("%s failed on host %s: %s", label, socket.gethostname(), detail)
-    try:
-        with open(_failure_path(lock_path), "w", encoding="utf-8") as f:
-            f.write("\t".join([
-                pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-                socket.gethostname(),
-                detail,
-            ]))
-    except OSError:  # never let a diagnostics write break the pull's state
-        pass
+    """Log the failure and persist it for the UI banner (see joblocks)."""
+    return joblocks.record_failure(
+        lock_path, label, _refresh_log_path(log_name), reason
+    )
 
 
 # A pull older than this with no new file is treated as crashed, so the button
-# re-enables instead of wedging the UI forever. Comfortably above the ~10-minute
-# typical runtime and the extract's own 900s SQL_QUERY_TIMEOUT default.
-REFRESH_STALE_SECONDS = 30 * 60
+# re-enables instead of wedging the UI forever. Defined in joblocks because the
+# nightly scheduler asks the same "is this lock live?" question of the same file.
+REFRESH_STALE_SECONDS = joblocks.REFRESH_STALE_SECONDS
 
 
 def _refresh_lock_path():
@@ -164,15 +98,10 @@ def _refresh_lock_path():
     glob, so it never shows up as a snapshot) so a click and the nightly task
     coordinate through one file regardless of which one started the pull.
     """
-    return os.path.join(datasources._raw_dir(), ".refresh.lock")
+    return joblocks.lock_path(datasources._raw_dir())
 
 
-def _clear_lock(lock_path):
-    """Remove a refresh lock, ignoring the case where it's already gone."""
-    try:
-        os.remove(lock_path)
-    except OSError:
-        pass
+_clear_lock = joblocks.release
 
 
 def _refresh_state(lock_path, completed_since, label, log_name=DEMAND_LOG,
@@ -308,9 +237,8 @@ def _launch_refresh(lock_path, script, extra_args, env_overrides, header,
     handle is kept in ``_CHILDREN`` so ``_refresh_state`` notices a fast failure
     without waiting for the stale timeout.
     """
-    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(lock_path, "w", encoding="utf-8") as f:
-        f.write(now)
+    now = joblocks.now_stamp()
+    joblocks.acquire(lock_path, now)
     # A new attempt supersedes the previous outcome, so drop the stale banner.
     _clear_lock(_failure_path(lock_path))
 
@@ -321,10 +249,7 @@ def _launch_refresh(lock_path, script, extra_args, env_overrides, header,
         creationflags = _bg_creationflags()
         logf = open(_refresh_log_path(log_name), "a", encoding="utf-8")
         try:
-            logf.write(
-                f"\n===== {header} started {now} "
-                f"on {socket.gethostname()} =====\n"
-            )
+            logf.write(joblocks.run_header(header, now))
             logf.flush()
             _CHILDREN[lock_path] = subprocess.Popen(
                 [sys.executable, script] + extra_args,
@@ -352,14 +277,7 @@ def _launch_refresh(lock_path, script, extra_args, env_overrides, header,
 # --------------------------------------------------------------------------- #
 # Failure reporting                                                           #
 # --------------------------------------------------------------------------- #
-def _read_failure(lock_path):
-    """``(when, host, detail)`` for a pull's last failure, or None."""
-    try:
-        with open(_failure_path(lock_path), encoding="utf-8") as f:
-            when, host, detail = f.read().split("\t", 2)
-    except (OSError, ValueError):
-        return None
-    return when, host, detail
+_read_failure = joblocks.read_failure
 
 
 def sync_failures():
@@ -403,7 +321,7 @@ WAREHOUSE_EXTRACT_SCRIPT = os.path.join(HERE, "extract_warehouse_projections.py"
 def _wh_refresh_lock_path():
     """Lock for an in-flight warehouse pull, in the warehouse snapshot folder
     (not matched by the ``*.xlsx`` discovery glob)."""
-    return os.path.join(data_io._warehouse_dir(), ".refresh.lock")
+    return joblocks.lock_path(data_io._warehouse_dir())
 
 
 def _wh_snapshot_complete_since(lock_mtime):
@@ -460,7 +378,7 @@ def start_warehouse_refresh():
 KEY_SKUS_EXTRACT_SCRIPT = os.path.join(HERE, "extract_key_skus.py")
 # The pull is fast (a single DISTINCT SKU query), so a shorter stale window than
 # the demand/warehouse 30 min re-enables the button quickly if it fails.
-KEY_SKUS_STALE_SECONDS = 5 * 60
+KEY_SKUS_STALE_SECONDS = joblocks.KEY_SKUS_STALE_SECONDS
 
 
 def _key_skus_dir():
@@ -474,7 +392,7 @@ def _key_skus_lock_path():
     ``.refresh.lock`` isn't matched by the ``key_skus_*.xlsx`` discovery glob,
     so it never shows up as a list file.
     """
-    return os.path.join(_key_skus_dir(), ".refresh.lock")
+    return joblocks.lock_path(_key_skus_dir())
 
 
 def key_skus_refresh_in_progress():
@@ -523,18 +441,18 @@ def start_key_skus_refresh():
 # outputs/agent_summary_<view>.json exactly as the nightly job does. We also keep
 # the Popen handle in session_state so the current session detects completion
 # promptly (the lock's stale timeout is only the cross-restart fallback).
-BATCH_STALE_SECONDS = 90 * 60  # generous: a full LLM batch can approach an hour.
+BATCH_STALE_SECONDS = joblocks.BATCH_STALE_SECONDS  # 3h; see joblocks for why.
 
 
 def _batch_lock_path():
     """Lock file marking an in-flight all-views batch, kept under outputs/."""
-    return os.path.join(REPO_ROOT, "outputs", ".agent_batch.lock")
+    return joblocks.batch_lock_path(REPO_ROOT)
 
 
 def _batch_log_path():
     """Today's batch log: ``logs/<date>/logs_agent_batch.txt`` (computed per call
     so a long-running dashboard files each run under the day it ran)."""
-    return dated_log_path("logs_agent_batch.txt")
+    return dated_log_path(joblocks.BATCH_LOG)
 
 
 def _batch_result_line():
@@ -674,23 +592,7 @@ def _batch_run_finished(started):
     return any(ln.strip().startswith("Done:") for ln in lines[hdr + 1:])
 
 
-def _read_lock(lock_path):
-    """(started_str, pid_or_None) from the batch lock; ('', None) on any error.
-
-    Line 1 is the start timestamp (written before launch); line 2, if present,
-    is the child PID (written just after launch). Older single-line locks have
-    no PID and read back as pid=None.
-    """
-    try:
-        with open(lock_path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        return "", None
-    started = lines[0].strip() if lines else ""
-    pid = None
-    if len(lines) > 1 and lines[1].strip().isdigit():
-        pid = int(lines[1].strip())
-    return started, pid
+_read_lock = joblocks.read_lock
 
 
 def _pid_running_batch(pid):
@@ -786,10 +688,8 @@ def start_agent_batch(provider, views=None):
         )
 
     lock_path = _batch_lock_path()
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(lock_path, "w", encoding="utf-8") as f:
-        f.write(now)
+    now = joblocks.now_stamp()
+    joblocks.acquire(lock_path, now)
 
     try:
         env = _child_env(LLM_PROVIDER=provider)
@@ -800,7 +700,7 @@ def start_agent_batch(provider, views=None):
         scope = f"{len(views)} view(s)" if views else "all views"
         logf = open(_batch_log_path(), "a", encoding="utf-8")
         try:
-            logf.write(f"\n===== Agent batch ({scope}) started {now} =====\n")
+            logf.write(joblocks.run_header(f"Agent batch ({scope})", now))
             logf.flush()
             # `-m agent.batch` resolves because cwd=HERE is src/ (agent is a
             # package under src/). Provider is also passed as a flag so a stale
@@ -825,8 +725,7 @@ def start_agent_batch(provider, views=None):
     # Record the PID (line 2) so any session can check liveness / crash without
     # this session's Popen handle. Best-effort — liveness gracefully degrades.
     try:
-        with open(lock_path, "w", encoding="utf-8") as f:
-            f.write(f"{now}\n{proc.pid}\n")
+        joblocks.acquire(lock_path, now, pid=proc.pid)
     except OSError:
         pass
 
