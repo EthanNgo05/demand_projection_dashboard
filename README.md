@@ -50,8 +50,16 @@ Dashboard (interactive):
 
 ```
 pip install -r requirements.txt
+
+# localhost only
 streamlit run src/dashboard.py
+
+# served to the team on the LAN (what the shared instance runs)
+streamlit run .\src\dashboard.py --server.address 0.0.0.0 --server.port 12589
 ```
+
+The shared instance binds `0.0.0.0:12589`, so anyone on the network reaches it at
+`http://<this-machine>:12589`.
 
 Nightly automation. `src/scheduler.py` is a long-lived APScheduler daemon that at
 00:00 runs a **full** warehouse sync (demand, warehouse projections, key SKUs)
@@ -158,14 +166,14 @@ instead."* This is **grounded, not guessed**: `agent/demand_profile.py` determin
 computes the [Syntetos–Boylan](https://en.wikipedia.org/wiki/Demand_forecasting)
 demand-classification features and hands them to the LLM:
 
-| Feature | Meaning | Model signal |
-|---|---|---|
-| `pct_zero_weeks` | intermittency | high → TSB territory |
-| `avg_demand_interval` (ADI) | mean gap between demand weeks | ≥ 1.32 → intermittent/lumpy |
-| `cv2_demand_size` | lumpiness of demand size (CV²) | ≥ 0.49 → erratic/lumpy |
-| `weeks_of_history` | history length | < ~104 → Holt-Winters can't fit annual seasonality |
-| `sku_count` | pooling scale | more SKUs favour pooled XGBoost |
-| `pattern` | `smooth` / `intermittent` / `erratic` / `lumpy` quadrant | derived from ADI + CV² |
+| Feature                       | Meaning                                                          | Model signal                                        |
+| ----------------------------- | ---------------------------------------------------------------- | --------------------------------------------------- |
+| `pct_zero_weeks`            | intermittency                                                    | high → TSB territory                               |
+| `avg_demand_interval` (ADI) | mean gap between demand weeks                                    | ≥ 1.32 → intermittent/lumpy                       |
+| `cv2_demand_size`           | lumpiness of demand size (CV²)                                  | ≥ 0.49 → erratic/lumpy                            |
+| `weeks_of_history`          | history length                                                   | < ~104 → Holt-Winters can't fit annual seasonality |
+| `sku_count`                 | pooling scale                                                    | more SKUs favour pooled XGBoost                     |
+| `pattern`                   | `smooth` / `intermittent` / `erratic` / `lumpy` quadrant | derived from ADI + CV²                             |
 
 These are folded into the *same* LLM call (no extra call per view), which returns three
 parseable sections (`EXPECTED_MODEL` / `FIT_NOTE` / `SUMMARY`). The published
@@ -220,11 +228,11 @@ $$
 \text{projected position}(h) = \text{level}_T +(\phi+\phi^2+\cdots+\phi^h)\,\text{trend}_T, \qquad h=1,\ldots,15
 $$
 
-| Parameter | Range | Role |
-|-----------|-------|------|
-| `ALPHA` | 0–1 | Level smoothing — how fast the level tracks recent demand |
-| `BETA`  | 0–1 | Trend smoothing — how fast the slope adapts (the ES analogue of the old `TREND_WEIGHT`; exposed as `TREND_WEIGHT` for dashboard compatibility) |
-| `PHI`   | 0–1 | Trend damping — values < 1 flatten the trend the further out we forecast, so a short-run slope is not extrapolated indefinitely (`PHI = 1` → plain Holt; `PHI = 0` → flat at the level) |
+| Parameter | Range | Role                                                                                                                                                                                           |
+| --------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALPHA` | 0–1  | Level smoothing — how fast the level tracks recent demand                                                                                                                                     |
+| `BETA`  | 0–1  | Trend smoothing — how fast the slope adapts (the ES analogue of the old`TREND_WEIGHT`; exposed as `TREND_WEIGHT` for dashboard compatibility)                                             |
+| `PHI`   | 0–1  | Trend damping — values < 1 flatten the trend the further out we forecast, so a short-run slope is not extrapolated indefinitely (`PHI = 1` → plain Holt; `PHI = 0` → flat at the level) |
 
 Extras: fits all completed history by default (`LOOKBACK_WEEKS = None`),
 zero-fills gap weeks inside a SKU's active span (`FILL_GAPS_WITH_ZERO`),
@@ -252,10 +260,10 @@ Autofit button** for this model (its `fit_regression` carries no α/β/φ args a
 defines no `autofit_smoothing`, so the dashboard hides those controls, as it does
 for XGBoost).
 
-| Constant | Default | Role |
-|----------|---------|------|
-| `SEASONAL_PERIODS` | 52 | Length of one seasonal cycle in weeks (annual) |
-| `MIN_WEEKS_FOR_SEASONAL` | 104 | Minimum history (2 full cycles) before a seasonal fit is attempted |
+| Constant                   | Default | Role                                                               |
+| -------------------------- | ------- | ------------------------------------------------------------------ |
+| `SEASONAL_PERIODS`       | 52      | Length of one seasonal cycle in weeks (annual)                     |
+| `MIN_WEEKS_FOR_SEASONAL` | 104     | Minimum history (2 full cycles) before a seasonal fit is attempted |
 
 Additive (not multiplicative) seasonality is used deliberately — demand has many
 zero / near-zero weeks, on which a multiplicative season degenerates. SKUs with
@@ -332,7 +340,7 @@ Running the test suite (~150 fast tests):
 pip install -r requirements.txt
 pytest tests/ -v
 pytest --runslow          # include the slow full-matrix parity tests
-````
+```
 
 Run end-to-end and print a row count for all 3 models (the `agent` package lives
 under `src/`, so run these from that folder — data paths still resolve to the
