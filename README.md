@@ -46,11 +46,26 @@ The data folders (`raw_inputs/`, `outputs/`, `logs/`, `sql/`, `docs/`,
 
 ## Running it
 
+First-time setup on a new machine. The project needs **Python 3.11+** (`numpy`,
+`pandas` and `streamlit` are pinned above that floor), and some boxes still have
+an old 3.7 first on `PATH` — so pick the interpreter explicitly rather than
+trusting bare `python`, and install into a venv:
+
+```
+py -0p                       # list the interpreters the launcher knows about
+py -3.13 -m venv .venv       # use whatever 3.11+ version that listed
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Every command below assumes that venv is active (`.\.venv\Scripts\Activate.ps1`
+in each new shell). A bare `python -m streamlit ...` that reports
+`No module named streamlit` almost always means the venv isn't active and `python`
+resolved to a system 3.7.
+
 Dashboard (interactive):
 
 ```
-pip install -r requirements.txt
-
 # localhost only
 streamlit run src/dashboard.py
 
