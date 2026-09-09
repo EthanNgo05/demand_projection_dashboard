@@ -229,6 +229,14 @@ TREND_COL = "Recent Trend"
 # appears — there is deliberately no second "WOS vs the updated forecast".
 ONHAND_COL = "On Hand"
 WOS_COL = "WOS Impact"
+# Weekly demand expressed in CONTAINERS instead of units: units ÷ the SKU's Plytix
+# ``Container Load`` (how many units a full container holds). Two tiles, not one,
+# because the question has two tenses — what is selling now vs what the updated
+# forecast implies — and a planner books containers against both. Computed by
+# kpis._weekly_containers; see its docstring for why it is a per-week sum averaged
+# over weeks rather than a sum of per-SKU averages.
+CONTAINER_HIST_COL = "Container Demand (hist avg/wk)"
+CONTAINER_FC_COL = "Container Demand (forecast avg/wk)"
 
 # ``Data Source`` at SKU level, when the SKU's customer groups don't agree.
 #
@@ -241,6 +249,59 @@ WOS_COL = "WOS Impact"
 # So the total keeps every customer and says so here. Per-customer rows keep their
 # own single source; only the SKU-level roll-up can read MIXED_SOURCE.
 MIXED_SOURCE = "Mixed (POS + Orders)"
+
+
+# --------------------------------------------------------------------------- #
+# Product categories: the SKU sets behind the "Category detail" section        #
+# --------------------------------------------------------------------------- #
+# There is NO category field in any source. The demand export carries only
+# SKU / Description / Customer, and Plytix `SKU Type` is an object class
+# (Product / Packaging / Part / POP), not a product family. The only category
+# signal in the data is free text inside Description / Plytix Label, and nothing
+# parses it. So membership is CURATED here rather than derived at runtime — an
+# explicit list is auditable, and a regex over marketing copy is not.
+#
+# Scope is ACTIVE SKUs only (Plytix `SKU Status == "Active"`). A category total is
+# therefore deliberately NOT the sum of every matching row in the by-SKU table:
+# discontinued SKUs still present in the snapshot are excluded. The section's
+# caption says so, so the difference reads as intent rather than as a bug.
+#
+# This list goes stale twice — when a SKU launches, and when one is discontinued.
+# Re-derive it against the newest snapshot with:
+#
+#   d = read_raw_frame(<newest all_demand_projections_*.xlsx>)
+#   p = read_plytix(<newest list_prices_*.xlsx, or PLYTIX_FEED_URL>)
+#   u = d.drop_duplicates("SKU")[["SKU", "Description"]]
+#   des = u["Description"].fillna("").str.lower()
+#   liners = u[des.str.contains("liners")
+#              & ~des.str.contains("liner pocket|liner rim")]
+#   sorted(liners.merge(p[p["SKU Status"] == "Active"], on="SKU")["SKU"])
+#
+# The PLURAL "liners" plus those two exclusions is what separates the liners from
+# the step cans that merely have a liner pocket or liner rim (CW2023, CW2024,
+# CW2103, ...) and from the hinge-block / air-damper parts that name one in their
+# description (PD6274, PD6275, PD6285). Verified on the 2026-09-01 snapshot: 110
+# SKUs matched, 31 correctly excluded, 76 of the 110 Active.
+#
+# Reviewed: 2026-09-09 (all_demand_projections_2026-09-01 + list_prices_07-24).
+# Every one of the 76 carried both a Container Load and a List Price USD then.
+PRODUCT_CATEGORIES = {
+    "Liners": frozenset({
+        "CW0160", "CW0160CP", "CW0161", "CW0161CP", "CW0162", "CW0162CP",
+        "CW0163CP", "CW0164CP", "CW0165CP", "CW0166", "CW0166CP", "CW0168",
+        "CW0168CP", "CW0169", "CW0169CP", "CW0171", "CW0171CP", "CW0173",
+        "CW0173CP", "CW0174", "CW0174CP", "CW0175", "CW0175CP", "CW0176",
+        "CW0176CP", "CW0201", "CW0201CP", "CW0217CP", "CW0250", "CW0251",
+        "CW0257", "CW0258", "CW0259", "CW0260", "CW0261", "CW0262",
+        "CW0263", "CW0264", "CW0404", "CW0405CP", "CW0415", "CW0416",
+        "CW0417", "CW0419CP", "CW0426CP", "CW0565MC", "CW0566MC", "CW0567MC",
+        "CW0568MC", "CW0570MC", "CW0573", "CW0574", "CW0575", "CW0576",
+        "CW0577", "CW0578", "CW0579", "CW0580CP", "CW0581", "CW0582",
+        "CW0585", "CW0586", "CW0589", "CW0591", "CW0593", "CW0596",
+        "CW0598", "CW0599", "CW0601", "CW0602", "CW0605", "CW0606",
+        "CW0610", "CW0612", "CW0614", "CW0634CP",
+    }),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +341,7 @@ KPI_ORDER = [
     PRICE_COL, RISK_COL, "Projected Revenue",
     # --- what is on the shelf ----------------------------------------------
     ONHAND_COL, WOS_COL, "Container Impact",
+    CONTAINER_HIST_COL, CONTAINER_FC_COL,
 ]
 
 # Identity fields: short strings, not measurements. Rendered in the same tile as
@@ -357,6 +419,19 @@ KPI_HELP = {
     "Container Impact": (
         "The SKU's total cumulative spike units ÷ its Container Load — how many "
         "containers of unplanned demand this represents. SKU-level."
+    ),
+    CONTAINER_HIST_COL: (
+        "Actual weekly demand expressed in containers: each week, Σ (that SKU's "
+        "units ÷ its Container Load), averaged over the weeks in the historical "
+        "window — the container equivalent of the Total Weekly Demand tile. SKUs "
+        "with no Container Load in the Plytix export are left out; the caption "
+        "beneath says how many."
+    ),
+    CONTAINER_FC_COL: (
+        "The updated forecast expressed in containers: each future week, Σ (that "
+        "SKU's forecast units ÷ its Container Load), averaged over the 15 forecast "
+        "weeks — the container equivalent of the Updated Forecast tile. SKUs with "
+        "no Container Load are left out."
     ),
     "Data Source": (
         "Which signal the forecast used: POS (sell-through) where the SKU has "

@@ -8,7 +8,7 @@ import streamlit as st
 from dashboard_app.config import (
     PRICE_COL, RISK_COL, fmt_dollar, MODEL_USED_COL, BEST_MODEL_COMBINED_VIEW,
     ALL_TIME_AVG_COL, EIGHT_WK_AVG_COL, TREND_COL, ONHAND_COL, WOS_COL, KPI_HELP,
-    MIXED_SOURCE,
+    MIXED_SOURCE, CONTAINER_HIST_COL, CONTAINER_FC_COL, PRODUCT_CATEGORIES,
 )
 from dashboard_app.summaries import (
     resolve_avg_col, avg_window_phrase, historical_window,
@@ -190,6 +190,139 @@ def _render_kpis(summary, agg, anchors, stacked=False, avg_col=None,
             )
 
 
+# --------------------------------------------------------------------------- #
+# Container demand: weekly units restated in the unit planners actually order   #
+# --------------------------------------------------------------------------- #
+
+def _as_container_load(container_load):
+    """``container_load`` as a str-indexed Series, or None when unusable.
+
+    Accepts the Series ``container_load_from_plytix`` returns or a plain dict.
+    Never mutates the input: the map is derived once in ``dashboard.main`` and
+    handed to every section, so reindexing it in place would edit shared state
+    from inside a render function.
+    """
+    if container_load is None:
+        return None
+    load = (container_load if isinstance(container_load, pd.Series)
+            else pd.Series(container_load, dtype="float64"))
+    if load.empty:
+        return None
+    return load.set_axis(load.index.astype(str))
+
+
+def _container_breakdown(frame, value_col, container_load):
+    """Weekly container demand for ``frame``, as a total AND its per-SKU parts.
+
+    Returns ``(total, per_sku, n_covered, n_total)`` where ``per_sku`` is a
+    SKU -> containers/week Series that **sums exactly to** ``total``.
+
+    That tie is the reason this returns both together instead of offering two
+    functions. The total is computed PER WEEK and then averaged: Σ over SKUs of
+    (units ÷ that SKU's load) for each week, meaned over the weeks present. The
+    obvious way to write the per-SKU column — each SKU's own mean ÷ its load —
+    divides a SKU that sold in 3 of 8 weeks by 3 while the total divides it by 8,
+    so the column would not add up to the tile beside it and the table would read
+    as broken. Both figures here are ``containers ÷ n_weeks`` over the SAME
+    ``n_weeks``, so they agree by construction rather than by coincidence.
+
+    The same reasoning as the Total Weekly Demand tile in ``_render_kpis``: a
+    per-SKU average divides each SKU by its own weeks-with-data, so summing those
+    would count a SKU that sold in a few weeks as if it sold in all of them.
+
+    The division has to happen PER SKU before the weekly sum: Container Load is a
+    per-SKU constant (a container holds 46,430 of CW0166 but 393 of ST2030), so
+    there is no such thing as a category-level load to divide a category total by.
+
+    ``container_load`` is the SKU -> units-per-container map from
+    ``agent.data_io.container_load_from_plytix`` (a Series; a plain dict also
+    works). SKUs missing from it map to NaN and drop out, exactly the way unpriced
+    SKUs drop out of Revenue Risk — the figure then covers a subset, and the caller
+    says which.
+
+    ``total`` is None when no SKU in the frame has a usable load, so the caller can
+    render an em dash rather than a zero: "no Container Load on file" must not read
+    as "zero containers". ``per_sku`` is then an empty Series, never zeros.
+    """
+    empty = pd.Series(dtype="float64")
+    load = _as_container_load(container_load)
+    if load is None or frame is None or getattr(frame, "empty", True):
+        return None, empty, 0, 0
+    if value_col not in frame.columns or "SKU" not in frame.columns:
+        return None, empty, 0, 0
+
+    skus = frame["SKU"].astype(str)
+    units = pd.to_numeric(frame[value_col], errors="coerce")
+    # .where(> 0): a zero or negative load would divide to inf, which would then
+    # dominate the weekly sum. container_load_from_plytix already filters those
+    # out; this keeps the helper honest against a dict passed in by a caller.
+    per_sku_load = pd.to_numeric(skus.map(load), errors="coerce")
+    containers = units / per_sku_load.where(per_sku_load > 0)
+
+    has_val = units.notna()
+    keep = containers.notna()
+    n_total = int(skus[has_val].nunique())
+    n_covered = int(skus[has_val & keep].nunique())
+    if not keep.any():
+        return None, empty, 0, n_total
+
+    kept = containers[keep]
+    weeks = pd.to_datetime(frame.loc[keep, "WeekDate"])
+    n_weeks = int(weeks.nunique())
+    if not n_weeks:
+        return None, empty, 0, n_total
+
+    total = float(kept.sum()) / n_weeks
+    per_sku = kept.groupby(skus[keep]).sum() / n_weeks
+    return total, per_sku, n_covered, n_total
+
+
+def _weekly_containers(frame, value_col, container_load):
+    """Mean weekly container count for ``frame`` — the total half of
+    ``_container_breakdown``, for callers that need no per-SKU split.
+
+    Returns ``(containers, n_covered, n_total)``.
+    """
+    total, _, n_covered, n_total = _container_breakdown(
+        frame, value_col, container_load)
+    return total, n_covered, n_total
+
+
+def _render_container_tiles(hist_frame, weekly_frame, container_load):
+    """The two container-demand tiles, plus a coverage caption when SKUs dropped out.
+
+    Two tiles rather than one because the question has two tenses: how many
+    containers a week is the category moving NOW (historical window, the container
+    twin of Total Weekly Demand), and how many the updated forecast implies going
+    forward (the twin of Updated Forecast). A planner books against both, and the
+    gap between them is the whole point.
+
+    Both come from ``_weekly_containers``, so the two tiles cannot drift apart in
+    method — only in input frame.
+    """
+    hist, _, _ = _weekly_containers(hist_frame, "demand", container_load)
+    fc, fc_covered, fc_total = _weekly_containers(
+        weekly_frame, "projected_pos", container_load)
+    for col, val in ((CONTAINER_HIST_COL, hist), (CONTAINER_FC_COL, fc)):
+        if val is None:
+            st.metric(
+                col, "—",
+                help="Load a list_prices_*.xlsx or refresh the Plytix feed "
+                     "(sidebar) to enable container demand — it needs each SKU's "
+                     "Container Load.",
+            )
+        else:
+            # Two decimals: a single SKU's weekly demand is often a fraction of a
+            # container, and rounding that to 0.0 would hide the number entirely.
+            st.metric(col, f"{val:,.2f}", help=KPI_HELP.get(col))
+    missing = fc_total - fc_covered
+    if fc is not None and missing:
+        st.caption(
+            f"📦 {missing} of {fc_total} SKUs have no Container Load in "
+            "the Plytix export; they are left out of the two container tiles."
+        )
+
+
 def render_sku_detail_card(agg_by_group, weekly_by_group, anchors, chart_anchors,
                            pm, row, key_base, model_label=None, top_groups=None):
     """Detail-card body for one (SKU, Customer Grouping) row of a summary table.
@@ -291,7 +424,7 @@ def _sku_detail_source(summary_s):
 
 
 def render_sku_detail_section(summary, agg, weekly, by_cust, anchors, prices,
-                              avg_col=None, key="sku"):
+                              container_load=None, avg_col=None, key="sku"):
     """The ``SKU detail`` section: ONE SKU's total weekly demand across every
     customer group in the view — the order-sizing view of the page ("how many units
     of this SKU do I need per week?"). The mirror of ``Customer detail``, drilled the
@@ -319,6 +452,10 @@ def render_sku_detail_section(summary, agg, weekly, by_cust, anchors, prices,
     a SKU × customer frame scoped to one SKU yields precisely its roll-up — which is
     why Optimized needs no per-SKU summary frame of its own. Building one would be a
     second path to the same number, and two paths are how two numbers start.
+
+    ``container_load`` is the SKU -> units-per-container map (Plytix). Optional: the
+    two container tiles simply read an em dash without it, the same way Revenue Risk
+    does without list prices.
 
     ``key`` namespaces the widgets (``{key}_sku`` selector, ``range_sku_{key}`` range
     picker) so both views can be open in one session without colliding.
@@ -443,6 +580,221 @@ def render_sku_detail_section(summary, agg, weekly, by_cust, anchors, prices,
                 if vals.empty:
                     continue
                 st.metric(col, fmt.format(vals.iloc[0]), help=KPI_HELP.get(col))
+        # This SKU's weekly demand restated in containers — the unit the order is
+        # actually placed in. Same window as the two tiles above it (the section
+        # `anchors`), so the units figure and the container figure describe the
+        # same weeks.
+        _render_container_tiles(
+            historical_window(agg_s, summary_s, anchors), weekly_s, container_load)
+
+
+def _sheet_slug(category):
+    """A category name as a legal Excel sheet name.
+
+    Excel caps sheet names at 31 characters and rejects ``[]:*?/\\`` — the same
+    truncation ``exceptions.py`` applies to its per-slug exports.
+    """
+    slug = "".join("-" if c in '[]:*?/\\' else c for c in str(category))
+    return slug.strip()[:31] or "category"
+
+
+def _file_slug(category):
+    """A category name as a filename fragment: lowercase, no spaces or separators."""
+    slug = "".join("_" if c in ' []:*?/\\' else c for c in str(category).lower())
+    return slug.strip("_") or "category"
+
+
+def _category_members(summary, category):
+    """The SKUs of ``category`` that are actually present in ``summary``.
+
+    The curated list in ``PRODUCT_CATEGORIES`` is snapshot-independent; this
+    intersects it with what the loaded snapshot and the active view really carry, so
+    a US-only view offers the liners that sell in the US rather than 76 rows of
+    which half are empty.
+    """
+    members = PRODUCT_CATEGORIES.get(category, frozenset())
+    present = set(summary["SKU"].astype(str).unique())
+    return sorted(present & set(members))
+
+
+def render_category_detail_section(summary, agg, weekly, by_cust, anchors, prices,
+                                   container_load=None, today_str="", avg_col=None,
+                                   key="cat"):
+    """The ``Category detail`` section: a PRODUCT GROUP's total weekly demand across
+    every customer group in the view — SKU detail drilled one level out.
+
+    The question this answers is the one that sizes a container booking or a factory
+    run: "what is the whole liners business doing?" Answering it from SKU detail
+    means opening 76 panes and adding them up by hand.
+
+    Deliberately assembled from the SAME pieces as the rest of the page rather than
+    new ones — ``_render_kpis`` for the tiles, ``charts.aggregate_chart`` for the
+    chart, ``chart_range_control`` for the picker. ``aggregate_chart`` is already
+    exactly this shape: it sums actuals (via the resolved ``demand`` column), the
+    updated forecast and the snapshot's original ``Projection`` across whatever SKUs
+    it is handed. Scoped to a category's SKUs it IS a category chart, with no new
+    code and no second way for these numbers to be computed.
+
+    ``summary``/``by_cust`` arrive at different grains per view, exactly as they do
+    for ``render_sku_detail_section`` — Quick passes SKU-grain ``summary`` plus
+    ``by_cust``; Optimized passes ``combined`` for both. ``_render_kpis`` sums the
+    projection columns, so either grain scoped to the category yields its roll-up.
+
+    ``today_str`` dates the Excel export's filename, the same way every other
+    download button on the page is dated.
+
+    NOTE on scope: ``PRODUCT_CATEGORIES`` lists ACTIVE SKUs only, so these totals are
+    deliberately not the sum of every liner row in the table below — discontinued
+    liners still present in the snapshot are excluded. The caption says so, so the
+    difference reads as intent rather than as a bug.
+    """
+    _, lcw, ffw = anchors
+    st.markdown("### Category detail")
+
+    # Only offer categories this view actually has SKUs for: an empty entry is a dead
+    # end, and on a regional view a category can legitimately vanish.
+    cats = [c for c in PRODUCT_CATEGORIES if _category_members(summary, c)]
+    if not cats:
+        st.caption("No product category has SKUs in this view.")
+        return
+
+    def _cat_label(c):
+        return f"{c} ({len(_category_members(summary, c))} SKUs)"
+
+    category = st.selectbox("Category", cats, key=f"{key}_category",
+                            help="Type to search", format_func=_cat_label)
+    members = _category_members(summary, category)
+    st.caption(
+        f"Every active SKU in {category}, summed across every customer group in "
+        "this view — the one roll-up the tiles, the chart and the SKU list below "
+        "all read from. Scoped to SKUs Plytix marks Active, so it deliberately "
+        f"leaves out discontinued {category.lower()} still present in the "
+        "snapshot: it will not tie to the sum of every matching row in the table "
+        "further down."
+    )
+
+    def in_cat(frame):
+        return frame[frame["SKU"].astype(str).isin(members)]
+
+    summary_c = in_cat(summary)
+    agg_c = in_cat(agg)
+    weekly_c = in_cat(weekly)
+
+    if agg_c.empty or weekly_c.empty:
+        st.caption("No weekly data for this category in this snapshot.")
+        return
+
+    # Chart-only history floor, same reasoning as the SKU section's sku_anchors: `lb`
+    # is as short as 8 weeks under the 8-Week Moving Average model, which would trap
+    # the range picker inside that window. The KPIs keep the section `anchors`.
+    cat_anchors = (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw)
+
+    # Derived ONCE, above the column split, because both halves of the section read
+    # it: the per-SKU container columns in the listing on the left, and the container
+    # tiles on the right. Two calls would be two chances for the table and the tile
+    # above it to describe different windows.
+    hist_c = historical_window(agg_c, summary_c, anchors)
+
+    ccL, ccR = st.columns([3, 1])
+    with ccL:
+        cat_range = chart_range_control(agg_c, weekly_c, lcw, key=f"range_cat_{key}")
+        st.plotly_chart(
+            aggregate_chart(agg_c, summary_c, weekly_c, cat_anchors, category,
+                            date_range=cat_range, prices=prices),
+            width="stretch",
+        )
+
+        # --- The SKUs behind the number ------------------------------------
+        # Collapsed by default: this is the audit trail for the tiles, not something
+        # to read every visit. A table rather than the SKU section's donut — with 76
+        # members a share chart is 76 unreadable slivers, and the question here is
+        # "which SKUs are in this, and what does each contribute?".
+        with st.expander(f"SKUs in {category} ({len(members)})"):
+            cols = [c for c in ("SKU", "Description", EIGHT_WK_AVG_COL,
+                                "Current Projection Average",
+                                "Updated Projection Average")
+                    if c in summary_c.columns]
+            listing = summary_c.drop_duplicates("SKU")[cols].copy()
+            skus_col = listing["SKU"].astype(str)
+            load = _as_container_load(container_load)
+            if load is not None:
+                listing["Container Load"] = skus_col.map(load)
+                # Each SKU's share of the two container tiles beside the chart. From
+                # _container_breakdown, so these columns SUM to those tiles exactly
+                # (see its docstring for why a per-SKU mean would not).
+                for col, frame, value_col in (
+                    (CONTAINER_HIST_COL, hist_c, "demand"),
+                    (CONTAINER_FC_COL, weekly_c, "projected_pos"),
+                ):
+                    _, per_sku, _, _ = _container_breakdown(
+                        frame, value_col, container_load)
+                    listing[col] = skus_col.map(per_sku)
+            if "Updated Projection Average" in listing.columns:
+                listing = listing.sort_values("Updated Projection Average",
+                                              ascending=False)
+            st.caption(
+                "The rows the tiles beside the chart are the sum of — including the "
+                "two container columns, which add up to the container tiles. A blank "
+                "Container Load means that SKU sits out all three."
+            )
+            st.dataframe(listing, width="stretch", hide_index=True)
+            st.download_button(
+                f"⬇️ Download the {category} SKU list",
+                data=summary_to_excel(with_export_flags(listing),
+                                      sheet_name=_sheet_slug(category)),
+                file_name=f"{_file_slug(category)}_skus_{today_str}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument."
+                     "spreadsheetml.sheet",
+                # Namespaced by `key`: this section renders on both Quick and
+                # Optimized, and a bare key would collide across the two.
+                key=f"dl_category_skus_{key}",
+            )
+    with ccR:
+        # The same seven metrics as the top of the view, scoped to the category and
+        # stacked to fit the side column. Section anchors (not the widened chart
+        # range) so the historical window lines up with the KPI row above.
+        #
+        # SKUs Forecasted is KEPT here, unlike the SKU section where it is 1 by
+        # construction: "how many SKUs is this" is the first thing a reader needs in
+        # order to size everything under it.
+        _render_kpis(summary_c, agg_c, anchors, stacked=True, avg_col=avg_col)
+
+        # On Hand / WOS at CATEGORY grain. Neither can be the SKU section's
+        # `.iloc[0]` lookup: both are SKU-level constants repeated on every one of a
+        # SKU's customer rows, so de-duplicate on SKU before summing, or a SKU sold
+        # to five groups contributes its stock five times (the same trap
+        # exceptions._sum_distinct_skus exists for).
+        #
+        # WOS is then RE-DERIVED from the two category totals rather than averaged
+        # over the per-SKU column: a mean of ratios is not the ratio of the totals,
+        # and it is the latter that answers "how long does this category's stock
+        # last". Same formula as compute.attach_supply_columns, one level up.
+        bd = in_cat(by_cust) if by_cust is not None and not by_cust.empty else None
+        if bd is not None and not bd.empty and ONHAND_COL in bd.columns:
+            per_sku = bd.drop_duplicates("SKU")
+            onhand = pd.to_numeric(per_sku[ONHAND_COL], errors="coerce")
+            if onhand.notna().any():
+                total_onhand = float(onhand.sum())
+                st.metric(
+                    ONHAND_COL, f"{total_onhand:,.0f}",
+                    help=f"Total On Hand across the {int(onhand.notna().sum())} "
+                         "SKUs in this category that have a warehouse figure "
+                         "(counted once per SKU, not once per customer row).",
+                )
+                current = pd.to_numeric(
+                    summary_c["Current Projection Average"], errors="coerce").sum()
+                if current > 0:
+                    st.metric(
+                        WOS_COL, f"{total_onhand / current:,.1f}",
+                        help="The category's total On Hand ÷ its total current "
+                             "weekly projection — the ratio of the totals, not "
+                             "the average of the per-SKU ratios.",
+                    )
+
+        # The category's weekly demand in containers. The per-SKU division happens
+        # inside the helper: a container holds a different number of every SKU, so
+        # there is no category-level load to divide a category total by.
+        _render_container_tiles(hist_c, weekly_c, container_load)
 
 
 def projection_kpi_extras(row):
@@ -490,7 +842,7 @@ def projection_difference_delta(row):
 
 def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows,
                                 anchors, P=None, data_sig=None,
-                                onhand_by_sku=None):
+                                onhand_by_sku=None, container_load=None):
     """Render the BEST_MODEL_COMBINED_VIEW: per-group best-model table.
 
     Builds (and session-caches) the mixed table via ``compute_by_customer_best``,
@@ -680,7 +1032,17 @@ def _render_best_model_combined(df, today_ts, today_str, prices, n_excluded_rows
     # per-customer rows, and _render_kpis sums them — which is exactly the roll-up
     # this section shows. No gate: unlike Quick, this view always spans every group.
     render_sku_detail_section(combined, agg_all, weekly_all, combined, anchors, pm,
+                              container_load=container_load,
                               avg_col=anchors_avg_col, key="best")
+
+    # ----- Per-category detail ----------------------------------------------
+    # SKU detail drilled one level out: the same tiles and the same chart over a
+    # product group instead of a single SKU. `combined` again serves as both the KPI
+    # frame and the breakdown frame, for the same reason it does above.
+    render_category_detail_section(combined, agg_all, weekly_all, combined, anchors,
+                                   pm, container_load=container_load,
+                                   today_str=today_str,
+                                   avg_col=anchors_avg_col, key="best")
 
     st.markdown("### Summary table by SKU and customer")
 

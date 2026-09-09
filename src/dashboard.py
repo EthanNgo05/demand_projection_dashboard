@@ -172,7 +172,8 @@ from dashboard_app.agent_summary import (  # noqa: F401
 from dashboard_app.kpis import (  # noqa: F401
     BEST_MIX_CARD_COLS, BEST_MIX_CONDENSED_COLS,
     _render_best_model_combined, _render_kpis, render_sku_detail_card,
-    render_sku_detail_section, projection_difference_delta, projection_kpi_extras,
+    render_sku_detail_section, render_category_detail_section,
+    projection_difference_delta, projection_kpi_extras,
 )
 from dashboard_app.exceptions import (  # noqa: F401
     compute_exceptions, render_exceptions,
@@ -1324,6 +1325,14 @@ def main():
         excl = data_io.apply_exclusions(df, plytix_df, P, anchors=(lb, lcw, ffw))
         st.session_state["_excl_result"] = excl
         st.session_state["_excl_sig"] = excl_sig
+    # SKU -> units-per-container, for the container-demand tiles on the SKU and
+    # Category detail sections. Derived here, once, from the same plytix_df every
+    # other Plytix-backed figure on the page reads — not inside the sections, so the
+    # two of them cannot end up reading different snapshots of it. Cheap enough to
+    # sit outside the exclusions memo: it is a dropna + to_numeric over the Plytix
+    # frame, not a groupby. None when no Plytix export is loaded, and the tiles then
+    # render an em dash rather than a zero.
+    container_load = data_io.container_load_from_plytix(plytix_df)
     df = excl.df
     # Same frame minus the discontinued drop, for the Historical Summary only. That
     # filter removes a retired SKU's ENTIRE history, which is right for forecasting
@@ -1613,6 +1622,7 @@ def main():
         _render_best_model_combined(
             df, today_ts, today_str, prices, n_excluded_rows, (lb, lcw, ffw), P,
             data_sig=data_sig, onhand_by_sku=onhand_by_sku,
+            container_load=container_load,
         )
         st.stop()
 
@@ -1985,7 +1995,8 @@ def main():
     is_view_total = view == ALL_CUSTOMERS_VIEW or region_from_view(view) is not None
     if is_view_total:
         render_sku_detail_section(summary, agg, weekly, by_cust, (lb, lcw, ffw),
-                                  prices, avg_col=anchors_avg_col, key="quick")
+                                  prices, container_load=container_load,
+                                  avg_col=anchors_avg_col, key="quick")
 
     # ----- Summary table by SKU (view total), collapsed ---------------------
     # One row per SKU: the SUM of that SKU's customer rows in the table below, and the
@@ -2049,6 +2060,27 @@ def main():
     # screen. Only the view-total roll-up above it folds away — the two are not a
     # matched pair, and putting this one behind a click as well would leave the page
     # opening on nothing but the drill-downs.
+    # ----- Category detail --------------------------------------------------
+    # SKU detail drilled one level out: a product group's total across every customer
+    # group in the view.
+    #
+    # BELOW the by-SKU table, not above it: that table is the table form of exactly
+    # what SKU detail just charted (one row per SKU at the view total), so the two
+    # have to stay adjacent — its own comment says as much. Category detail is the
+    # step out to the next grain up, which puts it last before the main summary
+    # table. Optimized Projections reads the same way for the same reason.
+    #
+    # Deliberately NOT behind `is_view_total`. That gate exists because for a single
+    # bare customer group the page's own KPI row already IS that group's roll-up, so
+    # SKU detail would only restate the table's detail cards. A category roll-up is
+    # never that restatement — "what are liners doing inside this one customer group"
+    # is a number the page shows nowhere else — so it renders for every view. Both
+    # branches of the compute path above produce all four frames it needs.
+    render_category_detail_section(summary, agg, weekly, by_cust, (lb, lcw, ffw),
+                                   prices, container_load=container_load,
+                                   today_str=today_str,
+                                   avg_col=anchors_avg_col, key="quick")
+
     st.markdown("### Summary table by SKU and customer")
     if not has_by_cust:
         st.info("No per-customer forecasts to show for this snapshot.")

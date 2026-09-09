@@ -871,9 +871,15 @@ def test_sku_detail_is_a_chart_a_kpi_stack_and_a_share_donut():
     assert "customer_share_donut" in inspect.getsource(
         dashboard.render_sku_detail_section
     )
-    # Twice, not three times: the page-top row and Customer detail (one group, many
-    # SKUs) both still count SKUs. SKU detail no longer does.
-    assert sum(m.label == "SKUs Forecasted" for m in at.metric) == 2
+    # Three times, and not from SKU detail: the page-top row, Customer detail (one
+    # group, many SKUs) and Category detail (one product group, many SKUs) all count
+    # SKUs, because for each of them the count is a real number the reader needs to
+    # size everything under it. SKU detail is the one section that does NOT, since
+    # scoped to a single SKU the tile could only ever read 1.
+    assert sum(m.label == "SKUs Forecasted" for m in at.metric) == 3
+    assert "show_sku_count=False" in inspect.getsource(
+        dashboard.render_sku_detail_section
+    ), "SKU detail is the section that suppresses the count"
     # The other stacked tiles stay — only the count was dropped.
     assert any(m.label == "Updated Forecast (avg/wk)" for m in at.metric)
 
