@@ -230,13 +230,19 @@ TREND_COL = "Recent Trend"
 ONHAND_COL = "On Hand"
 WOS_COL = "WOS Impact"
 # Weekly demand expressed in CONTAINERS instead of units: units ÷ the SKU's Plytix
-# ``Container Load`` (how many units a full container holds). Two tiles, not one,
+# ``Container Load`` (how many units a full container holds). Two figures, not one,
 # because the question has two tenses — what is selling now vs what the updated
 # forecast implies — and a planner books containers against both. Computed by
-# kpis._weekly_containers; see its docstring for why it is a per-week sum averaged
+# kpis._container_breakdown; see its docstring for why it is a per-week sum averaged
 # over weeks rather than a sum of per-SKU averages.
-CONTAINER_HIST_COL = "Container Demand (hist avg/wk)"
-CONTAINER_FC_COL = "Container Demand (forecast avg/wk)"
+#
+# These are the STABLE names: the KPI_ORDER/KPI_HELP keys, the column headers in the
+# category SKU listing, and the headers in its Excel export. The historical TILE is
+# labelled dynamically instead ("Container Demand (6-Month avg/wk)") because it
+# follows the chart's Date range selector — see kpis._render_container_tiles. The
+# export keeps a fixed schema so a downloaded workbook is comparable run to run.
+CONTAINER_HIST_COL = "Historical Container Demand (avg/wk)"
+CONTAINER_FC_COL = "Forecast Container Demand (avg/wk)"
 
 # ``Data Source`` at SKU level, when the SKU's customer groups don't agree.
 #
@@ -422,16 +428,20 @@ KPI_HELP = {
     ),
     CONTAINER_HIST_COL: (
         "Actual weekly demand expressed in containers: each week, Σ (that SKU's "
-        "units ÷ its Container Load), averaged over the weeks in the historical "
-        "window — the container equivalent of the Total Weekly Demand tile. SKUs "
-        "with no Container Load in the Plytix export are left out; the caption "
-        "beneath says how many."
+        "units ÷ its Container Load), averaged over the weeks shown. "
+        "This one FOLLOWS the chart's Date range selector, so a 3-month and a "
+        "1-year selection give different answers — unlike 'Total Weekly Demand "
+        "(8-Week avg)' above it, which names its window and therefore always uses "
+        "that window. SKUs with no Container Load in the Plytix export are left "
+        "out; the caption beneath says how many."
     ),
     CONTAINER_FC_COL: (
         "The updated forecast expressed in containers: each future week, Σ (that "
         "SKU's forecast units ÷ its Container Load), averaged over the 15 forecast "
-        "weeks — the container equivalent of the Updated Forecast tile. SKUs with "
-        "no Container Load are left out."
+        "weeks — the container equivalent of the Updated Forecast tile. Unaffected "
+        "by the Date range selector, which only ever trims history: the forecast "
+        "horizon stays fully visible at every preset. SKUs with no Container Load "
+        "are left out."
     ),
     "Data Source": (
         "Which signal the forecast used: POS (sell-through) where the SKU has "

@@ -20,7 +20,8 @@ from dashboard_app.compute import (
 )
 from dashboard_app.refresh import batch_in_progress
 from dashboard_app.charts import (
-    chart_range_control, aggregate_chart, sku_chart, customer_share_donut,
+    chart_range_control, chart_range_preset, aggregate_chart, sku_chart,
+    customer_share_donut,
 )
 from dashboard_app.tables import FIXED_FILTER_LABELS, render_selectable_table
 
@@ -288,7 +289,60 @@ def _weekly_containers(frame, value_col, container_load):
     return total, n_covered, n_total
 
 
-def _render_container_tiles(hist_frame, weekly_frame, container_load):
+def _container_help(col, hist_frame):
+    """``KPI_HELP`` for a container tile, plus the exact weeks behind it.
+
+    Naming the real first and last week matters for the historical tile because a
+    preset can be CLIPPED by short history: "1 Year" on a SKU with four months of
+    data is a four-month average, and only the dates reveal that.
+    """
+    base = KPI_HELP.get(col)
+    if col != CONTAINER_HIST_COL or hist_frame is None or hist_frame.empty:
+        return base
+    weeks = pd.to_datetime(hist_frame["WeekDate"])
+    if weeks.empty:
+        return base
+    span = (f"Weeks used: {weeks.min().date()} → {weeks.max().date()} "
+            f"({weeks.nunique()} weeks).")
+    return f"{base} {span}" if base else span
+
+
+# How a Date-range preset reads inside a tile label. Only the wording differs from
+# charts.RANGE_PRESETS' keys; anything not listed falls through unchanged.
+_RANGE_LABELS = {
+    "1 Month": "1-Month", "3 Months": "3-Month", "6 Months": "6-Month",
+    "9 Months": "9-Month", "1 Year": "1-Year", "2 Years": "2-Year",
+    "3 Years": "3-Year", "All": "All-Time", "Custom…": "custom range",
+}
+
+
+def _range_label(preset):
+    """A Date-range preset name as it should read inside a tile label."""
+    return _RANGE_LABELS.get(preset, str(preset))
+
+
+def _history_window_from_range(date_range, anchors):
+    """``anchors`` re-based on the chart's selected date range, for history math.
+
+    ``chart_range_control`` returns ``end`` as the FORECAST horizon in every branch —
+    presets trim history only, so the forecast always stays visible. Handing that
+    tuple straight to ``summaries.historical_window`` would therefore drag forecast
+    weeks into a historical slice. Clamping ``end`` to ``lcw`` (the last completed
+    week) is what keeps this a history window.
+
+    ``start`` needs no clamp: the picker already floors it at the frame's first week.
+    Falls back to ``anchors`` unchanged when no range is supplied, so a caller
+    without a picker keeps the model's window.
+    """
+    if not date_range:
+        return anchors
+    _, lcw, ffw = anchors
+    start, end = date_range
+    return pd.Timestamp(start), min(pd.Timestamp(end), lcw), ffw
+
+
+def _render_container_tiles(hist_frame, weekly_frame, container_load,
+                            range_label=None):
     """The two container-demand tiles, plus a coverage caption when SKUs dropped out.
 
     Two tiles rather than one because the question has two tenses: how many
@@ -299,14 +353,28 @@ def _render_container_tiles(hist_frame, weekly_frame, container_load):
 
     Both come from ``_weekly_containers``, so the two tiles cannot drift apart in
     method — only in input frame.
+
+    ``range_label`` names the window ``hist_frame`` was sliced to, e.g. ``"6-Month"``,
+    and makes the historical tile read "Container Demand (6-Month avg/wk)". That tile
+    FOLLOWS the chart's Date range selector, so it has to say which window it is on —
+    a bare "hist" would leave two differently-windowed averages sitting in one column
+    with nothing to tell them apart. The forecast tile takes no such label: the picker
+    only ever trims history, so its window is the same at every preset.
+
+    The DISPLAYED label is dynamic but ``KPI_HELP`` is keyed by the stable constant,
+    which is also the column header in the SKU listing and its Excel export — a
+    downloaded workbook keeps a fixed schema whatever the picker was set to.
     """
     hist, _, _ = _weekly_containers(hist_frame, "demand", container_load)
     fc, fc_covered, fc_total = _weekly_containers(
         weekly_frame, "projected_pos", container_load)
-    for col, val in ((CONTAINER_HIST_COL, hist), (CONTAINER_FC_COL, fc)):
+    hist_label = (f"Container Demand ({range_label} avg/wk)"
+                  if range_label else CONTAINER_HIST_COL)
+    for col, label, val in ((CONTAINER_HIST_COL, hist_label, hist),
+                            (CONTAINER_FC_COL, CONTAINER_FC_COL, fc)):
         if val is None:
             st.metric(
-                col, "—",
+                label, "—",
                 help="Load a list_prices_*.xlsx or refresh the Plytix feed "
                      "(sidebar) to enable container demand — it needs each SKU's "
                      "Container Load.",
@@ -314,7 +382,7 @@ def _render_container_tiles(hist_frame, weekly_frame, container_load):
         else:
             # Two decimals: a single SKU's weekly demand is often a fraction of a
             # container, and rounding that to 0.0 would hide the number entirely.
-            st.metric(col, f"{val:,.2f}", help=KPI_HELP.get(col))
+            st.metric(label, f"{val:,.2f}", help=_container_help(col, hist_frame))
     missing = fc_total - fc_covered
     if fc is not None and missing:
         st.caption(
@@ -581,11 +649,20 @@ def render_sku_detail_section(summary, agg, weekly, by_cust, anchors, prices,
                     continue
                 st.metric(col, fmt.format(vals.iloc[0]), help=KPI_HELP.get(col))
         # This SKU's weekly demand restated in containers — the unit the order is
-        # actually placed in. Same window as the two tiles above it (the section
-        # `anchors`), so the units figure and the container figure describe the
-        # same weeks.
+        # actually placed in.
+        #
+        # This one DELIBERATELY diverges from the tiles above it: it follows the
+        # chart's Date range selector rather than the model's window. Containers are
+        # booked against what is selling over a horizon the planner chooses, and the
+        # model's window is either 8 weeks or 3 years with nothing in between. The
+        # tiles above keep the model window because their labels name it — "Total
+        # Weekly Demand (8-Week avg)" has to be an 8-week average. This tile's label
+        # names the selected range instead, so both are honest about their window.
+        sku_hist = historical_window(
+            agg_s, summary_s, _history_window_from_range(sku_range, anchors))
         _render_container_tiles(
-            historical_window(agg_s, summary_s, anchors), weekly_s, container_load)
+            sku_hist, weekly_s, container_load,
+            range_label=_range_label(chart_range_preset(f"range_sku_{key}")))
 
 
 def _sheet_slug(category):
@@ -689,15 +766,19 @@ def render_category_detail_section(summary, agg, weekly, by_cust, anchors, price
     # the range picker inside that window. The KPIs keep the section `anchors`.
     cat_anchors = (pd.to_datetime(agg_c["WeekDate"]).min(), lcw, ffw)
 
-    # Derived ONCE, above the column split, because both halves of the section read
-    # it: the per-SKU container columns in the listing on the left, and the container
-    # tiles on the right. Two calls would be two chances for the table and the tile
-    # above it to describe different windows.
-    hist_c = historical_window(agg_c, summary_c, anchors)
-
     ccL, ccR = st.columns([3, 1])
     with ccL:
         cat_range = chart_range_control(agg_c, weekly_c, lcw, key=f"range_cat_{key}")
+        # Derived ONCE, here, because both halves of the section read it: the per-SKU
+        # container columns in the listing below, and the container tiles in the right
+        # column. Two calls would be two chances for the table and the tile it sums to
+        # to describe different windows.
+        #
+        # It has to sit INSIDE ccL rather than above the split, because it depends on
+        # cat_range, which the picker above only produces once this column runs. ccL
+        # executes before ccR, so the frame is ready by the time the tiles are drawn.
+        cat_hist_window = _history_window_from_range(cat_range, anchors)
+        hist_c = historical_window(agg_c, summary_c, cat_hist_window)
         st.plotly_chart(
             aggregate_chart(agg_c, summary_c, weekly_c, cat_anchors, category,
                             date_range=cat_range, prices=prices),
@@ -734,8 +815,10 @@ def render_category_detail_section(summary, agg, weekly, by_cust, anchors, price
                                               ascending=False)
             st.caption(
                 "The rows the tiles beside the chart are the sum of — including the "
-                "two container columns, which add up to the container tiles. A blank "
-                "Container Load means that SKU sits out all three."
+                "two container columns, which add up to the container tiles. The "
+                "historical container column covers the same Date range as the "
+                "chart, so it moves with that selector; the forecast one does not. "
+                "A blank Container Load means that SKU sits out all three."
             )
             st.dataframe(listing, width="stretch", hide_index=True)
             st.download_button(
@@ -794,7 +877,11 @@ def render_category_detail_section(summary, agg, weekly, by_cust, anchors, price
         # The category's weekly demand in containers. The per-SKU division happens
         # inside the helper: a container holds a different number of every SKU, so
         # there is no category-level load to divide a category total by.
-        _render_container_tiles(hist_c, weekly_c, container_load)
+        # Follows the Date range selector — see the note in SKU detail for why this
+        # tile diverges from the model-window tiles above it.
+        _render_container_tiles(
+            hist_c, weekly_c, container_load,
+            range_label=_range_label(chart_range_preset(f"range_cat_{key}")))
 
 
 def projection_kpi_extras(row):

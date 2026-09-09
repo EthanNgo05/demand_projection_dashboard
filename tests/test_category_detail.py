@@ -17,8 +17,15 @@ from dashboard_app.config import (
 )
 from dashboard_app.kpis import (
     _weekly_containers, _container_breakdown, _category_members,
-    _sheet_slug, _file_slug,
+    _sheet_slug, _file_slug, _range_label, _history_window_from_range,
 )
+
+# The historical container TILE is labelled dynamically after the Date range preset,
+# so it is not keyed by CONTAINER_HIST_COL on screen — that constant stays the stable
+# header for the listing column and the Excel export. The picker defaults to
+# "6 Months" (charts.RANGE_PRESET_DEFAULT).
+HIST_TILE = "Container Demand (6-Month avg/wk)"
+HIST_TILE_1M = "Container Demand (1-Month avg/wk)"
 
 # Three real members of the curated Liners set, so these tests exercise the
 # shipped list rather than a monkeypatched stand-in.
@@ -272,7 +279,7 @@ def test_category_container_tiles():
     """
     at = _run(_category_app)
     tiles = {m.label: m.value for m in at.metric}
-    assert tiles[CONTAINER_HIST_COL] == "1.75"
+    assert tiles[HIST_TILE] == "1.75"
     assert tiles[CONTAINER_FC_COL] == "1.93"
 
 
@@ -291,7 +298,7 @@ def test_container_tiles_show_an_em_dash_without_plytix():
     no list prices are loaded."""
     at = _run(_no_load_app)
     tiles = {m.label: m.value for m in at.metric}
-    assert tiles[CONTAINER_HIST_COL] == "—"
+    assert tiles[HIST_TILE] == "—"
     assert tiles[CONTAINER_FC_COL] == "—"
 
 
@@ -354,7 +361,7 @@ def test_sku_detail_gains_container_tiles():
     10 = 1.0 container, and 11 forecast units = 1.1."""
     at = _run(_sku_app)
     tiles = {m.label: m.value for m in at.metric}
-    assert tiles[CONTAINER_HIST_COL] == "1.00"
+    assert tiles[HIST_TILE] == "1.00"
     assert tiles[CONTAINER_FC_COL] == "1.10"
 
 
@@ -418,7 +425,8 @@ def test_listing_container_columns_sum_to_the_tiles():
     # Same fixture as test_category_container_tiles: 1.75 hist, 1.93 forecast.
     assert listing[CONTAINER_HIST_COL].sum() == pytest.approx(1.75)
     assert listing[CONTAINER_FC_COL].sum() == pytest.approx(1.925)
-    assert tiles[CONTAINER_HIST_COL] == "1.75"
+    # The COLUMN header is the stable constant; the TILE names the selected range.
+    assert tiles[HIST_TILE] == "1.75"
     assert tiles[CONTAINER_FC_COL] == "1.93"
     # Only the category's SKUs, and each once.
     assert sorted(listing["SKU"]) == sorted([LINER_A, LINER_B, LINER_C])
@@ -485,4 +493,121 @@ def test_by_sku_table_sits_above_category_detail():
     category = src.index("render_category_detail_section(")
     by_customer = src.index('st.markdown("### Summary table by SKU and customer")')
     assert sku_detail < by_sku < category < by_customer
+
+
+# --------------------------------------------------------------------------- #
+# The Date range selector drives the historical container tile — and ONLY it  #
+# --------------------------------------------------------------------------- #
+def _ranged_frames():
+    """Like ``_frames`` but with demand that CHANGES over the window.
+
+    The stock fixture sells a flat 10 units every week, so narrowing the window
+    leaves every average identical and a range test would pass without the feature
+    existing. Here the last four weeks run 10x the first eight, so a 1-Month window
+    and a 6-Month window cannot agree.
+    """
+    df, agg, weekly, anchors = _frames()
+    cutoff = pd.Timestamp("2026-03-02")
+    agg = agg.copy()
+    late = pd.to_datetime(agg["WeekDate"]) >= cutoff
+    agg.loc[late, ["POS", "demand"]] = 100.0
+    return df, agg, weekly, anchors
+
+
+def _ranged_app():
+    # AppTest.from_function ships only this function's source to a temp
+    # script, so module-level names have to be re-imported here.
+    from dashboard_app.kpis import render_category_detail_section
+    from test_category_detail import _ranged_frames, LINER_A, LINER_B, LINER_C
+    from test_category_detail import NOT_LINER_CAN
+    import pandas as pd
+    df, agg, weekly, anchors = _ranged_frames()
+    render_category_detail_section(
+        df, agg, weekly, df, anchors, None,
+        container_load=pd.Series({LINER_A: 10.0, LINER_B: 20.0, LINER_C: 40.0,
+                                  NOT_LINER_CAN: 1.0}),
+        key="best",
+    )
+
+
+def test_narrowing_the_date_range_moves_only_the_historical_container_tile():
+    """The whole agreed rule, in one test.
+
+    The Date range selector drives historical KPIs — but not those whose label
+    already names a fixed window. So exactly one tile may move: the historical
+    container demand. "Total Weekly Demand (8-Week avg)" says 8-Week and therefore
+    stays an 8-week average; the forecast tiles have no historical input at all; On
+    Hand and WOS are point-in-time.
+    """
+    at = _run(_ranged_app)
+    before = {m.label: m.value for m in at.metric}
+    assert HIST_TILE in before, "labelled with the default preset"
+
+    at = at.selectbox(key="range_cat_best_preset").set_value("1 Month").run()
+    assert not at.exception, at.exception
+    after = {m.label: m.value for m in at.metric}
+
+    # The tile moved, and its label followed the preset.
+    assert HIST_TILE_1M in after
+    assert HIST_TILE not in after
+    assert after[HIST_TILE_1M] != before[HIST_TILE], (
+        "a shorter window over rising demand must give a different average"
+    )
+
+    # Everything else is untouched. This is the half of the rule that is easy to
+    # break by accident.
+    for label in ("Total Weekly Demand (8-Week avg)", "Current Forecast (avg/wk)",
+                  "Updated Forecast (avg/wk)", "Projection Difference (avg/wk)",
+                  "Revenue Risk (avg/wk)", "Projected Revenue (avg/wk)",
+                  "SKUs Forecasted", ONHAND_COL, WOS_COL, CONTAINER_FC_COL):
+        assert label in before, f"{label} missing from the fixture"
+        assert after[label] == before[label], f"{label} must not follow the range"
+
+
+def test_the_per_sku_column_still_ties_after_a_range_change():
+    """The tie has to hold at EVERY window, not just the default one — the listing
+    and the tile must be sliced from the same frame."""
+    at = _run(_ranged_app)
+    at = at.selectbox(key="range_cat_best_preset").set_value("1 Month").run()
+    assert not at.exception, at.exception
+
+    tiles = {m.label: m.value for m in at.metric}
+    listing = at.dataframe[0].value
+    assert listing[CONTAINER_HIST_COL].sum() == pytest.approx(
+        float(tiles[HIST_TILE_1M]), abs=0.005
+    ), "column sum must still equal the tile after narrowing the range"
+
+
+def test_history_window_clamps_the_pickers_forecast_end():
+    """``chart_range_control`` returns the FORECAST horizon as its end in every
+    branch — presets trim history only. Passing that through unclamped would pull
+    forecast weeks into a historical average."""
+    anchors = (pd.Timestamp("2026-01-05"), pd.Timestamp("2026-08-30"),
+               pd.Timestamp("2026-09-06"))
+    picker = (pd.Timestamp("2026-03-01"), pd.Timestamp("2026-12-13"))  # end = horizon
+    start, end, ffw = _history_window_from_range(picker, anchors)
+    assert start == pd.Timestamp("2026-03-01")
+    assert end == anchors[1], "clamped back to the last completed week"
+    assert ffw == anchors[2]
+    # No range at all -> the model's window, unchanged.
+    assert _history_window_from_range(None, anchors) == anchors
+
+
+def test_range_labels_read_as_windows():
+    assert _range_label("6 Months") == "6-Month"
+    assert _range_label("1 Year") == "1-Year"
+    assert _range_label("All") == "All-Time"
+    assert _range_label("Custom\u2026") == "custom range"
+
+
+def test_export_header_is_stable_across_range_changes():
+    """The tile label moves with the picker; the column header must not, or a
+    downloaded workbook would have a different schema depending on what the user
+    happened to have selected."""
+    at = _run(_ranged_app)
+    assert CONTAINER_HIST_COL in at.dataframe[0].value.columns
+    at = at.selectbox(key="range_cat_best_preset").set_value("1 Month").run()
+    assert not at.exception, at.exception
+    assert CONTAINER_HIST_COL in at.dataframe[0].value.columns
+    assert HIST_TILE_1M not in at.dataframe[0].value.columns
 

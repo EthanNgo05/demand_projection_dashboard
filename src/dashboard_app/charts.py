@@ -149,6 +149,26 @@ def _revenue_risk_trace(week_series, risk_by_week):
     )
 
 
+RANGE_PRESET_DEFAULT = "6 Months"
+
+
+def chart_range_preset(key, default=RANGE_PRESET_DEFAULT):
+    """The preset name currently showing in the picker keyed ``key``.
+
+    ``chart_range_control`` returns only the resolved ``(start, end)`` dates, which
+    is all a chart needs. A caller that wants to LABEL the window — the historical
+    container tile does, since it follows this picker — needs the preset's name too,
+    and reading it back from session state is cheaper than changing a signature nine
+    call sites share.
+
+    Safe before the widget has ever rendered: Streamlit only writes the key once the
+    selectbox is instantiated, so the first paint of a section whose picker has not
+    run yet falls back to ``default``. In practice both callers render the picker in
+    the left column, which executes before the right column holding the tiles.
+    """
+    return st.session_state.get(f"{key}_preset", default)
+
+
 def chart_range_control(agg, weekly, lcw, key):
     """Compact date-range picker rendered right above a chart.
 
@@ -175,7 +195,7 @@ def chart_range_control(agg, weekly, lcw, key):
 
     preset = st.selectbox(
         "Date range", list(RANGE_PRESETS),
-        index=list(RANGE_PRESETS).index("6 Months"),
+        index=list(RANGE_PRESETS).index(RANGE_PRESET_DEFAULT),
         key=f"{key}_preset",
         help="How much history to show. The forecast always stays visible.",
     )
